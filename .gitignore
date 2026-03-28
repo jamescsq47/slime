@@ -194,3 +194,4 @@ _examples_synced/
 .DS_StoreMegatron-LM/
 Megatron-LM/
 *.pt
+*.parquet
