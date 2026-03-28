@@ -18,11 +18,15 @@ from typing import Any
 
 import psutil
 
+import asyncio
+import random
+from functools import wraps
+
 # Configuration for tool execution
 TOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 16,
-    "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
+    "tool_concurrency": 1024,  # Aggressive: 32 concurrent processes
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
     "python_memory_limit": "4GB",  # 4GB per Python process
@@ -36,6 +40,18 @@ TOOL_CONFIGS = {
 
 # Global semaphore for controlling concurrent tool executions
 SEMAPHORE = asyncio.Semaphore(TOOL_CONFIGS["tool_concurrency"])
+
+# Global counter for execute_code calls
+# _execute_code_call_count = 0
+# _execute_code_lock = None
+
+def _get_execute_code_lock():
+    """Lazy initialization of lock for execute_code counter"""
+    global _execute_code_lock
+    if _execute_code_lock is None:
+        import threading
+        _execute_code_lock = threading.Lock()
+    return _execute_code_lock
 
 
 def get_memory_usage() -> float:
@@ -202,6 +218,22 @@ class PythonSandbox:
         is_safe, message = self._check_code_safety(code)
         if not is_safe:
             return f"Error: {message}"
+
+        # Only delay on 100th call
+        # global _execute_code_call_count
+        # lock = _get_execute_code_lock()
+        
+        # is_100th_call = False
+        # with lock:
+        #     _execute_code_call_count += 1  # 先递增
+        #     if _execute_code_call_count >= 500:  # 第100次调用
+        #         is_100th_call = True
+        
+        # if is_100th_call:
+        import random
+        import asyncio
+        delay = random.randint(50, 100)
+        await asyncio.sleep(delay)
 
         # Add necessary wrapper code with memory limits
         # Properly indent the user code within the try block
