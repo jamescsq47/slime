@@ -4,6 +4,7 @@
 import asyncio
 import re
 import numpy as np
+import time
 
 from qa_em_format import compute_score_em
 
@@ -14,11 +15,11 @@ from slime.utils.types import Sample
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 2,
+    "max_turns": 6,
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
-    "search_backend": "local",  # Options: "local" or "google"
+    "search_backend": "duckduckgo",  # Options: "local" or "google" or "duckduckgo"
     # ============== Local Search Configuration ==============
     # (Only used when search_backend="local")
     "local": {
@@ -28,9 +29,12 @@ SEARCH_R1_CONFIGS = {
     # ============== Google Search Configuration ==============
     # (Only used when search_backend="google")
     "google": {
-        "api_key": "your_api_key_here",  # Replace with your actual API key
+        "api_key": "999fa931992345de291bf3236edf68181a46e341",  # Replace with your actual API key
         "snippet_only": True,  # Set to True to only return snippets
         "proxy": None,  # Set to your proxy if needed
+    },
+    "duckduckgo":{
+        "proxy": None,
     },
     # ============== Log Probability Collection ==============
     "return_logprob": True,  # Set to True to collect log probabilities for TIS metrics
@@ -84,6 +88,15 @@ async def search(query: str) -> str:
             SEARCH_R1_CONFIGS["topk"],
             snippet_only=google_config["snippet_only"],
             proxy=google_config["proxy"],
+        )
+    elif backend == "duckduckgo":
+        from duckduckgo_search_server import duckduckgo_search
+
+        duckduckgo_config = SEARCH_R1_CONFIGS["duckduckgo"]
+        result = await duckduckgo_search(
+            query,
+            SEARCH_R1_CONFIGS["topk"],
+            proxy=duckduckgo_config.get("proxy"),
         )
     else:
         raise ValueError(f"Unknown search backend: {backend}. " f"Must be either 'local' or 'google'.")
@@ -151,24 +164,31 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Handle partial rollout samples: continue generation from existing response
-    prompt = sample.prompt
-    if args.apply_chat_template:
-        assert isinstance(prompt, np.ndarray), "prompt should be a np.ndarray when apply_chat_template is True"
-        prompt_text = state.tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_generation_prompt=True,  # Add generation prompt for the assistant
-            **(args.apply_chat_template_kwargs or {}),
-        )
-    else:
-        assert isinstance(prompt, str), "prompt should be a string when apply_chat_template is False"
-        prompt_text = prompt
+    # prompt = sample.prompt
+    # if args.apply_chat_template:
+    #     # print(f"prompt: {prompt}")
+    #     print(f"the type of prompt is: {type(prompt)}")
+    #     assert isinstance(prompt, np.ndarray), "prompt should be a np.ndarray when apply_chat_template is True"
+    #     prompt_text = state.tokenizer.apply_chat_template(
+    #         prompt,
+    #         tokenize=False,
+    #         add_generation_prompt=True,  # Add generation prompt for the assistant
+    #         **(args.apply_chat_template_kwargs or {}),
+    #     )
+    # else:
+    #     assert isinstance(prompt, str), "prompt should be a string when apply_chat_template is False"
+    #     prompt_text = prompt
+    prompt_text = sample.prompt
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
     loss_mask = []
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
+    tool_call_count = 0
+    tool_time = 0.0
+    sample_time = 0.0
 
+    sample_start = time.time()
     for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
         payload = {
             "text": prompt_text + response,
@@ -218,9 +238,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
+        start_time = time.time()
         next_obs, done = await execute_predictions(cur_response)
+        elapsed_time = time.time() - start_time
+        tool_time += elapsed_time
+
         if done:
             break
+
+        if "<information>" in next_obs:
+            tool_call_count += 1
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
@@ -237,12 +264,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 rollout_log_probs
             ), f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
 
+    sample_time = time.time() - sample_start
     # Store statistics for wandb logging
     sample.tokens = prompt_tokens_ids + response_token_ids
     sample.response_length = len(response_token_ids)
     sample.response = response
     sample.loss_mask = loss_mask
     sample.prompt = prompt_text
+    sample.tool_call_count = tool_call_count
+    tool_token_count = loss_mask.count(0)
+    sample.tool_token_count = tool_token_count
+    sample.tool_time = tool_time
+    sample.sample_time = sample_time
 
     # Store log probs if enabled
     if SEARCH_R1_CONFIGS["return_logprob"]:
@@ -269,9 +302,20 @@ async def reward_func(args, sample, **kwargs):
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
+    # 动态适配 Train 和 Eval 的标签格式
+    if isinstance(sample.label, str):
+        # 针对 GAIA 评估集：把字符串 "答案" 包装成 {"target": ["答案"]}
+        formatted_gt = {"target": [sample.label]}
+    elif isinstance(sample.label, dict):
+        # 针对训练集：正常提取 "ground_truth" 字段，得到 {"target": array([...])}
+        formatted_gt = sample.label.get("ground_truth", {})
+    else:
+        # 兜底处理
+        formatted_gt = {"target": [str(sample.label)]}
+        
     score = compute_score_em(
         solution_str=sample.prompt + sample.response,
-        ground_truth=sample.label["ground_truth"],
+        ground_truth=formatted_gt,
         format_score=SEARCH_R1_CONFIGS["format_score"],
     )
 

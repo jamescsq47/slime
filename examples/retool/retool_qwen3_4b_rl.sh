@@ -29,9 +29,9 @@ source "/root/slime/scripts/models/qwen3-4B.sh"
 CKPT_ARGS=(
    --hf-checkpoint /root/font-info/qwen3-4b-sft
    --ref-load /root/font-info/qwen3-4b-sft_torch_dist
-   # --load /root/Qwen3-4B_slime/
-   --save /root/font-info/qwen3-4b-sft/qwen3-4b-sft-multi-turn/
-   --save-interval 20
+   --load /root/font-info/qwen3-4b-sft/qwen3-4b-sft-multi-turn/iter_0000079
+   # --save /root/font-info/qwen3-4b-sft/qwen3-4b-sft-multi-turn/
+   # --save-interval 20
    --rotary-base 5000000
 )
 
@@ -100,12 +100,12 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dapo
    --wandb-group qwen3-4B-test-multi-turn
-   --wandb-key ${WANDB_KEY}
+   --wandb-key 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
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.5
 )
 
 MISC_ARGS=(
@@ -126,7 +126,7 @@ CUSTOM_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --num-cpus 64 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -141,7 +141,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
+   --actor-num-gpus-per-node 8 \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

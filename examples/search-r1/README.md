@@ -22,7 +22,7 @@ git clone https://github.com/PeterGriffinJin/Search-R1.git
 cd Search-R1/
 
 # Set your working directory
-WORK_DIR=/root/Search-R1
+WORK_DIR=/homes/siqic/Search-R1
 LOCAL_DIR=$WORK_DIR/data/nq_hotpotqa_train
 
 # Process multiple dataset search format train file
@@ -45,15 +45,15 @@ Initialize the Qwen2.5-3B model:
 
 ```bash
 # hf checkpoint
-huggingface-cli download Qwen/Qwen2.5-3B --local-dir /root/Qwen2.5-3B
+huggingface-cli download Qwen/Qwen2.5-3B --local-dir /homes/siqic/Qwen2.5-3B
 
 # mcore checkpoint
-cd /root/slime
+cd /workspace/slime
 source scripts/models/qwen2.5-3B.sh
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
     ${MODEL_ARGS[@]} \
-    --hf-checkpoint /root/Qwen2.5-3B \
-    --save /root/Qwen2.5-3B_torch_dist
+    --hf-checkpoint /workspace/Qwen2.5-3B \
+    --save /workspace/Qwen2.5-3B_torch_dist
 ```
 
 ## Configuration

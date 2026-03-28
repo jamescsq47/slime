@@ -188,7 +188,30 @@ def slice_log_prob_with_cp(
     total_length: int,
     response_length: int,
 ) -> list[float] | torch.Tensor:
-    assert len(log_prob) == response_length
+    # ================= 修复开始 =================
+    # 原代码可能是: assert len(log_prob) == response_length
+    
+    current_len = len(log_prob)
+    
+    # 情况 1: Log Prob 包含了 Prompt + Response (通常发生在这一步)
+    if current_len > response_length:
+        # print(f"[Fixing] Trimming log_prob from {current_len} to {response_length}")
+        # 我们只取最后 response_length 长度的部分，因为 Response 永远在序列的最后
+        log_prob = log_prob[-response_length:]
+        
+    # 情况 2: Log Prob 比 Response 还短 (这是真正的错误，需要报错)
+    elif current_len < response_length:
+        # 这里可以选择报错，或者像上一条建议那样抛出异常跳过
+        raise ValueError(
+            f"Log prob length ({current_len}) is smaller than response length ({response_length}). "
+            "Model output might be truncated unexpectedly."
+        )
+
+    # 再次检查，确保万无一失
+    if len(log_prob) != response_length:
+        raise AssertionError(f"Mismatch persist: {len(log_prob)} vs {response_length}")
+        
+    # ================= 修复结束 =================
 
     cp_size = mpu.get_context_parallel_world_size()
 

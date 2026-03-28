@@ -104,3 +104,6 @@ def train(args):
 if __name__ == "__main__":
     args = parse_args()
     train(args)
+    import wandb
+    if wandb.run is not None:
+        wandb.finish()

@@ -28,7 +28,7 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
-
+_wandb_metric_defined = False
 
 class GenerateState(metaclass=SingletonMeta):
     """
@@ -402,6 +402,112 @@ async def generate_rollout_async(
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
     all_samples = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
+    try:
+        import wandb
+        print("record tool call counts for analysis")
+        tool_time_counts = []
+        sample_time_counts = []
+        code_call_counts = []
+        search_call_counts = []
+        metrics_to_log = {}
+
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_time'):
+                    tool_time_counts.append(sample.tool_time)
+                if hasattr(sample, 'sample_time'):
+                    sample_time_counts.append(sample.sample_time)
+                if hasattr(sample, 'code_call_count'):
+                    code_call_counts.append(sample.code_call_count)
+                if hasattr(sample, 'search_call_count'):
+                    search_call_counts.append(sample.search_call_count)
+
+        if tool_time_counts:
+            avg_tool_times = sum(tool_time_counts) / len(tool_time_counts)
+            avg_sample_times = sum(sample_time_counts) / len(sample_time_counts) if sample_time_counts else 0.0
+            avg_tool_times_ratio_per_sample = [
+                t / s if s > 0 else 0.0
+                for t, s in zip(tool_time_counts, sample_time_counts)
+            ]
+
+            metrics_to_log.update({
+                "tool/avg_tool_calls_time": avg_tool_times,
+                "tool/avg_sample_time": avg_sample_times,
+                "tool/avg_tool_time_ratio_per_sample": sum(avg_tool_times_ratio_per_sample) / len(avg_tool_times_ratio_per_sample) if avg_tool_times_ratio_per_sample else 0.0,
+                "tool/avg_code_call_count": sum(code_call_counts) / len(code_call_counts) if code_call_counts else 0.0,
+                "tool/avg_search_call_count": sum(search_call_counts) / len(search_call_counts) if search_call_counts else 0.0,
+            })
+            
+        
+        tool_call_counts = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_call_count'):
+                    tool_call_counts.append(sample.tool_call_count)
+        
+        if tool_call_counts:
+            avg_tool_calls = sum(tool_call_counts) / len(tool_call_counts)
+            samples_with_tool_calls = sum(1 for count in tool_call_counts if count > 0)
+
+            metrics_to_log.update({
+                "tool/avg_tool_calls_per_sample": avg_tool_calls,
+                "tool/total_tool_calls": sum(tool_call_counts),
+                "tool/samples_with_tool_calls": samples_with_tool_calls,
+            })
+
+        tool_token_counts = []
+        response_lengths = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_token_count'):
+                    tool_token_counts.append(sample.tool_token_count)
+                    response_lengths.append(sample.response_length)
+
+        if tool_token_counts:
+            total_tool_tokens = sum(tool_token_counts)
+            avg_tool_tokens = total_tool_tokens / len(tool_token_counts)
+            per_sample_ratios = [
+                t / r if r > 0 else 0.0
+                for t, r in zip(tool_token_counts, response_lengths)
+            ]
+            tool_token_ratio = sum(per_sample_ratios) / len(per_sample_ratios)
+            metrics_to_log.update({
+                "tool/avg_tool_tokens_per_sample": avg_tool_tokens,
+                "tool/tool_token_ratio_in_response": tool_token_ratio,
+            })
+        
+        mismatch_counts = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'mismatch'):
+                    mismatch_counts.append(sample.mismatch)
+         
+
+        if mismatch_counts:
+            total_mismatches = sum(mismatch_counts)
+            avg_mismatches = total_mismatches / len(mismatch_counts)
+            samples_with_mismatches = sum(1 for m in mismatch_counts if m > 0)
+
+            metrics_to_log.update({
+                "debug/total_mismatches": total_mismatches,
+                "debug/avg_mismatches_per_sample": avg_mismatches,
+                "debug/samples_with_mismatches": samples_with_mismatches,
+            })
+
+        # Use a dedicated rollout step axis to avoid conflicts with other threads logging wandb step.
+        if metrics_to_log:
+            global _wandb_metric_defined
+            if not _wandb_metric_defined:
+                wandb.define_metric("rollout/step")
+                wandb.define_metric("tool/*", step_metric="rollout/step")
+                wandb.define_metric("debug/*", step_metric="rollout/step")
+                _wandb_metric_defined = True
+
+            metrics_to_log["rollout/step"] = rollout_id
+            wandb.log(metrics_to_log)
+    except Exception:
+        pass
+
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
     if args.rollout_sample_filter_path is not None:
@@ -551,6 +657,78 @@ async def eval_rollout_single_dataset(
     pbar.close()
 
     data.sort(key=lambda sample: sample.index)
+
+    tool_time_counts = []
+    sample_time_counts = []
+    tool_call_counts = []
+    tool_token_counts = []
+    response_lengths = []
+
+    for group in data:
+        if not isinstance(group, (list, tuple)):
+            group = [group]
+        
+        for sample in group:
+            if hasattr(sample, 'tool_time'):
+                tool_time_counts.append(sample.tool_time)
+            if hasattr(sample, 'sample_time'):
+                sample_time_counts.append(sample.sample_time)
+            if hasattr(sample, 'tool_call_count'):
+                tool_call_counts.append(sample.tool_call_count)
+            if hasattr(sample, 'tool_token_count'):
+                tool_token_counts.append(sample.tool_token_count)
+            if hasattr(sample, 'response_length'):
+                response_lengths.append(sample.response_length)
+
+    # 时间统计
+    if tool_time_counts and sample_time_counts:
+        avg_tool_times = sum(tool_time_counts) / len(tool_time_counts)
+        avg_sample_times = sum(sample_time_counts) / len(sample_time_counts)
+        
+        tool_time_ratios = [t/s for t, s in zip(tool_time_counts, sample_time_counts)]
+        avg_tool_time_ratio = sum(tool_time_ratios) / len(tool_time_ratios)
+        
+        print(f"tool/avg_tool_calls_time: {avg_tool_times}")
+        print(f"tool/avg_sample_time: {avg_sample_times}")
+        print(f"tool/avg_tool_time_ratio_per_sample: {avg_tool_time_ratio}")
+        
+        import wandb
+        wandb.log({
+            "tool/avg_tool_calls_time": avg_tool_times,
+            "tool/avg_sample_time": avg_sample_times,
+            "tool/avg_tool_time_ratio_per_sample": avg_tool_time_ratio,
+        })
+
+    # 调用次数统计
+    if tool_call_counts:
+        avg_tool_calls = sum(tool_call_counts) / len(tool_call_counts)
+        samples_with_tool_calls = sum(1 for count in tool_call_counts if count > 0)
+        
+        print(f"tool/avg_tool_calls_per_sample: {avg_tool_calls}")
+        print(f"tool/total_tool_calls: {sum(tool_call_counts)}")
+        print(f"tool/samples_with_tool_calls: {samples_with_tool_calls}")
+        
+        wandb.log({
+            "tool/avg_tool_calls_per_sample": avg_tool_calls,
+            "tool/total_tool_calls": sum(tool_call_counts),
+            "tool/samples_with_tool_calls": samples_with_tool_calls,
+        })
+
+    # token统计
+    if tool_token_counts and response_lengths:
+        total_tool_tokens = sum(tool_token_counts)
+        avg_tool_tokens = total_tool_tokens / len(tool_token_counts)
+        
+        token_ratios = [t/r for t, r in zip(tool_token_counts, response_lengths)]
+        avg_token_ratio = sum(token_ratios) / len(token_ratios)
+        
+        print(f"tool/avg_tool_tokens_per_sample: {avg_tool_tokens}")
+        print(f"tool/tool_token_ratio_in_response: {avg_token_ratio}")
+        
+        wandb.log({
+            "tool/avg_tool_tokens_per_sample": avg_tool_tokens,
+            "tool/tool_token_ratio_in_response": avg_token_ratio,
+        })
 
     reward_key = args.eval_reward_key or args.reward_key
     return {

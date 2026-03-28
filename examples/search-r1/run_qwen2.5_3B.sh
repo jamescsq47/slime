@@ -5,10 +5,10 @@ pkill -9 sglang
 sleep 3
 ray stop --force
 pkill -9 ray
-pkill -9 python
+# pkill -9 python
 sleep 3
 pkill -9 ray
-pkill -9 python
+# pkill -9 python
 
 set -ex
 
@@ -16,38 +16,41 @@ set -ex
 export PYTHONBUFFERED=16
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-3B.sh"
+source "${SCRIPT_DIR}/../../scripts/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen2.5-3B/
-   --ref-load /root/Qwen2.5-3B_torch_dist/
-   # --load /root/Qwen2.5-3B_slime/
-   # --save /root/Qwen2.5-3B_slime/
-   # --save-interval 20
+   --hf-checkpoint /workspace/Qwen3-4B/
+   --ref-load /workspace/Qwen3-4B_torch_dist/
+   # --load /root/Qwen3-4B_slime/
+   # --save /workspace/Qwen3-4B_search_r1/
+   # --save-interval 300
 )
+export WANDB_KEY="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"
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/Search-R1/data/nq_hotpotqa_train/train.parquet
+   # --rollout-function-path fully_async_rollout.generate_rollout_fully_async
+   --prompt-data /workspace/Search-R1/data/nq_hotpotqa_train/train.parquet
    --input-key prompt
    --label-key reward_model
    --apply-chat-template
    --rollout-shuffle
-   --num-rollout 3000
+   --num-rollout 2000
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 512
+   --rollout-max-response-len 2048
    --rollout-temperature 1
 
    # eval args
    # --eval-interval 25
-   # --eval-prompt-data nq_test /root/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
-   # # --eval-prompt-data nq_test /root/nq_search/test.parquet
+   # --eval-prompt-data nq_test /workspace/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:3000]
+   # # --eval-prompt-data nq_test /workspace/Search-R1/data/nq_search/test.parquet
    # --eval-input-key prompt
    # --eval-label-key reward_model
    # --n-samples-per-eval-prompt 1
 
    --global-batch-size 256
    --balance-data
+   --save-debug-rollout-data /workspace/slime/examples/search-r1/debug/duckduckgo_512_6_3_sync/rollout_{rollout_id}.pt
 )
 
 PERF_ARGS=(
@@ -77,7 +80,7 @@ GRPO_ARGS=(
    --eps-clip-high 0.28
 
    # whether enabling TIS
-   # --use-tis
+   --use-tis
 )
 
 OPTIMIZER_ARGS=(
@@ -90,10 +93,10 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group search-r1_qwen2.5-3B-test
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project search-r1_qwen3-4B
+   --wandb-group search-r1_qwen3-4B-2048-6-3
+   --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
@@ -117,13 +120,13 @@ CUSTOM_ARGS=(
    --custom-rm-path generate_with_search.reward_func
 
    # TIS-related args, recommended to enable when using TIS
-   # --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
-   # --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
+   --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
+   --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --num-cpus 64 --disable-usage-stats 
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -136,8 +139,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
-   --rollout-num-gpus 4 \
+   --actor-num-gpus-per-node 8 \
+   --rollout-num-gpus 8 \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
@@ -149,3 +152,10 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${CUSTOM_ARGS[@]}
+
+
+   # -- python3 train.py \
+   # --actor-num-nodes 1 \
+   # --actor-num-gpus-per-node 4 \
+   # --rollout-num-gpus 4 \
+   # --colocate \

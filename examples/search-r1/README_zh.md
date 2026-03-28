@@ -225,10 +225,10 @@ pip install uvicorn fastapi
 
 ```bash
 # 设置保存路径
-save_path=/root/Index
+save_path=/homes/siqic/Index
 
 # 下载索引和语料库文件
-python /root/slime/examples/search-r1/local_dense_retriever/download.py --save_path $save_path
+python /homes/siqic/slime/examples/search-r1/local_dense_retriever/download.py --save_path $save_path
 
 # 合并分割的索引文件
 cat $save_path/part_* > $save_path/e5_Flat.index
@@ -249,14 +249,14 @@ gzip -d $save_path/wiki-18.jsonl.gz
 conda activate retriever
 
 # 设置路径
-save_path=/root/Index
+save_path=/homes/siqic/Index
 index_file=$save_path/e5_Flat.index
 corpus_file=$save_path/wiki-18.jsonl
 retriever_name=e5
 retriever_path=intfloat/e5-base-v2
 
 # 启动检索服务器
-python /root/slime/examples/search-r1/local_dense_retriever/retrieval_server.py \
+python /homes/siqic/slime/examples/search-r1/local_dense_retriever/retrieval_server.py \
     --index_path $index_file \
     --corpus_path $corpus_file \
     --topk 3 \
@@ -280,14 +280,14 @@ python /root/slime/examples/search-r1/local_dense_retriever/retrieval_server.py 
 cd /root/slime
 
 # 设置您的 wandb key（可选）
-export WANDB_KEY="your_wandb_key_here"
+export WANDB_KEY="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"
 
 # 如果 ray 进程卡住，尝试：
 # rm -rf /root/.cache
 # rm -rf /root/.*
 
 # 运行训练脚本
-bash /root/slime/examples/search-r1/run_qwen2.5_3B.sh
+bash examples/search-r1/run_qwen2.5_3B.sh
 ```
 
 ### 故障排查

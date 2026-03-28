@@ -3,6 +3,7 @@ import atexit
 import queue
 import threading
 import time
+import wandb
 
 # Import core functions from sglang_rollout directly to avoid code duplication
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
@@ -48,13 +49,15 @@ class AsyncRolloutWorker:
         self.output_queue = queue.Queue(maxsize=1000)  # Continuous output queue
         self.worker_thread = None
         self.state = GenerateState(args)
+        self.max_queue_size = self.output_queue.maxsize
+        self.step_counter = 0  
 
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
         print("Continuous async rollout worker started")
 
         active_tasks = set()
-        max_concurrent_tasks = self.args.rollout_batch_size
+        max_concurrent_tasks = self.args.rollout_batch_size #32
         group_id_counter = 0
 
         while self.running:
@@ -111,6 +114,21 @@ class AsyncRolloutWorker:
             await asyncio.wait(active_tasks)
 
         print("Continuous async rollout worker stopped")
+    
+    def monitor_queue_size(self):
+        """监控队列大小并记录到wandb"""
+        while self.running:
+            try:
+                queue_size = self.output_queue.qsize()
+                wandb.log({
+                    "queue/output_queue_size": queue_size,
+                    "queue/queue_utilization": queue_size / self.max_queue_size  
+                }, step=self.step_counter)
+                self.step_counter += 1
+                time.sleep(5)  # 每5秒记录一次
+            except Exception as e:
+                print(f"Error monitoring queue: {e}")
+                time.sleep(5)
 
     def worker_thread_func(self):
         """Worker function running in independent thread"""
@@ -122,12 +140,17 @@ class AsyncRolloutWorker:
             self.worker_thread = threading.Thread(target=self.worker_thread_func, daemon=True)
             self.worker_thread.start()
             print("Started continuous async worker thread")
+            self.monitor_thread = threading.Thread(target=self.monitor_queue_size, daemon=True)
+            self.monitor_thread.start()
+            print("Started queue monitoring thread")
 
     def stop(self):
         """Stop worker thread"""
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=5)
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=5)
         print("Stopped async worker thread")
 
     def get_completed_groups(self) -> list[tuple]:
@@ -236,6 +259,45 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
         if not processed_any:
             await asyncio.sleep(0.01)
 
+    try:
+        print("record tool call counts for analysis")
+        tool_call_counts = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_call_count'):
+                    tool_call_counts.append(sample.tool_call_count)
+        
+        if tool_call_counts:
+            avg_tool_calls = sum(tool_call_counts) / len(tool_call_counts)
+            samples_with_tool_calls = sum(1 for count in tool_call_counts if count > 0)
+            
+            import wandb
+            wandb.log({
+                "rollout/avg_tool_calls_per_sample": avg_tool_calls,
+                "rollout/total_tool_calls": sum(tool_call_counts),
+                "rollout/samples_with_tool_calls": samples_with_tool_calls,
+            })
+        
+        mismatch_counts = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'mismatch'):
+                    mismatch_counts.append(sample.mismatch)
+        
+
+        if mismatch_counts:
+            total_mismatches = sum(mismatch_counts)
+            avg_mismatches = total_mismatches / len(mismatch_counts)
+            samples_with_mismatches = sum(1 for m in mismatch_counts if m > 0)
+            
+            wandb.log({
+                "debug/total_mismatches": total_mismatches,
+                "debug/avg_mismatches_per_sample": avg_mismatches,
+                "debug/samples_with_mismatches": samples_with_mismatches,
+            })
+    except Exception:
+        pass
+    
     duration = time.time() - start_time
     print(f"Rollout completed in {duration:.2f}s! Global worker queue size: {worker.get_queue_size()}")
 

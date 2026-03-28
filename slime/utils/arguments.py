@@ -493,6 +493,42 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
                 ),
             )
+            parser.add_argument(
+                "--math-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to math training data (JSONL format). "
+                    "Used with CustomDataSource for unified data loading. "
+                    "Each line should contain 'prompt' and 'label' fields."
+                ),
+            )
+            parser.add_argument(
+                "--qa-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to QA/search training data (Parquet format). "
+                    "Used with CustomDataSource for unified data loading. "
+                    "Should contain 'prompt', 'reward_model', 'golden_answers', and other metadata fields."
+                ),
+            )
+            parser.add_argument(
+                "--math-ratio",
+                type=float,
+                default=0.7,
+                help=(
+                    "Ratio of math samples to total samples when mixing math and QA data. "
+                    "Valid range: [0.0, 1.0]. Default: 0.7 means 70% math and 30% QA."
+                ),
+            )
+            # 在参数解析部分添加
+            parser.add_argument('--batch-alternation', action='store_true', 
+                                help='Enable batch-level alternation mode')
+            parser.add_argument('--math-batches-per-cycle', type=int, default=1,
+                                help='Number of math batches per cycle in alternation mode')
+            parser.add_argument('--qa-batches-per-cycle', type=int, default=1,
+                                help='Number of QA batches per cycle in alternation mode')
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")

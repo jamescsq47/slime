@@ -445,6 +445,8 @@ def _compute_server_args(
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
     }
+    max_tokens = getattr(args, "rollout_max_response_len", 8192)
+    kwargs.setdefault("piecewise_cuda_graph_max_tokens", max_tokens)
 
     if worker_type == "prefill":
         kwargs["disaggregation_mode"] = "prefill"
