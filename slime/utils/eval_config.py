@@ -102,6 +102,9 @@ class EvalDatasetConfig:
     # Dataset-specific overrides
     input_key: str | None = None
     label_key: str | None = None
+    # When label_key points to a dict column (e.g. {"ground_truth": "18", ...}),
+    # label_sub_key extracts the inner value for the actual label string.
+    label_sub_key: str | None = None
     tool_key: str | None = None
     metadata_key: str | None = None
 
@@ -115,14 +118,26 @@ class EvalDatasetConfig:
     stop_token_ids: list[int] | None = None
     min_new_tokens: int | None = None
 
+    # per-dataset task type (e.g., "math" or "qa")
+    task_type: str | None = None
+
     # per-dataset custom generate function (e.g., for tool calling)
     custom_generate_function_path: str | None = None
+
+    # WandB log prefix. When set, eval metrics for this dataset are logged
+    # under "{wandb_prefix}/{dataset_name}/..." instead of "eval/{dataset_name}/...".
+    wandb_prefix: str | None = None
 
     # app_service URL for server mode generation (e.g., "http://localhost:18080")
     # If set, eval will use ServerGenerationProxy to generate through AppServer
     app_service: str | None = None
 
     eval_task_timeout: int | None = None
+
+    # per-dataset reward key extracted from reward function return dict
+    # (e.g., "score" for DAPO training reward, "acc" for accuracy).
+    # Falls back to --eval-reward-key / --reward-key if unset.
+    eval_reward_key: str | None = None
 
     metadata_overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -137,8 +152,10 @@ class EvalDatasetConfig:
             self.path,
             self.input_key,
             self.label_key,
+            self.label_sub_key,
             self.tool_key,
             self.metadata_key,
+            self.eval_reward_key,
         )
 
     def inject_metadata(self, sample_metadata: Any) -> dict[str, Any]:
@@ -150,6 +167,9 @@ class EvalDatasetConfig:
 
         if self.rm_type is not None:
             metadata["rm_type"] = self.rm_type
+
+        if self.task_type is not None:
+            metadata["task_type"] = self.task_type
 
         for key, value in self.metadata_overrides.items():
             metadata[key] = value

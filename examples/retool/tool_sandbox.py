@@ -22,7 +22,7 @@ import psutil
 TOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 16,
-    "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
+    "tool_concurrency": 1024,  # Aggressive: 1024 concurrent processes
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
     "python_memory_limit": "4GB",  # 4GB per Python process

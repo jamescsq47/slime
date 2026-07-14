@@ -144,7 +144,11 @@ class Sample:
         return sample
 
     def get_reward_value(self, args) -> float:
-        return self.reward if not args.reward_key else self.reward[args.reward_key]
+        if not args.reward_key:
+            return self.reward
+        if isinstance(self.reward, dict):
+            return self.reward[args.reward_key]
+        return self.reward  # scalar reward (e.g. qa reward func returns float)
 
     @property
     def effective_response_length(self):

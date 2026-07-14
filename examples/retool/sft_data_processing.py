@@ -28,4 +28,4 @@ def convert(sample):
 
 
 ds = ds.map(convert)
-ds.to_parquet("./data/retool/ReTool-SFT.parquet")
+ds.to_parquet("/workspace/data/retool/ReTool-SFT.parquet")

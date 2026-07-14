@@ -1,14 +1,14 @@
 #!/bin/bash
-
+ulimit -n 65536
 # for rerun the task
 pkill -9 sglang
 sleep 3
 ray stop --force
 pkill -9 ray
-pkill -9 python
+# pkill -9 python
 sleep 3
 pkill -9 ray
-pkill -9 python
+# pkill -9 python
 
 set -ex
 
@@ -24,20 +24,20 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "/root/slime/scripts/models/qwen3-4B.sh"
+source "/root/slime/scripts/models/qwen2.5-7B.sh"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen/Qwen3-4B-Instruct-2507/
-   --ref-load /root/Qwen/Qwen3-4B-Instruct-2507_torch_dist
-#    --load ./models/Qwen/Qwen3-4B-Instruct_slime/
-   --save /root/Qwen/Qwen3-4B-Instruct-2507_sft_slime/
+   --hf-checkpoint /workspace/DeepSeek-R1-Distill-Qwen-7B/
+   --ref-load /workspace/DeepSeek-R1-Distill-Qwen-7B_torch_dist
+#    --load ./models/Qwen/Qwen3-8B-Instruct_slime/
+   --save /workspace/DeepSeek-R1-Distill-Qwen-7B_sft/
    --save-interval 1000
-   --rotary-base 5000000
+   --rotary-base 10000
 )
 
 SFT_ARGS=(
    --rollout-function-path slime.rollout.sft_rollout.generate_rollout
-   --prompt-data ./data/retool/ReTool-SFT.parquet
+   --prompt-data /workspace/data/retool/ReTool-SFT.parquet
    --input-key messages
    --rollout-shuffle
    --num-epoch 3
@@ -51,7 +51,7 @@ SFT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 1
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -81,8 +81,8 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-4B-base-sft
-   --wandb-key ${WANDB_KEY}
+   --wandb-group qwen3-8B-base-sft
+   --wandb-key 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
 )
 
 MISC_ARGS=(
@@ -98,8 +98,8 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-export no_proxy="127.0.0.1,${MASTER_ADDR}"
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=${DASHBOARD_PORT}
 
 
 # Build the runtime environment JSON with proper variable substitution
@@ -112,7 +112,10 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
-ray job submit --address="http://127.0.0.1:8265" \
+echo "Waiting for Ray Dashboard to start..."
+sleep 10 
+
+ray job submit --address="http://127.0.0.1:${DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_async.py \
    --actor-num-nodes 1 \

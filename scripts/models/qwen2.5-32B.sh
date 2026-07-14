@@ -10,7 +10,7 @@ MODEL_ARGS=(
    --disable-bias-linear
    --add-qkv-bias
    --normalization "RMSNorm"
-   --norm-epsilon 1e-5
+   --norm-epsilon 1e-06
    --rotary-base 1000000
    --vocab-size 152064
    --untie-embeddings-and-output-weights

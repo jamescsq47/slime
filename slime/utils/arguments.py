@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import yaml
@@ -379,6 +380,50 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--mask-offpolicy-math",
+                type=int,
+                default=None,
+                help=(
+                    "Mask off-policy tokens in math samples when lag_sample_math >= this value. "
+                    "lag_sample_math is the total math samples across the lagging versions. "
+                    "Requires partial_rollout to be enabled."
+                ),
+            )
+            parser.add_argument(
+                "--mask-offpolicy-qa",
+                type=int,
+                default=None,
+                help=(
+                    "Mask off-policy tokens in QA samples when lag_sample_qa >= this value. "
+                    "lag_sample_qa is the total QA samples across the lagging versions. "
+                    "Requires partial_rollout to be enabled."
+                ),
+            )
+            parser.add_argument(
+                "--enable-tool-delay",
+                action="store_true",
+                default=False,
+                help="Enable artificial async delay after each math/search tool call.",
+            )
+            parser.add_argument(
+                "--tool-delay-mean",
+                type=float,
+                default=25.0,
+                help="Mean in seconds for the artificial log-normal tool delay.",
+            )
+            parser.add_argument(
+                "--tool-delay-variance",
+                type=float,
+                default=500.0,
+                help="Variance in seconds^2 for the artificial log-normal tool delay.",
+            )
+            parser.add_argument(
+                "--tool-delay-check-interval",
+                type=float,
+                default=0.5,
+                help="Polling interval in seconds for making artificial tool delay abort-friendly.",
+            )
+            parser.add_argument(
                 "--custom-generate-function-path",
                 type=str,
                 default=None,
@@ -483,6 +528,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Hard cap on completed fully async samples kept in memory. Defaults to the legacy queue sizing "
                     "heuristic when unset."
                 ),
+            )
+            parser.add_argument(
+                "--fully-async-max-partial-span",
+                type=int,
+                default=None,
+                help="Max partial span for window evict in fully async",
             )
             parser.add_argument(
                 "--fully-async-eviction-policy",
@@ -603,6 +654,71 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
                 ),
             )
+            
+            parser.add_argument(
+                "--math-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to math training data (JSONL format). "
+                    "Used with CustomDataSource for unified data loading. "
+                    "Each line should contain 'prompt' and 'label' fields."
+                ),
+            )
+            parser.add_argument(
+                "--qa-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to QA/search training data (Parquet format). "
+                    "Used with CustomDataSource for unified data loading. "
+                    "Should contain 'prompt', 'reward_model', 'golden_answers', and other metadata fields."
+                ),
+            )
+            parser.add_argument(
+                "--math-ratio",
+                type=float,
+                default=0.7,
+                help=(
+                    "Ratio of math samples to total samples when mixing math and QA data. "
+                    "Valid range: [0.0, 1.0]. Default: 0.7 means 70% math and 30% QA."
+                ),
+            )
+            parser.add_argument('--batch-alternation', action='store_true', 
+                                help='Enable batch-level alternation mode')
+            parser.add_argument('--math-batches-per-cycle', type=int, default=1,
+                                help='Number of math batches per cycle in alternation mode')
+            parser.add_argument('--qa-batches-per-cycle', type=int, default=1,
+                                help='Number of QA batches per cycle in alternation mode')
+            parser.add_argument('--phase-aware-alternation', action='store_true',
+                                help='Enable phase-aware alternation: prefer QA during training and math after policy update.')
+            parser.add_argument('--phase-aware-train-task', type=str, default='qa', choices=['math', 'qa'],
+                                help='Task type preferred while training is in progress in phase-aware alternation.')
+            parser.add_argument('--phase-aware-post-update-task', type=str, default='math', choices=['math', 'qa'],
+                                help='Task type preferred after policy update in phase-aware alternation.')
+            parser.add_argument(
+                '--count-aware-alternation',
+                action='store_true',
+                help=(
+                    'Select the phase-aware direction from the previous training composition: '
+                    'math-heavy selects train=qa/post-update=math; QA-heavy selects '
+                    'train=math/post-update=qa, while preserving per-cycle task quotas.'
+                ),
+            )
+
+            parser.add_argument('--dynamic-alternation', action='store_true', 
+                                help='Enable dynamic alternation mode based on policy version and in-flight tasks')
+            parser.add_argument('--lag-version', type=int, default=5,
+                                help='Lag version tolerance for dynamic alternation mode')
+            parser.add_argument('--dynamic-alternation-alpha', type=float, default=0.5,
+                                help='Weight of the lag-based ratio in dynamic alternation. 0 keeps math-ratio, 1 uses pure lag-based ratio.')
+            parser.add_argument('--dynamic-alternation-warmup-steps', type=int, default=5,
+                                help='Number of initial policy versions that use math-ratio before enabling lag-based dynamic alternation.')
+            parser.add_argument('--dynamic-alternation-min-math-ratio', type=float, default=0.3,
+                                help='Lower bound for math dispatch probability in dynamic alternation.')
+            parser.add_argument('--dynamic-alternation-max-math-ratio', type=float, default=0.7,
+                                help='Upper bound for math dispatch probability in dynamic alternation.')
+
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
@@ -766,6 +882,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
             parser.add_argument("--eval-max-context-len", type=int, default=None)
+            parser.add_argument(
+                "--eval-dataset-override",
+                type=str,
+                default=None,
+                action="append",
+                help=(
+                    "Per-dataset eval config overrides in the format 'name.key=value'. "
+                    "Repeatable for multiple overrides across datasets. "
+                    "Example: --eval-dataset-override aime.n_samples_per_eval_prompt=16 "
+                    "--eval-dataset-override nq_test.wandb_prefix=eval2"
+                ),
+            )
 
             return parser
 
@@ -1190,6 +1318,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
+            parser.add_argument(
+                "--grad-log-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Directory to save per-parameter gradient statistics. "
+                    "If set, after each training step a lightweight stats file is saved "
+                    "with per-parameter mean_abs, max_abs, std_abs, norm and sparsity. "
+                    "Useful for comparing gradient patterns across different training modes."
+                ),
+            )
             # use together with --record-memory-history and --memory-snapshot-path (defined in Megatron)
             parser.add_argument(
                 "--memory-snapshot-dir",
@@ -1546,6 +1685,32 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
         datasets_config = []
 
     eval_datasets = build_eval_dataset_configs(args, datasets_config, defaults)
+
+    # Apply per-dataset overrides from --eval-dataset-override
+    overrides = getattr(args, "eval_dataset_override", None) or []
+    for override in overrides:
+        # format: "dataset_name.key=value"
+        pattern = r"^([^.]+)\.(.+)=(.+)$"
+        m = re.match(pattern, override)
+        if m is None:
+            logger.warning(f"Malformed --eval-dataset-override: {override!r} (expected name.key=value)")
+            continue
+        ds_name, ds_key, ds_value = m.group(1), m.group(2), m.group(3)
+        for ds in eval_datasets:
+            if ds.name == ds_name:
+                # Attempt numeric parsing, fall back to string
+                try:
+                    ds_value = int(ds_value)
+                except ValueError:
+                    try:
+                        ds_value = float(ds_value)
+                    except ValueError:
+                        pass
+                setattr(ds, ds_key, ds_value)
+                break
+        else:
+            logger.warning(f"--eval-dataset-override: no dataset named {ds_name!r} found, skipping")
+
     if eval_datasets:
         args.eval_prompt_data = [item for dataset in eval_datasets for item in (dataset.name, dataset.path)]
     else:

@@ -4,6 +4,8 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 
 def train(args):

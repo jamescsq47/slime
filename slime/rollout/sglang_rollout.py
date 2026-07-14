@@ -6,6 +6,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from typing import Any
+import wandb
 
 import numpy as np
 import pybase64
@@ -34,7 +35,7 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
-
+_wandb_metric_defined = False
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
@@ -429,6 +430,198 @@ async def generate_rollout_async(
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+    try:
+        print("record tool call counts for analysis")
+        tool_time_counts = []
+        sample_time_counts = []
+        code_call_counts = []
+        search_call_counts = []
+        metrics_to_log = {}
+        task_types = []
+        math_samples = []  
+        qa_samples = [] 
+
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_time'):
+                    tool_time_counts.append(sample.tool_time)
+                if hasattr(sample, 'sample_time'):
+                    sample_time_counts.append(sample.sample_time)
+                if hasattr(sample, 'code_call_count'):
+                    code_call_counts.append(sample.code_call_count)
+                if hasattr(sample, 'search_call_count'):
+                    search_call_counts.append(sample.search_call_count)
+                if hasattr(sample, 'metadata'):
+                    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                    task_type = metadata.get("task_type", "error") 
+                    task_types.append(task_type)
+                    if task_type == "math":
+                        math_samples.append(sample)
+                    elif task_type == "qa":
+                        qa_samples.append(sample)
+
+        if task_types:
+            total_math = len(math_samples)
+            total_qa = len(qa_samples)
+
+            def _get_reward_score(r):
+                if r is None:
+                    return 0.0
+                if isinstance(r, dict):
+                    return r.get("score", 0.0)
+                if isinstance(r, (float, int)):
+                    return r
+                if hasattr(r, "item"):
+                    return r.item()
+                return 0.0
+
+            def _get_reward_acc(r):
+                if r is None:
+                    return None
+                if isinstance(r, dict):
+                    if "acc" in r:
+                        return float(r["acc"])
+                    if "score" in r:
+                        return 1.0 if r["score"] >= 0.8 else 0.0
+                    return None
+                if isinstance(r, (float, int)):
+                    return 1.0 if r >= 0.8 else 0.0
+                if hasattr(r, "item"):
+                    return 1.0 if r.item() >= 0.8 else 0.0
+                return None
+
+            def _average_acc(samples):
+                accs = [_get_reward_acc(s.reward) for s in samples]
+                accs = [acc for acc in accs if acc is not None]
+                return sum(accs) / len(accs) if accs else 0
+
+            math_reward_avg = sum(_get_reward_score(s.reward) for s in math_samples) / total_math if total_math > 0 else 0
+            qa_reward_avg = sum(_get_reward_score(s.reward) for s in qa_samples) / total_qa if total_qa > 0 else 0
+            math_acc_avg = _average_acc(math_samples)
+            qa_acc_avg = _average_acc(qa_samples)
+            
+            # Calculate math task sample_time stats
+            math_sample_times = [s.sample_time for s in math_samples if hasattr(s, 'sample_time')]
+            math_sample_time_max = max(math_sample_times) if math_sample_times else 0
+            math_sample_time_avg = sum(math_sample_times) / len(math_sample_times) if math_sample_times else 0
+            
+            # Calculate qa task sample_time stats
+            qa_sample_times = [s.sample_time for s in qa_samples if hasattr(s, 'sample_time')]
+            qa_sample_time_max = max(qa_sample_times) if qa_sample_times else 0
+            qa_sample_time_avg = sum(qa_sample_times) / len(qa_sample_times) if qa_sample_times else 0
+            
+            # Calculate math task response_length stats
+            math_response_lengths = [s.response_length for s in math_samples if hasattr(s, 'response_length')]
+            math_response_length_max = max(math_response_lengths) if math_response_lengths else 0
+            math_response_length_avg = sum(math_response_lengths) / len(math_response_lengths) if math_response_lengths else 0
+            
+            # Calculate qa task response_length stats
+            qa_response_lengths = [s.response_length for s in qa_samples if hasattr(s, 'response_length')]
+            qa_response_length_max = max(qa_response_lengths) if qa_response_lengths else 0
+            qa_response_length_avg = sum(qa_response_lengths) / len(qa_response_lengths) if qa_response_lengths else 0
+            
+            metrics_to_log.update({
+                "tool/math_count": total_math,
+                "tool/qa_count": total_qa,
+                "tool/math_reward": math_reward_avg,
+                "tool/qa_reward": qa_reward_avg,
+                "tool/math_acc": math_acc_avg,
+                "tool/qa_acc": qa_acc_avg,
+                "tool/math_sample_time_max": math_sample_time_max,
+                "tool/math_sample_time_avg": math_sample_time_avg,
+                "tool/qa_sample_time_max": qa_sample_time_max,
+                "tool/qa_sample_time_avg": qa_sample_time_avg,
+                "tool/math_response_length_max": math_response_length_max,
+                "tool/math_response_length_avg": math_response_length_avg,
+                "tool/qa_response_length_max": qa_response_length_max,
+                "tool/qa_response_length_avg": qa_response_length_avg,
+            })
+
+        if tool_time_counts:
+            avg_tool_times = sum(tool_time_counts) / len(tool_time_counts)
+            avg_sample_times = sum(sample_time_counts) / len(sample_time_counts) if sample_time_counts else 0.0
+            avg_tool_times_ratio_per_sample = [
+                t / s if s > 0 else 0.0
+                for t, s in zip(tool_time_counts, sample_time_counts)
+            ]
+
+            metrics_to_log.update({
+                "tool/avg_tool_calls_time": avg_tool_times,
+                "tool/avg_sample_time": avg_sample_times,
+                "tool/avg_tool_time_ratio_per_sample": sum(avg_tool_times_ratio_per_sample) / len(avg_tool_times_ratio_per_sample) if avg_tool_times_ratio_per_sample else 0.0,
+                "tool/avg_code_call_count": sum(code_call_counts) / len(code_call_counts) if code_call_counts else 0.0,
+                "tool/avg_search_call_count": sum(search_call_counts) / len(search_call_counts) if search_call_counts else 0.0,
+            })
+            
+        
+        tool_call_counts = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_call_count'):
+                    tool_call_counts.append(sample.tool_call_count)
+        
+        if tool_call_counts:
+            avg_tool_calls = sum(tool_call_counts) / len(tool_call_counts)
+            samples_with_tool_calls = sum(1 for count in tool_call_counts if count > 0)
+
+            metrics_to_log.update({
+                "tool/avg_tool_calls_per_sample": avg_tool_calls,
+                "tool/total_tool_calls": sum(tool_call_counts),
+                "tool/samples_with_tool_calls": samples_with_tool_calls,
+            })
+
+        tool_token_counts = []
+        response_lengths = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'tool_token_count'):
+                    tool_token_counts.append(sample.tool_token_count)
+                    response_lengths.append(sample.response_length)
+
+        if tool_token_counts:
+            total_tool_tokens = sum(tool_token_counts)
+            avg_tool_tokens = total_tool_tokens / len(tool_token_counts)
+            per_sample_ratios = [
+                t / r if r > 0 else 0.0
+                for t, r in zip(tool_token_counts, response_lengths)
+            ]
+            tool_token_ratio = sum(per_sample_ratios) / len(per_sample_ratios)
+            metrics_to_log.update({
+                "tool/avg_tool_tokens_per_sample": avg_tool_tokens,
+                "tool/tool_token_ratio_in_response": tool_token_ratio,
+            })
+        
+        mismatch_counts = []
+        for group in data:
+            for sample in group:
+                if hasattr(sample, 'mismatch'):
+                    mismatch_counts.append(sample.mismatch)
+         
+
+        if mismatch_counts:
+            total_mismatches = sum(mismatch_counts)
+            avg_mismatches = total_mismatches / len(mismatch_counts)
+            samples_with_mismatches = sum(1 for m in mismatch_counts if m > 0)
+
+            metrics_to_log.update({
+                "debug/total_mismatches": total_mismatches,
+                "debug/avg_mismatches_per_sample": avg_mismatches,
+                "debug/samples_with_mismatches": samples_with_mismatches,
+            })
+
+        # Use a dedicated rollout step axis to avoid conflicts with other threads logging wandb step.
+        if metrics_to_log:
+            global _wandb_metric_defined
+            if not _wandb_metric_defined:
+                wandb.define_metric("rollout/step")
+                wandb.define_metric("tool/*", step_metric="rollout/step")
+                wandb.define_metric("debug/*", step_metric="rollout/step")
+                _wandb_metric_defined = True
+
+            metrics_to_log["rollout/step"] = rollout_id
+            wandb.log(metrics_to_log)
+    except Exception:
+        logger.warning("Failed to compute/record tool metrics", exc_info=True)
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -508,6 +701,13 @@ async def eval_rollout_single_dataset(
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 
+    # When label_key points to a dict column (e.g. {"ground_truth": "18", ...}),
+    # extract the inner field so downstream reward functions get a plain string.
+    if dataset_cfg.label_sub_key is not None:
+        for s in dataset.samples:
+            if isinstance(s.label, dict):
+                s.label = str(s.label.get(dataset_cfg.label_sub_key, ""))
+
     base_sampling_params = dict(
         temperature=dataset_cfg.temperature,
         top_p=dataset_cfg.top_p,
@@ -567,12 +767,21 @@ async def eval_rollout_single_dataset(
 
     data.sort(key=lambda sample: sample.index)
 
-    reward_key = args.eval_reward_key or args.reward_key
+    reward_key = dataset_cfg.eval_reward_key or args.eval_reward_key or args.reward_key
+
+    def _extract_reward(sample: Sample) -> float:
+        if not reward_key:
+            return sample.reward
+        if isinstance(sample.reward, dict):
+            return sample.reward[reward_key]
+        return sample.reward  # reward func returned a scalar (e.g. qa reward)
+
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [_extract_reward(sample) for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "wandb_prefix": dataset_cfg.wandb_prefix or "eval",
         }
     }
 

@@ -978,7 +978,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutF
 
             if do_print:
                 print(
-                    f"First rollout sample: {[group[0].prompt + group[0].response]}, "
+                    f"First rollout sample: {[str(group[0].prompt) + group[0].response]}, "
                     f"label: {group[0].label}, reward: {group[0].reward}",
                     flush=True,
                 )
@@ -1010,7 +1010,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutF
 
     if data:
         print(
-            f"Finish rollout: {[data[-1][0].prompt + data[-1][0].response]}, "
+            f"Finish rollout: {[str(data[-1][0].prompt) + data[-1][0].response]}, "
             f"label: {data[-1][0].label}, reward: {data[-1][0].reward}",
             flush=True,
         )

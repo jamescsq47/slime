@@ -718,7 +718,19 @@ def policy_loss_function(
         # *pre-RS* valid tokens. If we aggregate metrics with `modified_response_masks`, the rejected
         # tokens are excluded from the denominator and the metric can be artificially driven to 0.
         # Keep a copy of the original reducer (based on `batch["loss_masks"]`) for metric aggregation.
-        sum_of_sample_mean_for_mismatch_metrics = sum_of_sample_mean
+        # A fully masked partial rollout has no statistical observation.  Do
+        # not turn it into a literal zero in mismatch metrics such as TIS/OIS.
+        # The corresponding per-metric denominator is returned below and
+        # reduced with the metric across data-parallel ranks.
+        sum_of_sample_mean_for_mismatch_metrics = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            batch["loss_masks"],
+            args.calculate_per_token_loss,
+            args.qkv_format,
+            max_seq_lens,
+            skip_empty_samples=True,
+        )
 
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
@@ -793,9 +805,21 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
+    mismatch_metric_normalizer = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        if args.get_mismatch_metrics or args.use_tis:
+            train_rollout_logprob_abs_diff = sum_of_sample_mean_for_mismatch_metrics(
+                (old_log_probs - rollout_log_probs).abs()
+            )
+        else:
+            train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+
+    if args.get_mismatch_metrics or args.use_tis:
+        if args.calculate_per_token_loss:
+            mismatch_metric_normalizer = sum(loss_mask.sum() for loss_mask in batch["loss_masks"])
+        else:
+            mismatch_metric_normalizer = sum((loss_mask.sum() > 0).to(torch.long) for loss_mask in batch["loss_masks"])
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -814,11 +838,68 @@ def policy_loss_function(
     if args.get_mismatch_metrics or args.use_tis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
+        # This uses the default batch denominator and makes mask-induced data
+        # loss visible without contaminating the actual mismatch statistics.
+        reported_loss["mismatch_valid_fraction"] = mismatch_metric_normalizer
         reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()
         # Assume all metrics are already cloned and detached
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean_for_mismatch_metrics(metric_value)
+
+        # `loss_function` consumes this private entry to give mismatch metrics
+        # their own denominator.  It is deliberately not emitted to W&B.
+        for key in ("train_rollout_logprob_abs_diff", "ois", *tis_metrics.keys()):
+            if key in reported_loss:
+                reported_loss[f"_metric_normalizer/{key}"] = mismatch_metric_normalizer
+
+        task_types = batch.get("task_types")
+        if task_types is not None:
+            assert len(task_types) == len(batch["loss_masks"]), "task_types must align with loss_masks"
+            mismatch_metrics = {**tis_metrics, "ois": ois}
+            if train_rollout_logprob_abs_diff is not None:
+                mismatch_metrics["train_rollout_logprob_abs_diff"] = (old_log_probs - rollout_log_probs).abs()
+
+            # Always emit both task namespaces.  This keeps the logging keys
+            # identical on every rank even when a micro-batch is single-task.
+            for task_type in ("math", "qa"):
+                task_loss_masks = [
+                    loss_mask if sample_task_type == task_type else torch.zeros_like(loss_mask)
+                    for sample_task_type, loss_mask in zip(task_types, batch["loss_masks"], strict=True)
+                ]
+                task_metric_reducer = get_sum_of_sample_mean(
+                    total_lengths,
+                    response_lengths,
+                    task_loss_masks,
+                    args.calculate_per_token_loss,
+                    args.qkv_format,
+                    max_seq_lens,
+                    skip_empty_samples=True,
+                )
+                if args.calculate_per_token_loss:
+                    task_metric_normalizer = sum(loss_mask.sum() for loss_mask in task_loss_masks)
+                    task_total_normalizer = sum(
+                        loss_mask.sum() for loss_mask, sample_task_type in zip(
+                            batch["loss_masks"], task_types, strict=True
+                        )
+                        if sample_task_type == task_type
+                    )
+                else:
+                    task_metric_normalizer = sum(
+                        (loss_mask.sum() > 0).to(torch.long) for loss_mask in task_loss_masks
+                    )
+                    task_total_normalizer = sum(
+                        torch.ones((), dtype=torch.long, device=loss_mask.device)
+                        for loss_mask, sample_task_type in zip(batch["loss_masks"], task_types, strict=True)
+                        if sample_task_type == task_type
+                    )
+
+                reported_loss[f"{task_type}_mismatch_valid_fraction"] = task_metric_normalizer
+                reported_loss[f"_metric_normalizer/{task_type}_mismatch_valid_fraction"] = task_total_normalizer
+                for metric_key, metric_value in mismatch_metrics.items():
+                    key_name = f"{task_type}_{metric_key}"
+                    reported_loss[key_name] = task_metric_reducer(metric_value)
+                    reported_loss[f"_metric_normalizer/{key_name}"] = task_metric_normalizer
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
@@ -998,6 +1079,11 @@ def loss_function(
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
+    metric_normalizers = {}
+    for key in list(log):
+        if key.startswith("_metric_normalizer/"):
+            metric_normalizers[key.removeprefix("_metric_normalizer/")] = log.pop(key)
+
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so
     # the CP gather's backward (reduce-scatter) is not called, deadlocking other CP
@@ -1026,6 +1112,15 @@ def loss_function(
                 ]
                 + list(log.values()),
                 device=logits.device,
+            ),
+            "metric_normalizers": torch.stack(
+                [
+                    torch.as_tensor(
+                        metric_normalizers.get(key, num_tokens if args.calculate_per_token_loss else num_samples),
+                        device=logits.device,
+                    )
+                    for key in log
+                ]
             ),
         },
     )

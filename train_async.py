@@ -41,7 +41,9 @@ def train(args):
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
 
-        # Start the next rollout early.
+        # Start the next rollout early. It will run while this rollout is training,
+        # so mark the data source as being in the training phase before dispatches happen.
+        ray.get(rollout_manager.set_policy_phase.remote("train"))
         if rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 

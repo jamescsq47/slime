@@ -57,6 +57,7 @@ def get_sum_of_sample_mean(
     calculate_per_token_loss: bool = False,
     qkv_format: str = "thd",
     max_seq_lens: list[int] | None = None,
+    skip_empty_samples: bool = False,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Calculate correct sample mean for CP
@@ -67,7 +68,9 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+                    (x_i * loss_mask_i).sum()
+                    / torch.clamp_min(loss_mask_i.sum(), 1)
+                    * (loss_mask_i.sum() > 0 if skip_empty_samples else 1)
                     for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
                 ]
             )
@@ -100,7 +103,9 @@ def get_sum_of_sample_mean(
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
+                    (x_i * chunked_loss_mask).sum()
+                    / torch.clamp_min(loss_mask.sum(), 1)
+                    * (loss_mask.sum() > 0 if skip_empty_samples else 1)
                     for x_i, chunked_loss_mask, loss_mask in zip(
                         x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
                     )

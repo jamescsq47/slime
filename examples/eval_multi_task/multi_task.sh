@@ -2,14 +2,15 @@
 
 # for rerun the task
 pkill -9 sglang
-sleep 3
 ray stop --force
-pkill -9 ray
-pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
-
+sleep 3
+rm -rf /tmp/ray/          # ← 加这行，清掉残留 session
+sleep 3
+rm -rf /tmp/ray/          # ← 加这行，清掉残留 session
+ray stop --force 2>/dev/null  # 再清一次确保干净
 set -ex
 
 # will prevent ray from buffering stdout/stderr
@@ -29,16 +30,16 @@ source "${REPO_ROOT}/scripts/models/qwen3-4B.sh"
 EVAL_CONFIG_PATH="${REPO_ROOT}/examples/eval_multi_task/multi_task.yaml"
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-4B
+   --hf-checkpoint /workspace/Qwen3-4B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /root/Qwen3-4B_torch_dist
-   --load /root/Qwen3-4B_slime/
-   --save /root/Qwen3-4B_slime/
-   --save-interval 20
+   --ref-load /workspace/Qwen3-4B_torch_dist
+   # --load /root/Qwen3-4B_slime/
+   # --save /root/Qwen3-4B_slime/
+   # --save-interval 20
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/dapo-math-17k/dapo-math-17k.jsonl
+   --prompt-data /workspace/data/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -99,12 +100,17 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-project eval
    --wandb-group multi_task
-   --wandb-key ${WANDB_KEY}
+   --wandb-key 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
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
+)
+
+CUSTOM_ARGS=(
+   --custom-generate-function-path generate_with_hybrid.generate_unified
+   --custom-rm-path generate_with_hybrid.reward_func_unified
 )
 
 MISC_ARGS=(
@@ -120,12 +126,23 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+ray start --head --node-ip-address ${MASTER_ADDR}  --dashboard-port ${DASHBOARD_PORT} --num-gpus 8 --num-cpus 64 --disable-usage-stats
+
+# Wait for the Ray dashboard and job agent to be fully ready
+echo "Waiting for Ray agent to initialize..."
+for i in {1..30}; do
+  if curl -s http://${MASTER_ADDR}:${DASHBOARD_PORT}/api/jobs/ 1>/dev/null; then
+    echo "Ray agent is up!"
+    break
+  fi
+  sleep 1
+done
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${REPO_ROOT}/examples/hybrid\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
@@ -146,4 +163,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
+   ${CUSTOM_ARGS[@]} \
    ${MISC_ARGS[@]}

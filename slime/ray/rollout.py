@@ -20,7 +20,7 @@ from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
-from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
+from slime.utils.http_utils import _wrap_ipv6, find_available_port, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
@@ -385,7 +385,7 @@ class RolloutManager:
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
         self._fully_async_log_step = 0
-        self.update_runtime_state(current_rollout_id=-1, current_policy_version=0)
+        self.update_runtime_state(current_rollout_id=-1, current_policy_version=0, current_policy_phase="post_update")
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -464,6 +464,12 @@ class RolloutManager:
         logging_utils.log(self.args, fully_async_metrics, step_key="fully_async/step")
         self._fully_async_log_step = fully_async_step + 1
 
+
+    def set_policy_phase(self, phase: str):
+        if phase not in {"train", "post_update"}:
+            raise ValueError(f"Unsupported policy phase: {phase}")
+        self.update_runtime_state(current_policy_phase=phase)
+
     def before_weight_update(self, policy_version: int):
         """Called *before* weights are synced.
 
@@ -477,7 +483,7 @@ class RolloutManager:
 
         ``policy_version`` is the **new** version just applied.
         """
-        self.update_runtime_state(current_policy_version=policy_version)
+        self.update_runtime_state(current_policy_version=policy_version, current_policy_phase="post_update")
         result = self._call_generate_rollout_hook("after_weight_update", policy_version=policy_version)
         self._log_fully_async_metrics(result)
         return result
@@ -531,6 +537,82 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+
+        train_time_masked_count = 0
+        if (
+            getattr(self.args, "mask_offpolicy_math", None) is not None
+            or getattr(self.args, "mask_offpolicy_qa", None) is not None
+        ):
+            for sample in data:
+                train_time_masked_count += int(self._apply_train_time_offpolicy_mask(sample))
+            if train_time_masked_count:
+                logger.info(f"Applied train-time off-policy mask to {train_time_masked_count} samples")
+
+        # Record actual training data composition for dynamic alternation or per-task mask
+        need_task_counts = (
+            getattr(self.args, 'partial_rollout', False)
+            or getattr(self.data_source, 'dynamic_alternation', False)
+            or getattr(self.data_source, 'count_aware_alternation', False)
+            or getattr(self.args, 'mask_offpolicy_math', None) is not None
+            or getattr(self.args, 'mask_offpolicy_qa', None) is not None
+        )
+        if need_task_counts:
+            task_counts = {}
+            for sample in data:
+                task_type = (sample.metadata or {}).get("task_type", "math")
+                task_counts[task_type] = task_counts.get(task_type, 0) + 1
+            version = getattr(self.args, 'current_policy_version', 0)
+            if not hasattr(self.data_source, 'version_task_counts'):
+                self.data_source.version_task_counts = {}
+            self.data_source.version_task_counts[version] = task_counts
+            logger.info(f"[v{version}] recorded training composition: {task_counts}")
+
+            # Count effective (unmasked) samples and max version lag.
+            sample_effective_counts = {"math": 0, "qa": 0}
+            sample_masked_counts = {"math": 0, "qa": 0}
+            total_sample_effective = 0
+            total_sample_masked = 0
+            max_version_lag = 0
+            for sample in data:
+                metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                task_type = metadata.get("task_type", "math")
+                masked = metadata.get("offpolicy_masked", False)
+                if masked:
+                    sample_masked_counts[task_type] = sample_masked_counts.get(task_type, 0) + 1
+                    total_sample_masked += 1
+                else:
+                    sample_effective_counts[task_type] = sample_effective_counts.get(task_type, 0) + 1
+                    total_sample_effective += 1
+
+                dv = metadata.get("dispatch_version", None)
+                if dv is not None:
+                    lag = version - dv
+                    if lag > max_version_lag:
+                        max_version_lag = lag
+
+            # Compute per-group lag_sample metrics
+            lag_metrics = self._compute_lag_sample_metrics(data, version)
+            # Combine all training-data metrics
+            train_metrics = {
+                "tool/math_sample_effective": sample_effective_counts.get("math", 0),
+                "tool/qa_sample_effective": sample_effective_counts.get("qa", 0),
+                "tool/total_sample_effective": total_sample_effective,
+                "tool/math_sample_masked": sample_masked_counts.get("math", 0),
+                "tool/qa_sample_masked": sample_masked_counts.get("qa", 0),
+                "tool/total_sample_masked": total_sample_masked,
+                "tool/max_version_lag": max_version_lag,
+                **(lag_metrics or {}),
+            }
+            if metrics is None:
+                metrics = {}
+            metrics.update(train_metrics)
+            # Direct wandb logging to ensure these metrics are recorded
+            try:
+                import wandb
+                wandb.log({**train_metrics, "rollout/step": rollout_id})
+            except Exception as e:
+                logger.warning(f"Failed to log training data metrics to wandb: {e}")
+
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
@@ -538,6 +620,77 @@ class RolloutManager:
             return
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+
+    def _compute_lag_sample_metrics(self, samples, current_version):
+        """Compute per-group lag_sample_math and lag_sample_qa metrics.
+
+        For each group, computes how many samples of its task type were trained
+        across the versions between its dispatch_version and current_version.
+        Returns a dict of metrics to be logged via wandb.
+        """
+        version_task_counts = getattr(self.data_source, 'version_task_counts', {})
+        if not version_task_counts:
+            logger.info("[lag_metrics] version_task_counts is empty, skipping")
+            return {}
+
+        # Group samples by group_index, extract (task_type, dispatch_version) per group
+        groups = {}
+        none_dispatch_count = 0
+        for sample in samples:
+            gid = getattr(sample, 'group_index', None)
+            if gid is None:
+                continue
+            if gid not in groups:
+                metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                dispatch_version = metadata.get("dispatch_version", None)
+                if dispatch_version is None:
+                    none_dispatch_count += 1
+                groups[gid] = {
+                    "task_type": metadata.get("task_type", "math"),
+                    "dispatch_version": dispatch_version,
+                }
+
+        if none_dispatch_count > 0:
+            logger.warning(f"[lag_metrics] {none_dispatch_count}/{len(groups)} groups have dispatch_version=None")
+
+        # Compute lag_sample per group
+        math_lag_samples = []
+        qa_lag_samples = []
+
+        for gid, info in groups.items():
+            dispatch_version = info["dispatch_version"]
+            task_type = info["task_type"]
+            if dispatch_version is None:
+                continue
+
+            my_lag = current_version - dispatch_version
+            if my_lag <= 0:
+                lag_sample = 0
+            else:
+                lag_sample = 0
+                for v in range(dispatch_version, current_version):
+                    lag_sample += version_task_counts.get(v, {}).get(task_type, 0)
+
+            if task_type == "math":
+                math_lag_samples.append(lag_sample)
+            else:
+                qa_lag_samples.append(lag_sample)
+
+        logger.info(
+            f"[lag_metrics] current_version={current_version}, "
+            f"version_task_counts_keys={list(version_task_counts.keys())}, "
+            f"groups={len(groups)}, math_lags={len(math_lag_samples)}, qa_lags={len(qa_lag_samples)}"
+        )
+
+        result = {}
+        if math_lag_samples:
+            result["tool/lag_sample_math_average"] = sum(math_lag_samples) / len(math_lag_samples)
+            result["tool/lag_sample_math_max"] = max(math_lag_samples)
+        if qa_lag_samples:
+            result["tool/lag_sample_qa_average"] = sum(qa_lag_samples) / len(qa_lag_samples)
+            result["tool/lag_sample_qa_max"] = max(qa_lag_samples)
+
+        return result
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -728,6 +881,62 @@ class RolloutManager:
 
         return raw_rewards, raw_rewards
 
+    def _get_task_offpolicy_mask_threshold(self, task_type: str) -> int | None:
+        if task_type == "math":
+            return getattr(self.args, "mask_offpolicy_math", None)
+        if task_type == "qa":
+            return getattr(self.args, "mask_offpolicy_qa", None)
+        return None
+
+    def _get_train_time_lag_sample_decision(self, sample: Sample) -> tuple[bool, int | None, int | None]:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        task_type = metadata.get("task_type", "math")
+        threshold = self._get_task_offpolicy_mask_threshold(task_type)
+        if threshold is None:
+            return False, None, None
+
+        dispatch_version = metadata.get("dispatch_version", None)
+        if dispatch_version is None:
+            return False, None, threshold
+
+        try:
+            dispatch_version = int(dispatch_version)
+        except (TypeError, ValueError):
+            return False, None, threshold
+
+        current_version = getattr(self.args, "current_policy_version", 0)
+        if current_version - dispatch_version <= 0:
+            return False, 0, threshold
+
+        version_task_counts = getattr(self.data_source, "version_task_counts", {})
+        lag_sample = 0
+        for version in range(dispatch_version, current_version):
+            lag_sample += version_task_counts.get(version, {}).get(task_type, 0)
+
+        return lag_sample >= threshold, lag_sample, threshold
+
+    def _apply_train_time_offpolicy_mask(self, sample: Sample) -> bool:
+        should_mask, lag_sample, threshold = self._get_train_time_lag_sample_decision(sample)
+        if not should_mask:
+            return False
+
+        if sample.loss_mask is None:
+            sample.loss_mask = [1] * sample.response_length
+
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        metadata["offpolicy_masked"] = True
+        metadata["train_time_offpolicy_masked"] = True
+        metadata["train_time_lag_sample"] = lag_sample
+        metadata["train_time_mask_threshold"] = threshold
+        sample.metadata = metadata
+
+        # If the generator already masked a partial rollout, keep its finer-grained
+        # old-token/new-token mask. Otherwise this whole completed response was
+        # generated under a stale dispatch version, so mask it out before training.
+        if not metadata.get("partial_rollout"):
+            sample.loss_mask = [0] * sample.response_length
+        return True
+
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
         Convert inference generated samples to training data.
@@ -743,6 +952,10 @@ class RolloutManager:
         train_data = {
             "tokens": [sample.tokens for sample in samples],
             "response_lengths": [sample.response_length for sample in samples],
+            "task_types": [
+                (sample.metadata if isinstance(sample.metadata, dict) else {}).get("task_type", "unknown")
+                for sample in samples
+            ],
             # some reward model, e.g. remote rm, may return multiple rewards,
             # we could use key to select the reward.
             "rewards": rewards,
@@ -762,6 +975,7 @@ class RolloutManager:
             assert (
                 len(sample.loss_mask) == sample.response_length
             ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+            self._apply_train_time_offpolicy_mask(sample)
             if sample.remove_sample:
                 sample.loss_mask = [0] * sample.response_length
             loss_masks.append(sample.loss_mask)
@@ -830,6 +1044,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "task_types",
             ]:
                 if key not in data:
                     continue
@@ -963,7 +1178,10 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     if not force_new and args.sglang_router_ip is not None:
         return args.sglang_router_ip, args.sglang_router_port
 
-    router_ip = _wrap_ipv6(get_host_info()[1])
+    # Use the address by which this node joined Ray.  On multi-homed hosts,
+    # get_host_info() follows the default route and may return a public IP
+    # that worker nodes cannot reach (the Ray cluster itself uses the IB IP).
+    router_ip = _wrap_ipv6(ray.util.get_node_ip_address())
     if force_new:
         router_port = find_available_port(random.randint(3000, 4000))
     else:
@@ -990,7 +1208,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_args.disable_circuit_breaker = True
 
     # We will not use the health check from router.
-    router_args.disable_health_check = True
+    # router_args.disable_health_check = True
 
     logger.info(f"Launch router with args: {router_args}")
 
@@ -1199,19 +1417,20 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        wandb_prefix = data[key].get("wandb_prefix", "eval")
+        log_dict[f"{wandb_prefix}/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"{wandb_prefix}/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+            log_dict[f"{wandb_prefix}/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
                     group_size=args.n_samples_per_eval_prompt,
                 ),
-                f"eval/{key}-",
+                f"{wandb_prefix}/{key}-",
             )
 
     logger.info(f"eval {rollout_id}: {log_dict}")

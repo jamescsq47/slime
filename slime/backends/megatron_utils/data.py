@@ -1,4 +1,5 @@
 import logging
+import os
 from argparse import Namespace
 from collections.abc import Sequence
 
@@ -11,6 +12,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
+from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -307,7 +309,19 @@ def get_data_iterator(
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-    dp_group = mpu.get_data_parallel_group()
+    dynamic_batch_sync_backend = os.environ.get("SLIME_DYNAMIC_BATCH_SYNC_BACKEND", "nccl").lower()
+    if dynamic_batch_sync_backend not in {"nccl", "gloo_dp", "gloo_world"}:
+        raise ValueError(
+            "SLIME_DYNAMIC_BATCH_SYNC_BACKEND must be one of "
+            "'nccl', 'gloo_dp', or 'gloo_world', "
+            f"got {dynamic_batch_sync_backend!r}"
+        )
+    if dynamic_batch_sync_backend == "gloo_world":
+        microbatch_sync_group = get_gloo_group()
+    elif dynamic_batch_sync_backend == "gloo_dp":
+        microbatch_sync_group = mpu.get_data_parallel_group_gloo()
+    else:
+        microbatch_sync_group = mpu.get_data_parallel_group()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
     if vpp_size is None:
         vpp_size = 1
@@ -350,8 +364,13 @@ def get_data_iterator(
                 get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
             )
 
-        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
-        dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
+        # This is control-plane metadata (normally one integer per rollout
+        # step). Keep the historical NCCL behavior by default; selected
+        # deployments can opt into Gloo when their lazy NCCL DP communicator
+        # cannot safely perform the first collective.
+        device = "cpu" if dynamic_batch_sync_backend.startswith("gloo") else torch.cuda.current_device()
+        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=device)
+        dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=microbatch_sync_group)
 
         if vpp_size > 1:
             # vpp requies the number of microbatches to be divisible by vpp_size
@@ -413,6 +432,8 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "task_types",
+                "metadata",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",

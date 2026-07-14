@@ -118,7 +118,13 @@ def get_model_provider_func(
 
         return provider.provide
 
-    def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
+    def model_provider(
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: int | None = None,
+        config: TransformerConfig | None = None,
+        pg_collection=None,
+    ) -> GPTModel:
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -134,7 +140,8 @@ def get_model_provider_func(
         use_te = args.transformer_impl == "transformer_engine"
 
         # Experimental loading arguments from yaml
-        config: TransformerConfig = core_transformer_config_from_args(args)
+        if config is None:
+            config = core_transformer_config_from_args(args)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -202,6 +209,9 @@ def get_model_provider_func(
             "rope_scaling": args.use_rope_scaling,
         }
 
+        if pg_collection is not None:
+            kwargs["pg_collection"] = pg_collection
+
         if vp_stage is not None:
             kwargs["vp_stage"] = vp_stage
 
@@ -229,12 +239,25 @@ def get_model_provider_func(
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
+    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **megatron_kwargs):
         sig = inspect.signature(original_provider)
-        if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
+        incoming_kwargs = {
+            "pre_process": pre_process,
+            "post_process": post_process,
+            "vp_stage": vp_stage,
+            **megatron_kwargs,
+        }
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
+        # Megatron adds provider keywords over time (for example ``config`` and
+        # ``pg_collection``). Slime's built-in provider constructs these pieces
+        # itself, while custom providers can opt in by declaring the keyword or
+        # accepting **kwargs.
+        provider_kwargs = (
+            incoming_kwargs
+            if accepts_kwargs
+            else {key: value for key, value in incoming_kwargs.items() if key in sig.parameters}
+        )
+        model = original_provider(**provider_kwargs)
 
         freeze_model_params(model, args)
 

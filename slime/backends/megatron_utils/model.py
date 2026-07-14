@@ -51,7 +51,11 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-    wd_incr_steps = args.train_iters * args.global_batch_size
+    # eval-only mode (num_rollout=0): optimizer won't be used, but scheduler
+    # still needs a positive lr_decay_steps to pass its internal assertion.
+    if lr_decay_steps <= 0:
+        lr_decay_steps = 1
+    wd_incr_steps = max(args.train_iters * args.global_batch_size, 1)
     wsd_decay_steps = None
     if args.lr_wsd_decay_iters is not None:
         wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
@@ -296,6 +300,83 @@ def forward_only(
     return rollout_data
 
 
+@torch.no_grad()
+def log_grad_stats(
+    args: Namespace,
+    model: Sequence[DDP],
+    save_dir: str,
+    rollout_id: int,
+    step_id: int,
+) -> None:
+    """Save per-parameter gradient statistics for comparison across training modes.
+
+    For each parameter with a non-None gradient, computes:
+        mean_abs, max_abs, std_abs, norm, sparsity (fraction of near-zero grads).
+
+    Only rank-0 (DP=0, TP=0) within each PP stage writes to disk.
+    The output is a light-weight dict (~hundreds of KB) at
+    ``{save_dir}/grad_stats_pp{pp_rank}_r{rollout_id}_s{step_id}.pt``.
+    """
+    if not (
+        mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+        and mpu.get_tensor_model_parallel_rank() == 0
+    ):
+        return
+
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_world = mpu.get_pipeline_model_parallel_world_size()
+
+    param_stats = []
+
+    for model_chunk in model:
+        module = model_chunk.module
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Megatron DDP may store gradients in .main_grad instead of .grad
+            if param.grad is not None:
+                grad = param.grad.detach().float()
+            elif hasattr(param, "main_grad") and param.main_grad is not None:
+                grad = param.main_grad.detach().float()
+            else:
+                continue
+
+            if grad.numel() == 0:
+                continue
+
+            grad_abs = grad.abs()
+            param_stats.append({
+                "param_name": name,
+                "layer": ".".join(name.split(".")[:-1]) if "." in name else "root",
+                "shape": list(grad.shape),
+                "numel": grad.numel(),
+                "mean_abs": grad_abs.mean().item(),
+                "max_abs": grad_abs.max().item(),
+                "std_abs": grad_abs.std().item(),
+                "norm": grad.norm().item(),
+                "sparsity": (grad_abs < 1e-8).float().mean().item(),
+            })
+
+    if not param_stats:
+        logger.warning("log_grad_stats: no gradients found on any parameter")
+        return
+
+    save_data = {
+        "rollout_id": rollout_id,
+        "step_id": step_id,
+        "pp_rank": pp_rank,
+        "pp_world": pp_world,
+        "num_params": len(param_stats),
+        "params": param_stats,
+    }
+
+    save_path = Path(save_dir) / f"grad_stats_pp{pp_rank}_r{rollout_id}_s{step_id}.pt"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(save_data, str(save_path))
+    logger.info("Saved gradient stats (%d params) to %s", len(param_stats), save_path)
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -372,6 +453,7 @@ def train_one_step(
                 "rollout_log_probs",
                 "max_seq_lens",
                 "teacher_log_probs",
+                "task_types",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -428,6 +510,16 @@ def train_one_step(
         forward_only=False,
     )
 
+    # Log per-parameter gradient stats before any cleanup / optimizer step.
+    if hasattr(args, "grad_log_dir") and args.grad_log_dir is not None:
+        log_grad_stats(
+            args,
+            model,
+            args.grad_log_dir,
+            rollout_id,
+            step_id,
+        )
+
     valid_step = True
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
@@ -464,19 +556,24 @@ def train_one_step(
         # Average loss across microbatches.
         keys = losses_reduced[0]["keys"]
         values = None
+        metric_normalizers = None
         for x in losses_reduced:
             if values is None:
                 values = x["values"]
+                metric_normalizers = x["metric_normalizers"]
             else:
                 values += x["values"]
+                metric_normalizers += x["metric_normalizers"]
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+        torch.distributed.all_reduce(metric_normalizers, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
         loss_reduced = {}
         values = values.tolist()
-        num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:], strict=False):
-            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+        for key, value, normalizer in zip(keys, values[1:], metric_normalizers.tolist(), strict=False):
+            # An all-zero loss mask is excluded from mismatch metrics, whose
+            # normalizer can therefore be zero for an entirely masked batch.
+            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / max(normalizer, 1)
         return loss_reduced, grad_norm
     return {}, grad_norm
 

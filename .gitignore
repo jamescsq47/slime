@@ -193,3 +193,26 @@ glm/
 _examples_synced/
 .env
 .DS_Store
+
+# Model checkpoints and local training/rollout records
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+**/checkpoints/
+**/checkpoint*/
+**/debug/
+
+# Network filesystem leftovers
+.nfs*
+
+# Local analysis outputs
+analysis_report*.md
+concurrent_reqs.csv
+concurrent_reqs_plot.png
+param_analysis_results/
+req_timeline.png
+
+# Claude Code local settings
+.claude/settings.local.json

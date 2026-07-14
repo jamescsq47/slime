@@ -1,5 +1,6 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
 import re
+import time
 from typing import Any
 
 try:
@@ -104,6 +105,13 @@ def postprocess_predictions(prediction: str):
         content = answer_match.group(1).strip()
         return "answer", content
 
+    # Also accept bare \boxed{...} without requiring "Answer:" prefix
+    bare_boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+    bare_boxed_match = re.search(bare_boxed_pattern, prediction, re.DOTALL)
+    if bare_boxed_match:
+        content = bare_boxed_match.group(1).strip()
+        return "answer", content
+
     # Then check for <tool_call> tags (new format from Jinja2 template)
     tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
@@ -177,7 +185,62 @@ def postprocess_responses(resp: str) -> str:
             last_match = matches[-1]
             return resp[: last_match.end()]
 
+    # Also handle bare \boxed{...} without "Answer:" prefix
+    if "\\boxed{" in resp:
+        bare_boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+        matches = list(re.finditer(bare_boxed_pattern, resp, re.DOTALL))
+        if matches:
+            last_match = matches[-1]
+            return resp[: last_match.end()]
+
     return resp
+
+
+def reconstruct_loss_masks(response: str, tokenizer) -> list:
+    """Reconstruct loss masks from response content.
+    Used when resuming a partial rollout.
+    """
+    try:
+        response_tokens = tokenizer(response, add_special_tokens=False)["input_ids"]
+        loss_masks = [1] * len(response_tokens)
+
+        interpreter_pattern = r'<interpreter>(.*?)</interpreter>'
+        matches = list(re.finditer(interpreter_pattern, response, re.DOTALL))
+
+        if not matches:
+            return loss_masks
+
+        for match in matches:
+            start_char = match.start()
+            end_char = match.end()
+
+            prefix = response[:start_char]
+            prefix_tokens = tokenizer(prefix, add_special_tokens=False)["input_ids"]
+            start_token_idx = len(prefix_tokens)
+
+            prefix_with_interpreter = response[:end_char]
+            prefix_with_interp_tokens = tokenizer(prefix_with_interpreter, add_special_tokens=False)["input_ids"]
+            end_token_idx = len(prefix_with_interp_tokens)
+
+            for i in range(start_token_idx, end_token_idx):
+                if i < len(loss_masks):
+                    loss_masks[i] = 0
+
+        return loss_masks
+
+    except Exception as e:
+        print(f"[WARNING] Error reconstructing loss masks: {e}")
+        response_tokens = tokenizer(response, add_special_tokens=False)["input_ids"]
+        loss_masks = [1] * len(response_tokens)
+        return loss_masks
+
+
+def count_tool_turns(response: str) -> int:
+    """Count the number of completed tool turns in the response.
+    Used to determine where to resume generation.
+    """
+    interpreter_count = response.count("</interpreter>")
+    return interpreter_count
 
 
 async def execute_predictions(prediction: str) -> str:
@@ -213,38 +276,107 @@ async def execute_predictions(prediction: str) -> str:
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
-    """Custom generation function supporting tool calls"""
-    assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
+    """Custom generation function supporting tool calls with partial rollout support"""
 
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    # Set up the initial prompt with system prompt and tools (outside the loop)
+    # Initialize total_off_policy_tokens if it doesn't exist
+    if not hasattr(sample, 'total_off_policy_tokens'):
+        sample.total_off_policy_tokens = 0
+
+    # Set up tool specs
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
 
-    prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    response = ""
-    response_token_ids = []
-    loss_masks = []
-    tool_call_count = 0  # Track actual tool call rounds
+    # Ensure metadata exists
+    if not hasattr(sample, 'metadata') or sample.metadata is None:
+        sample.metadata = {}
 
-    for turn in range(TOOL_CONFIGS["max_turns"]):
+    # Check if this is a partial rollout resume
+    if args.partial_rollout and sample.status == Sample.Status.ABORTED and sample.response:
+        # Partial rollout: resume from existing response
+        metadata = sample.metadata
+
+        if metadata.get("formatted_prompt"):
+            prompt = metadata["formatted_prompt"]
+        else:
+            prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+
+        prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
+        # Restore state from saved metadata if available
+        response = sample.response
+        response_token_ids = state.tokenizer(response, add_special_tokens=False)["input_ids"]
+
+        if metadata.get("partial_rollout") and metadata.get("loss_masks") and metadata.get("tool_call_count"):
+            loss_masks = metadata["loss_masks"]
+            if len(loss_masks) != len(response_token_ids):
+                print(f"[WARNING] Saved loss_masks length ({len(loss_masks)}) != response tokens ({len(response_token_ids)})")
+                loss_masks = reconstruct_loss_masks(response, state.tokenizer)
+            tool_call_count = metadata["tool_call_count"]
+            start_turn = metadata.get("current_turn", tool_call_count)
+        else:
+            loss_masks = reconstruct_loss_masks(response, state.tokenizer)
+            tool_call_count = count_tool_turns(response)
+            start_turn = tool_call_count
+
+        # Update off-policy token count
+        sample.total_off_policy_tokens += len(response_token_ids)
+        # Carry over timing from previous attempt(s)
+        _accrued_sample_time = getattr(sample, 'sample_time', 0.0) or 0.0
+        _tool_time = getattr(sample, 'tool_time', 0.0) or 0.0
+    else:
+        # Non-partial rollout: start fresh
+        sample.rollout_log_probs = None
+        sample.response = ""
+        sample.response_length = 0
+        sample.loss_mask = None
+
+        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+        prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        response = ""
+        response_token_ids = []
+        loss_masks = []
+        tool_call_count = 0  # Track actual tool call rounds
+        start_turn = 0
+        _accrued_sample_time = 0.0
+        _tool_time = 0.0
+
+    _start_time = time.monotonic()
+
+    if args.rollout_max_context_len is not None:
+        max_context_length = args.rollout_max_context_len
+    else:
+        max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
+
+    output = None
+
+    for turn in range(start_turn, TOOL_CONFIGS["max_turns"]):
         # Check if total length exceeds max context length
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
-        if args.rollout_max_context_len is not None:
-            max_context_length = args.rollout_max_context_len
-        else:
-            max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
             break
+
+        # Clamp per-turn max_new_tokens to the remaining context budget so a
+        # single turn cannot push total_length past max_context_length. Without
+        # this, a turn can append up to rollout_max_response_len tokens on top
+        # of a total that was just barely under the cap, producing samples
+        # that exceed the training-side max_tokens_per_gpu * cp_size budget
+        # and crash the partition/batch code (asserts or OOMs on an oversized
+        # partition).
+        remaining_budget = max_context_length - total_length
+        per_turn_sampling_params = dict(sampling_params)
+        per_turn_sampling_params["max_new_tokens"] = min(
+            sampling_params.get("max_new_tokens", remaining_budget),
+            remaining_budget,
+        )
 
         # Use token IDs instead of text
         current_token_ids = prompt_tokens_ids + response_token_ids
         payload = {
             "input_ids": current_token_ids,
-            "sampling_params": sampling_params,
+            "sampling_params": per_turn_sampling_params,
             "return_logprob": True,  # Request log probabilities for training
         }
 
@@ -273,8 +405,67 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # Handle abort
         if output["meta_info"]["finish_reason"]["type"] == "abort":
-            sample.status = Sample.Status.ABORTED
-            return sample
+            if not args.partial_rollout:
+                sample.status = Sample.Status.ABORTED
+                sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+                sample.tool_time = _tool_time
+                return sample
+            else:
+                # Partial rollout enabled: process partial response and save state
+                if "output_token_logprobs" in output["meta_info"]:
+                    cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                    cur_response = state.tokenizer.decode(cur_response_token_ids)
+                    cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+                    if sample.rollout_log_probs is None:
+                        sample.rollout_log_probs = []
+                    sample.rollout_log_probs += cur_log_probs
+                else:
+                    sample.status = Sample.Status.ABORTED
+                    sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+                    sample.tool_time = _tool_time
+                    return sample
+
+                if cur_response:
+                    response += cur_response
+                    response_token_ids += cur_response_token_ids
+                    loss_masks += [1] * len(cur_response_token_ids)
+
+                    _tool_start = time.monotonic()
+                    next_obs, done = await execute_predictions(cur_response)
+                    if next_obs:
+                        if "<interpreter>" in next_obs:
+                            tool_call_count += 1
+                        _tool_time += time.monotonic() - _tool_start
+
+                        obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
+                        response += next_obs
+                        response_token_ids += obs_tokens_ids
+                        loss_masks += [0] * len(obs_tokens_ids)
+                        if sample.rollout_log_probs is not None:
+                            sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
+
+                # Save state for resumption
+                sample.status = Sample.Status.ABORTED
+                sample.tokens = prompt_tokens_ids + response_token_ids
+                sample.response_length = len(response_token_ids)
+                sample.response = response
+                sample.loss_mask = loss_masks
+                sample.tool_call_count = tool_call_count
+
+                sample.payload_text = prompt + response
+                sample.payload_has_system = "<|im_start|>system" in prompt + response
+                sample.payload_has_tools = "# Tools" in prompt + response
+
+                sample.metadata.update({
+                    "partial_rollout": True,
+                    "current_turn": turn,
+                    "loss_masks": loss_masks,
+                    "tool_call_count": tool_call_count,
+                    "formatted_prompt": prompt,
+                })
+                sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+                sample.tool_time = _tool_time
+                return sample
 
         if "output_token_logprobs" in output["meta_info"]:
             cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -285,9 +476,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.rollout_log_probs += cur_log_probs
 
         else:
-            cur_response = output["text"]
-            cur_response = postprocess_responses(cur_response)
-            cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+            # sglang returned text but no output_token_logprobs — we cannot
+            # recover per-token logprobs for this turn, which would desync
+            # rollout_log_probs from response_token_ids and blow up
+            # `slice_log_prob_with_cp` downstream. Abort the sample so the
+            # fully_async rollout manager returns the whole group to the
+            # buffer for retry instead of poisoning the trainer.
+            sample.status = Sample.Status.ABORTED
+            sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+            sample.tool_time = _tool_time
+            return sample
 
         response += cur_response
         response_token_ids += cur_response_token_ids
@@ -297,6 +495,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
+        _tool_start = time.monotonic()
         next_obs, done = await execute_predictions(cur_response)
         if done:
             break
@@ -305,6 +504,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # was called)
         if "<interpreter>" in next_obs:
             tool_call_count += 1
+            _tool_time += time.monotonic() - _tool_start
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
@@ -320,6 +520,26 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             assert len(response_token_ids) == len(
                 sample.rollout_log_probs
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
+
+        # Tool output is appended verbatim and can push total_length past
+        # max_context_length (the per-turn generation was clamped to the
+        # remaining budget, but tool output is unconstrained). Trim tail
+        # tokens so the final sample fits the training budget exactly.
+        overflow = len(prompt_tokens_ids) + len(response_token_ids) - max_context_length
+        if overflow > 0:
+            response_token_ids = response_token_ids[:-overflow]
+            loss_masks = loss_masks[:-overflow]
+            if sample.rollout_log_probs is not None:
+                sample.rollout_log_probs = sample.rollout_log_probs[:-overflow]
+            # Resync the text field from the trimmed token list so
+            # reward_func's `sample.prompt + sample.response` matches what
+            # the model was actually trained on. decode(tokenize(text)) can
+            # be lossy on some tokenizers (whitespace / special-token
+            # collapse), but reward_func's regex is whitespace-robust and
+            # the trainer sees tokens, not text — so the drift is safe.
+            response = state.tokenizer.decode(response_token_ids)
+            sample.status = Sample.Status.TRUNCATED
+            break
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             break
@@ -338,15 +558,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # Store tool call count for reward calculation
     sample.tool_call_count = tool_call_count
 
-    # Set status
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
+    # Set status based on finish reason
+    if output is not None:
+        match output["meta_info"]["finish_reason"]["type"]:
+            case "length":
+                sample.status = Sample.Status.TRUNCATED
+            case "abort":
+                sample.status = Sample.Status.ABORTED
+            case "stop":
+                sample.status = Sample.Status.COMPLETED
+    else:
+        sample.status = Sample.Status.TRUNCATED
 
+    sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+    sample.tool_time = _tool_time
     return sample
 
 
@@ -359,7 +584,7 @@ async def reward_func(args, sample, **kwargs):
     solution_str = sample.prompt + sample.response
 
     # Get ground truth answer - label is a string, not a dict
-    ground_truth = sample.label if sample.label is not None else ""
+    ground_truth = str(sample.label) if sample.label is not None else ""
 
     # Get tool call count as num_turns
     num_turns = getattr(sample, "tool_call_count", 0)

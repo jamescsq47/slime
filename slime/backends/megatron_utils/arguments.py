@@ -58,10 +58,17 @@ def _hf_validate_args(args, hf_config):
         ("rms_norm_eps", "norm_epsilon", equal),
     ]:
         if hasattr(hf_config, hf_config_name):
-            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
+            # Newer Megatron versions expose --norm-epsilon as
+            # ``layernorm_epsilon`` (the TransformerConfig field), while older
+            # versions used ``norm_epsilon``. Accept both parser layouts.
+            if megatron_config_name == "norm_epsilon" and not hasattr(args, megatron_config_name):
+                megatron_value = getattr(args, "layernorm_epsilon")
+            else:
+                megatron_value = getattr(args, megatron_config_name)
+            if not compare_fn(getattr(hf_config, hf_config_name), megatron_value):
                 errors.append(
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
-                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+                    f"{megatron_config_name} {megatron_value}, please check the config."
                 )
 
     # Validate rope_theta separately using the resolved value

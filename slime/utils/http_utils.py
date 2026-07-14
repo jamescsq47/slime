@@ -205,10 +205,15 @@ def init_http_client(args):
         return
 
     _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+    read_timeout = getattr(args, "sglang_router_request_timeout_secs", 120)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
+            limits=httpx.Limits(
+                max_connections=_client_concurrency,
+                max_keepalive_connections=_client_concurrency,
+                keepalive_expiry=30,
+            ),
+            timeout=httpx.Timeout(connect=10, read=read_timeout, write=10, pool=5),
             trust_env=False,  # internal SGLang comm only — never route through system proxy
         )
 
@@ -239,11 +244,15 @@ def _init_ray_distributed_post(args):
     # Define the async actor
     @ray.remote
     class _HttpPosterActor:
-        def __init__(self, concurrency: int):
+        def __init__(self, concurrency: int, read_timeout: float):
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
-                timeout=httpx.Timeout(None),
+                limits=httpx.Limits(
+                    max_connections=max(1, concurrency),
+                    max_keepalive_connections=max(1, concurrency),
+                    keepalive_expiry=30,
+                ),
+                timeout=httpx.Timeout(connect=10, read=read_timeout, write=10, pool=5),
                 trust_env=False,  # internal SGLang comm only — never route through system proxy
             )
 
@@ -254,6 +263,7 @@ def _init_ray_distributed_post(args):
     created = []
     # Distribute client concurrency across actors (at least 1 per actor)
     per_actor_conc = (_client_concurrency + len(nodes)) // len(nodes)
+    read_timeout = getattr(args, "sglang_router_request_timeout_secs", 120)
 
     for node in nodes:
         node_id = node["NodeID"]
@@ -266,7 +276,7 @@ def _init_ray_distributed_post(args):
                 max_concurrency=per_actor_conc,
                 # Use tiny CPU to schedule
                 num_cpus=0.001,
-            ).remote(per_actor_conc)
+            ).remote(per_actor_conc, read_timeout)
             created.append(actor)
 
     _post_actors = created
@@ -290,9 +300,29 @@ async def post(url, payload, max_retries=60, headers=None):
     return await _post(_http_client, url, payload, max_retries, headers=headers)
 
 
-async def get(url):
-    response = await _http_client.get(url)
-    response.raise_for_status()
-    content = await response.aread()
-    output = json.loads(content)
-    return output
+async def get(url, max_retries=5):
+    retry_count = 0
+    while retry_count < max_retries:
+        response = None
+        try:
+            response = await _http_client.get(url)
+            response.raise_for_status()
+            content = await response.aread()
+            output = json.loads(content)
+        except Exception as e:
+            retry_count += 1
+            if isinstance(e, httpx.HTTPStatusError):
+                response_text = e.response.text
+            else:
+                response_text = None
+            logger.info(
+                f"GET {url} failed: {e}, retrying ({retry_count}/{max_retries}, response={response_text})"
+            )
+            if retry_count >= max_retries:
+                raise
+            await asyncio.sleep(2)
+            continue
+        finally:
+            if response is not None:
+                await response.aclose()
+        return output
