@@ -38,6 +38,10 @@ dynamic token batching reduce OOM risk.
 
 Training defaults to 100 epochs; set `NUM_EPOCH` to override it. The long-run
 learning rate is 1e-6 with cosine decay to 1e-7 and 1% warmup.
+If `SAVE_PATH/latest_checkpointed_iteration.txt` exists, `train.sh`
+automatically resumes model, optimizer, scheduler, rollout id, and dataset
+cursor from that checkpoint. It also fails before starting Ray when no usable
+NVIDIA GPU is visible.
 The default global batch is 16 to bound synchronization skew from uneven
 long trajectories; distributed collectives use a 30-minute timeout.
 Dynamic-batch microbatch-count metadata uses the DP Gloo group so the first

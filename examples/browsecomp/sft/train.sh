@@ -15,6 +15,19 @@ SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-browsecomp-sft}
 NUM_GPUS=${NUM_GPUS:-8}
 
 [[ -s "${SFT_DATA}" ]] || { echo "Missing or empty SFT_DATA: ${SFT_DATA}" >&2; exit 2; }
+if ! nvidia-smi -L >/dev/null 2>&1; then
+  echo "No usable NVIDIA GPU is visible (nvidia-smi -L failed)." >&2
+  exit 2
+fi
+
+# A slime/Megatron save directory can be resumed directly. This matters for a
+# 100-epoch job: preserve the dataset cursor, optimizer, scheduler and rollout
+# id instead of silently restarting from the base checkpoint.
+LOAD_ARGS=()
+if [[ -s "${SAVE_PATH}/latest_checkpointed_iteration.txt" ]]; then
+  LOAD_ARGS=(--load "${SAVE_PATH}")
+  echo "Resuming SFT from ${SAVE_PATH} at iteration $(<"${SAVE_PATH}/latest_checkpointed_iteration.txt")"
+fi
 
 GPU_MEMORY_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || true)
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -oE 'NV[0-9]+' | wc -l || true)
@@ -65,6 +78,7 @@ ray job submit --address="http://${MASTER_ADDR}:${DASHBOARD_PORT}" \
     --actor-num-nodes 1 --actor-num-gpus-per-node "${NUM_GPUS}" \
     "${MODEL_ARGS[@]}" \
     --hf-checkpoint "${HF_CHECKPOINT}" --ref-load "${REF_LOAD}" \
+    "${LOAD_ARGS[@]}" \
     --save "${SAVE_PATH}" --save-interval 100 \
     --rollout-function-path examples.browsecomp.sft.sft_rollout.generate_rollout \
     --prompt-data "${SFT_DATA}" --input-key messages --rollout-shuffle \
