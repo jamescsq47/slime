@@ -6,21 +6,20 @@ ulimit -n 65536
 # sleep 3
 # ray stop --force
 # pkill -9 ray
-# pkill -9 python
 # sleep 3
 # pkill -9 ray
-# pkill -9 python
 
-set -ex
+set -e
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# 网络配置 - 与head节点保持一致
-export NCCL_SOCKET_IFNAME=ibp169s0f1
-export GLOO_SOCKET_IFNAME=ibp169s0f1
-export NCCL_IB_DISABLE=0
-export NCCL_IB_HCA=mlx5_1
+# 网络配置 - 默认沿用当前集群，换机器时通过环境变量覆盖。
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ibp169s0f1}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+export NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_1}
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -31,36 +30,63 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+BROWSECOMP_DIR="$(cd -- "${SCRIPT_DIR}/../browsecomp" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-8B.sh"
 
-MODE=${MODE:-"one_step_off"}
-FULLY_ASYNC_VERSION_WINDOW=${FULLY_ASYNC_VERSION_WINDOW:-1}
-FULLY_ASYNC_MAX_COMPLETED_SAMPLES=${FULLY_ASYNC_MAX_COMPLETED_SAMPLES:-128}
-FULLY_ASYNC_EVICTION_POLICY=${FULLY_ASYNC_EVICTION_POLICY:-"drop_oldest_version"}
-FULLY_ASYNC_MAX_PARTIAL_SPAN=${FULLY_ASYNC_MAX_PARTIAL_SPAN:-3}
-echo "=== Running hybrid async benchmark: mode=${MODE} ==="
+echo "=== Running mixed BrowseComp + Retool synchronous colocated training ==="
+
+# BrowseComp environment — consumed by browsecomp_agent.py / browsecomp_rm.py.
+export LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL:?"export LOCAL_SEARCH_URL to the BrowseComp-Plus search server"}
+if [ "${BROWSECOMP_EM_ONLY_REWARD:-0}" != "1" ]; then
+   if [ -z "${GRADER_API_KEY:-${OPENAI_API_KEY:-}}" ]; then
+      echo "export GRADER_API_KEY (or OPENAI_API_KEY) for the BrowseComp LLM judge"
+      exit 1
+   fi
+fi
+export GRADER_FALLBACK_MODEL=${GRADER_FALLBACK_MODEL:-${GRADER_MODEL:-}}
+export BROWSECOMP_MAX_TURNS=${BROWSECOMP_MAX_TURNS:-100}
+export BROWSECOMP_TURN_MAX_NEW_TOKENS=${BROWSECOMP_TURN_MAX_NEW_TOKENS:-2048}
+export BROWSECOMP_MUST_SEARCH=${BROWSECOMP_MUST_SEARCH:-1}
+export BROWSECOMP_ENABLE_THINKING=${BROWSECOMP_ENABLE_THINKING:-0}
+export BROWSECOMP_SEARCH_MAX_TOPK=${BROWSECOMP_SEARCH_MAX_TOPK:-5}
+export BROWSECOMP_SEARCH_SNIPPET_WORDS=${BROWSECOMP_SEARCH_SNIPPET_WORDS:-256}
+export BROWSECOMP_OPEN_PAGE_WORDS=${BROWSECOMP_OPEN_PAGE_WORDS:-2048}
+
+SGLANG_CTX_LEN=${SGLANG_CTX_LEN:-40960}
+CONTEXT_PARALLEL_SIZE=${CONTEXT_PARALLEL_SIZE:-2}
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
+MIXED_RETOOL_MAX_RESPONSE_LEN=${MIXED_RETOOL_MAX_RESPONSE_LEN:-8192}
+MIXED_BROWSECOMP_MAX_RESPONSE_LEN=${MIXED_BROWSECOMP_MAX_RESPONSE_LEN:-36864}
+BROWSECOMP_MAX_SEQ_LEN=${BROWSECOMP_MAX_SEQ_LEN:-${MIXED_BROWSECOMP_MAX_RESPONSE_LEN}}
+SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-new/}
+HF_CHECKPOINT=${HF_CHECKPOINT:-/workspace/Qwen3-8B}
+REF_LOAD=${REF_LOAD:-/workspace/Qwen3-8B_torch_dist}
+ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-2}
+ACTOR_GPUS_PER_NODE=${ACTOR_GPUS_PER_NODE:-8}
+ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-16}
+RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8266}
 
 CKPT_ARGS=(
-   # --hf-checkpoint /workspace/DeepSeek-R1-Distill-Qwen-7B
-   --hf-checkpoint /workspace/Qwen3-8B
+   --hf-checkpoint ${HF_CHECKPOINT}
    #--hf-checkpoint /root/Qwen3-8B-FP8
-   # --ref-load /workspace/DeepSeek-R1-Distill-Qwen-7B_sft_torch_dist
-   --ref-load /workspace/Qwen3-8B_sft_torch_dist
+   --ref-load ${REF_LOAD}
+   # --ref-load /workspace/Qwen3-8B_hybrid_batch400_400/iter399_torch_dist
    # --load /root/Qwen3-8B_slime/
-   # --save /workspace/Qwen3-8B_sync_hybrid0.5/
-   # --save-interval 100
-   --rotary-base 1000000
+   --save ${SAVE_PATH}
+   --save-interval 100
 )
-# Qwen3-4B_sync_qa Qwen3-4B_sync_math Qwen3-4B_sync_hybrid0.5 Qwen3-4B_sync_hybrid200-200
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project hybrid-qwen3-8b-sync
-   --wandb-group qwen3-8B-math
-   --wandb-key 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
+   --wandb-project mixed-qwen3-8b-sync
+   --wandb-group qwen3-8B-browsecomp-retool-sync-0.5-51200-51200
 )
+if [ -n "${WANDB_KEY:-}" ]; then
+   WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
+fi
 
 PROMPT_SET=/workspace/data/dapo-math-17k/dapo-math-17k.jsonl
+BROWSECOMP_DATA_DIR=${BROWSECOMP_DATA_DIR:-/workspace/data/browsecomp}
 
 ROLLOUT_ARGS=(
    --prompt-data /workspace/data/dapo-math-17k/dapo-math-17k.jsonl
@@ -68,63 +94,30 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rollout-seed 42
-   
+
    --rm-type dapo
    --reward-key score
 
-   --num-rollout 500
-   --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 8192 # 8192&512 
+   --num-rollout ${NUM_ROLLOUT:-800}
+   --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
+   --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT:-8}
+   --rollout-max-response-len ${MIXED_BROWSECOMP_MAX_RESPONSE_LEN}
    --rollout-temperature 1
 
-   --global-batch-size 256
+   --global-batch-size ${GLOBAL_BATCH_SIZE:-256}
    --num-steps-per-rollout 1
    --balance-data
    --rollout-health-check-interval 30
    --rollout-health-check-timeout 30
-#    --save-debug-rollout-data /workspace/slime/examples/hybrid/debug/ratio_0.5_8192_threshold/rollout_{rollout_id}.pt
-)
-
-EVAL_ARGS=(
-   --eval-interval 10
-   # All name/path pairs go under a single --eval-prompt-data (uses nargs='+')
-   --eval-prompt-data gsm8k  /workspace/data/gsm8k/test.parquet@[0:64] \
-                     nq_test /workspace/Search-R1/data/nq_hotpotqa_train/test.parquet@[0:64]
-   #--eval-prompt-data math500  /workspace/data/math500/math500_test.jsonl@[0:64]
-   # Per-dataset overrides (Dataset 1: aime / math)
-   --eval-dataset-override gsm8k.n_samples_per_eval_prompt=1
-   --eval-dataset-override gsm8k.max_response_len=8192
-   --eval-dataset-override gsm8k.label_key=reward_model
-   --eval-dataset-override gsm8k.task_type=math
-   --eval-dataset-override gsm8k.eval_reward_key=acc
-   --eval-dataset-override gsm8k.label_sub_key=ground_truth
-   # --eval-dataset-override gsm8k.top_p=1
-   --eval-dataset-override gsm8k.wandb_prefix=eval1
-   # --eval-dataset-override aime.n_samples_per_eval_prompt=8
-   # --eval-dataset-override aime.max_response_len=16384
-   # --eval-dataset-override aime.task_type=math
-   # --eval-dataset-override aime.wandb_prefix=eval1
-   # --eval-dataset-override math500.n_samples_per_eval_prompt=1
-   # --eval-dataset-override math500.max_response_len=16384
-   # --eval-dataset-override math500.input_key=problem
-   # --eval-dataset-override math500.label_key=answer
-   # --eval-dataset-override math500.task_type=math
-   # --eval-dataset-override math500.wandb_prefix=eval1
-   # Per-dataset overrides (Dataset 2: nq_test / search QA)
-   --eval-dataset-override nq_test.n_samples_per_eval_prompt=1
-   --eval-dataset-override nq_test.input_key=prompt
-   --eval-dataset-override nq_test.label_key=reward_model
-   --eval-dataset-override nq_test.wandb_prefix=eval2
-   --eval-dataset-override nq_test.task_type=qa
+   # --use-rollout-logprobs
+   # --save-debug-rollout-data /workspace/slime/examples/hybrid/debug/ratio_0.5_51200_51200/rollout_{rollout_id}.pt
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE:-4}
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size ${CONTEXT_PARALLEL_SIZE}
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
@@ -134,13 +127,13 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.00
+   # --use-kl-loss
+   # --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
@@ -161,23 +154,37 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.5
+   --sglang-context-length ${SGLANG_CTX_LEN}
 )
 
 CUSTOM_ARGS=(
    --data-source-path custom_data_source.CustomDataSource
    --custom-generate-function-path generate_with_hybrid.generate_unified
-   # --custom-generate-function-path generate_retool.generate
    --custom-rm-path generate_with_hybrid.reward_func_unified
    --math-data-path /workspace/data/dapo-math-17k/dapo-math-17k.jsonl
-   --qa-data-path /workspace/Search-R1/data/nq_hotpotqa_train/train.parquet
+   --qa-data-path ${BROWSECOMP_DATA_DIR}/bc_train.jsonl
    --math-ratio 0.5
-   # --batch-alternation \
-   # --math-batches-per-cycle 200 \
-   # --qa-batches-per-cycle 200 \
-   # --dynamic-alternation \
-   # --lag-version 3 \
-   #  --grad-log-dir /workspace/slime/examples/hybrid/debug/math
+   --mask-offpolicy-math 51200
+   --mask-offpolicy-qa 51200
+   # --count-aware-alternation
+   # --math-batches-per-cycle 16
+   # --qa-batches-per-cycle 16
+   # --batch-alternation-start-task qa
+   # --batch-alternation
+#   --phase-aware-train-task qa
+#   --phase-aware-post-update-task math
+   # --mask-offpolicy-in-partial-rollout
+#    --dynamic-alternation
+#    --dynamic-alternation-alpha 1 # lag-based ratio weight; final=(1-alpha)*math-ratio + alpha*lag-ratio
+#    --dynamic-alternation-warmup-steps 5  # use fixed math-ratio for first 5 policy versions
+#    --dynamic-alternation-min-math-ratio 0.2
+#    --dynamic-alternation-max-math-ratio 0.8
+#    --enable-tool-delay
+#    --tool-delay-mean 25
+#    --tool-delay-variance 500
+#    --tool-delay-check-interval 0.5
 )
+
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -193,7 +200,6 @@ MISC_ARGS=(
 # 多节点配置 - 假设Ray已经在head节点启动
 # 根据head节点启动脚本的配置
 export MASTER_ADDR="${MASTER_ADDR:-10.0.1.171}"
-export SLIME_HOST_IP="${MASTER_ADDR}"
 export RAY_PORT="${RAY_PORT:-6382}"  # 注意：head节点使用的是6382端口
 
 # 检查Ray集群状态 (ray status 需要指定 redis 端口而不是 http 控制台端口)
@@ -203,26 +209,43 @@ ray status || echo "Warning: Ray cluster may not be running properly"
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
-    \"SLIME_HOST_IP\": \"${MASTER_ADDR}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${BROWSECOMP_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
+    \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
+    \"GRADER_API_KEY\": \"${GRADER_API_KEY:-${OPENAI_API_KEY:-}}\",
+    \"GRADER_BASE_URL\": \"${GRADER_BASE_URL:-}\",
+    \"GRADER_MODEL\": \"${GRADER_MODEL:-}\",
+    \"GRADER_FALLBACK_MODEL\": \"${GRADER_FALLBACK_MODEL:-}\",
+    \"GRADER_API_VERSION\": \"${GRADER_API_VERSION:-}\",
+    \"BROWSECOMP_MAX_TURNS\": \"${BROWSECOMP_MAX_TURNS}\",
+    \"BROWSECOMP_TURN_MAX_NEW_TOKENS\": \"${BROWSECOMP_TURN_MAX_NEW_TOKENS}\",
+    \"BROWSECOMP_MUST_SEARCH\": \"${BROWSECOMP_MUST_SEARCH}\",
+    \"BROWSECOMP_ENABLE_THINKING\": \"${BROWSECOMP_ENABLE_THINKING}\",
+    \"BROWSECOMP_SEARCH_MAX_TOPK\": \"${BROWSECOMP_SEARCH_MAX_TOPK}\",
+    \"BROWSECOMP_SEARCH_SNIPPET_WORDS\": \"${BROWSECOMP_SEARCH_SNIPPET_WORDS}\",
+    \"BROWSECOMP_OPEN_PAGE_WORDS\": \"${BROWSECOMP_OPEN_PAGE_WORDS}\",
+    \"BROWSECOMP_MAX_SEQ_LEN\": \"${BROWSECOMP_MAX_SEQ_LEN}\",
+    \"MIXED_RETOOL_MAX_RESPONSE_LEN\": \"${MIXED_RETOOL_MAX_RESPONSE_LEN}\",
+    \"MIXED_BROWSECOMP_MAX_RESPONSE_LEN\": \"${MIXED_BROWSECOMP_MAX_RESPONSE_LEN}\",
+    \"BROWSECOMP_EM_ONLY_REWARD\": \"${BROWSECOMP_EM_ONLY_REWARD:-0}\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"NCCL_SOCKET_IFNAME\": \"ibp169s0f1\",
-    \"GLOO_SOCKET_IFNAME\": \"ibp169s0f1\",
-    \"NCCL_IB_DISABLE\": \"0\",
-    \"NCCL_IB_HCA\": \"mlx5_1\"
+    \"NCCL_SOCKET_IFNAME\": \"${NCCL_SOCKET_IFNAME}\",
+    \"GLOO_SOCKET_IFNAME\": \"${GLOO_SOCKET_IFNAME}\",
+    \"NCCL_IB_DISABLE\": \"${NCCL_IB_DISABLE}\",
+    \"NCCL_IB_HCA\": \"${NCCL_IB_HCA}\"
   }
 }"
 
-export RAY_DASHBOARD_PORT=8266
 # 提交作业到Ray集群
-# 注意：Ray dashboard端口是8266，但job submission使用的是8265（默认）
-ray job submit --address="http://${MASTER_ADDR}:8266" \
+# RAY_DASHBOARD_PORT 必须和 head 节点 ray start --dashboard-port 保持一致。
+ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes 2 \
-   --actor-num-gpus-per-node 4 \
-   --rollout-num-gpus 8 \
+   --actor-num-nodes ${ACTOR_NUM_NODES} \
+   --actor-num-gpus-per-node ${ACTOR_GPUS_PER_NODE} \
+   --rollout-num-gpus ${ROLLOUT_NUM_GPUS} \
+   --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
@@ -230,7 +253,6 @@ ray job submit --address="http://${MASTER_ADDR}:8266" \
    ${GRPO_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
    ${CUSTOM_ARGS[@]}
