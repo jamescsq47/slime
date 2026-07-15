@@ -27,16 +27,12 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 BROWSECOMP_DIR="$(cd -- "${SCRIPT_DIR}/../browsecomp" &>/dev/null && pwd)"
+MIXED_DIR="$(cd -- "${SCRIPT_DIR}/../mixed" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-8B.sh"
 
-# BrowseComp eval environment.
-export LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL:?"export LOCAL_SEARCH_URL to the BrowseComp-Plus search server"}
-if [ "${BROWSECOMP_EM_ONLY_REWARD:-0}" != "1" ]; then
-   if [ -z "${GRADER_API_KEY:-${OPENAI_API_KEY:-}}" ]; then
-      echo "export GRADER_API_KEY (or OPENAI_API_KEY) for the BrowseComp LLM judge"
-      exit 1
-   fi
-fi
+# This isolated experiment evaluates only GSM8K; BrowseComp services are unused.
+export LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL:-http://127.0.0.1:1}
+export BROWSECOMP_EM_ONLY_REWARD=1
 export GRADER_FALLBACK_MODEL=${GRADER_FALLBACK_MODEL:-${GRADER_MODEL:-}}
 export BROWSECOMP_MAX_TURNS=${BROWSECOMP_MAX_TURNS:-100}
 export BROWSECOMP_TURN_MAX_NEW_TOKENS=${BROWSECOMP_TURN_MAX_NEW_TOKENS:-2048}
@@ -57,6 +53,14 @@ FULLY_ASYNC_EVICTION_POLICY=${FULLY_ASYNC_EVICTION_POLICY:-"drop_oldest_version"
 FULLY_ASYNC_MAX_PARTIAL_SPAN=${FULLY_ASYNC_MAX_PARTIAL_SPAN:-3}
 echo "=== Running hybrid async benchmark: mode=${MODE} ==="
 
+ADVISOR_MODEL=${ADVISOR_MODEL:-/workspace/Qwen3-4B}
+ADVISOR_GPU=${ADVISOR_GPU:-7}
+ADVISOR_PORT=${ADVISOR_PORT:-31000}
+ADVISOR_MAX_TOKENS=${ADVISOR_MAX_TOKENS:-64}
+ADVISOR_MEM_FRACTION=${ADVISOR_MEM_FRACTION:-0.15}
+GSM8K_DATA=${GSM8K_DATA:-/workspace/data/gsm8k/test.parquet}
+DEBUG_ROLLOUT_PATH=${DEBUG_ROLLOUT_PATH:-${SCRIPT_DIR}/debug/eval/Qwen3-8B-gsm8k-advisor.pt}
+
 CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
@@ -67,12 +71,7 @@ CKPT_ARGS=(
 )
 # Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200/iter399_torch_dist
 
-WANDB_ARGS=(
-   --use-wandb
-   --wandb-project hybrid-qwen3-8b-eval
-   --wandb-group Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200
-   --wandb-key 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
-)
+WANDB_ARGS=()
 
 PROMPT_SET=/workspace/data/dapo-math-17k/dapo-math-17k.jsonl
 
@@ -97,7 +96,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-aime.pt
+   --save-debug-rollout-data ${DEBUG_ROLLOUT_PATH}
 )
 
 
@@ -109,7 +108,7 @@ EVAL_ARGS=(
    #                    aime2024 /workspace/data/aime-2024/aime-2024.jsonl \
    #                    browsecomp /workspace/data/browsecomp/bc_test.jsonl
                       # dapo_math_17k /workspace/data/dapo-math-17k/dapo-math-17k.jsonl 
-   --eval-prompt-data gsm8k /workspace/data/gsm8k/test.parquet
+   --eval-prompt-data gsm8k ${GSM8K_DATA}
    # --eval-prompt-data browsecomp /workspace/data/browsecomp/bc_test.jsonl
    # Per-dataset overrides (Dataset 1: gsm8k / competition math)
    --eval-dataset-override gsm8k.n_samples_per_eval_prompt=1
@@ -206,16 +205,16 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.7
-   --sglang-server-concurrency 8
+   --sglang-mem-fraction-static ${MAIN_SGLANG_MEM_FRACTION:-0.55}
+   --sglang-server-concurrency ${MAIN_SGLANG_CONCURRENCY:-4}
    --sglang-router-disable-health-check
    --sglang-context-length ${SGLANG_CTX_LEN}
 )
 
 CUSTOM_ARGS=(
    --data-source-path custom_data_source.CustomDataSource
-   --custom-generate-function-path generate_with_hybrid.generate_unified
-   --custom-rm-path generate_with_hybrid.reward_func_unified
+   --custom-generate-function-path generate_with_hybrid_advisor.generate_unified
+   --custom-rm-path generate_with_hybrid_advisor.reward_func_unified
    --math-data-path /workspace/data/dapo-math-17k/dapo-math-17k.jsonl
    --qa-data-path /workspace/data/browsecomp/bc_test.jsonl
    --math-ratio 0
@@ -254,9 +253,39 @@ for i in {1..30}; do
   sleep 1
 done
 
+ADVISOR_LOG=${SCRIPT_DIR}/debug/advisor_server.log
+echo "Starting Qwen3-4B tool-error advisor on GPU ${ADVISOR_GPU}, port ${ADVISOR_PORT}"
+CUDA_VISIBLE_DEVICES=${ADVISOR_GPU} python -m sglang.launch_server \
+   --model-path ${ADVISOR_MODEL} \
+   --host 127.0.0.1 \
+   --port ${ADVISOR_PORT} \
+   --context-length 4096 \
+   --mem-fraction-static ${ADVISOR_MEM_FRACTION} \
+   --max-running-requests 16 \
+   --disable-radix-cache \
+   >${ADVISOR_LOG} 2>&1 &
+ADVISOR_PID=$!
+trap 'kill ${ADVISOR_PID} 2>/dev/null || true' EXIT
+
+for i in {1..120}; do
+   if curl -sf http://127.0.0.1:${ADVISOR_PORT}/health >/dev/null; then
+      echo "Advisor is ready"
+      break
+   fi
+   if ! kill -0 ${ADVISOR_PID} 2>/dev/null; then
+      echo "Advisor failed to start; see ${ADVISOR_LOG}"
+      exit 1
+   fi
+   if [ "${i}" -eq 120 ]; then
+      echo "Timed out waiting for advisor; see ${ADVISOR_LOG}"
+      exit 1
+   fi
+   sleep 2
+done
+
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${BROWSECOMP_DIR}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${MIXED_DIR}:${BROWSECOMP_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
     \"GRADER_API_KEY\": \"${GRADER_API_KEY:-${OPENAI_API_KEY:-}}\",
@@ -275,6 +304,8 @@ RUNTIME_ENV_JSON="{
     \"BROWSECOMP_EM_ONLY_REWARD\": \"${BROWSECOMP_EM_ONLY_REWARD:-0}\",
     \"MIXED_RETOOL_MAX_RESPONSE_LEN\": \"${EVAL_RETOOL_MAX_RESPONSE_LEN}\",
     \"MIXED_BROWSECOMP_MAX_RESPONSE_LEN\": \"${EVAL_BROWSECOMP_MAX_RESPONSE_LEN}\",
+    \"TOOL_ERROR_ADVISOR_URL\": \"http://127.0.0.1:${ADVISOR_PORT}/generate\",
+    \"TOOL_ERROR_ADVISOR_MAX_TOKENS\": \"${ADVISOR_MAX_TOKENS}\",
     \"NCCL_NVLS_ENABLE\": \"0\",
     \"NCCL_DEBUG\": \"WARN\",
     \"NCCL_TIMEOUT\": \"1800000\",

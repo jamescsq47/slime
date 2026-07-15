@@ -247,6 +247,11 @@ def postprocess_predictions(prediction: str):
         content = answer_match.group(1).strip()
         return "answer", content
 
+    # GSM8K's canonical final-answer marker is also accepted as terminal output.
+    hash_answer_match = re.search(r"(?m)^\s*####\s*(.+?)\s*$", prediction)
+    if hash_answer_match:
+        return "answer", hash_answer_match.group(1).strip()
+
     # Then check for <tool_call> tags (new format from Jinja2 template)
     tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)

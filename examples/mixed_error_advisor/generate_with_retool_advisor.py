@@ -7,6 +7,8 @@ import re
 import time
 from typing import Any
 
+import httpx
+
 try:
     from jinja2 import Template
 except ImportError as e:
@@ -27,9 +29,74 @@ from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
 
 TOOL_DELAY_REMAINING_KEY = "pending_tool_delay_remaining"
 
+ADVISOR_FALLBACK = (
+    "The tool call failed. Read the error, correct the tool arguments, "
+    "and do not repeat the same failed call."
+)
+
 
 def _int_env(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
+
+
+def _extract_system_prompt(formatted_prompt: str) -> str:
+    match = re.search(r"<\|im_start\|>system\s*\n?(.*?)<\|im_end\|>", formatted_prompt, re.DOTALL)
+    return match.group(1).strip() if match else formatted_prompt
+
+
+def _extract_tool_call(prediction: str) -> str | None:
+    match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", prediction, re.DOTALL)
+    return re.sub(r"\s+", "", match.group(1)) if match else None
+
+
+def _strip_advisor_thinking(text: str) -> str:
+    text = text or ""
+    if "<think>" in text and "</think>" not in text:
+        return ""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text.split("<|im_end|>", 1)[0].strip()
+
+
+async def get_advisor_feedback(system_prompt: str, error: str, failed_action: str) -> str:
+    """Ask the isolated local advisor for one short, actionable correction."""
+    advisor_url = os.getenv("TOOL_ERROR_ADVISOR_URL", "").strip()
+    if not advisor_url:
+        return ADVISOR_FALLBACK
+
+    max_tokens = _int_env("TOOL_ERROR_ADVISOR_MAX_TOKENS", 64)
+    advisor_prompt = (
+        "<|im_start|>system\n"
+        "You diagnose failed tool calls. Reply with one concise actionable sentence only. "
+        "State what is wrong and exactly how to fix it. Do not solve the original problem. "
+        "Never state or repeat the original problem's numeric answer, even if it is visible. "
+        "Do not use markdown fences or XML tags.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "/no_think\n"
+        f"Original system prompt:\n{system_prompt}\n\n"
+        f"Failed action:\n{failed_action}\n\n"
+        f"Tool error:\n{error}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    payload = {
+        "text": advisor_prompt,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_tokens,
+            "stop": ["<|im_end|>"],
+            "skip_special_tokens": False,
+        },
+    }
+    try:
+        timeout = float(os.getenv("TOOL_ERROR_ADVISOR_TIMEOUT", "30"))
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            response = await client.post(advisor_url, json=payload)
+            response.raise_for_status()
+            output = response.json()
+        feedback = _strip_advisor_thinking(output.get("text", ""))
+        return feedback or ADVISOR_FALLBACK
+    except Exception as exc:
+        print(f"[tool-error-advisor] request failed: {exc}")
+        return ADVISOR_FALLBACK
 
 
 def _sample_tool_delay(args) -> float:
@@ -177,21 +244,6 @@ _QWEN_MESSAGE_PATTERN = re.compile(
     re.DOTALL,
 )
 
-RETOOL_PROTOCOL = (
-    "You are a mathematical problem-solving assistant. Reason carefully and solve the user's problem.\n\n"
-    "Using code_interpreter is OPTIONAL. If you can solve the problem reliably by reasoning in text, "
-    "do not call the tool.\n\n"
-    "If you call code_interpreter, follow all of these rules:\n"
-    "- Output exactly one <tool_call> JSON block and no text after it in that turn.\n"
-    "- Put raw executable Python in the code argument. Do not use Markdown code fences.\n"
-    "- Use print(...) so the result appears in the tool output.\n"
-    "- Use the returned result in your reasoning; do not repeat an identical tool call.\n"
-    "- Call the tool again only when a genuinely different computation is needed.\n\n"
-    "For the final response, do not include a tool call. Give concise reasoning and make the last line exactly:\n"
-    "#### \\boxed{answer}\n"
-    "A final answer and a tool call are mutually exclusive in the same turn."
-)
-
 
 def extract_user_prompt(prompt: str) -> str:
     """Unwrap a single-turn Qwen chat-template prompt if necessary."""
@@ -217,9 +269,14 @@ def format_conversation_with_tools(
 
     # Always add system message - use provided one or default
     if system_prompt:
-        system_content = f"{system_prompt.rstrip()}\n\n{RETOOL_PROTOCOL}"
+        system_content = system_prompt
     else:
-        system_content = RETOOL_PROTOCOL
+        system_content = (
+            "You are a helpful assistant that can use Python "
+            "tools to solve mathematical problems. When you need "
+            "to perform calculations, use the code_interpreter "
+            "tool to execute code and get results."
+        )
 
     messages_to_render.append({"role": "system", "content": system_content})
 
@@ -400,18 +457,30 @@ def append_observation_with_budget(
     return response, response_token_ids, loss_masks, rollout_log_probs, truncated, len(obs_tokens_ids)
 
 
-async def execute_predictions(prediction: str) -> str:
+async def execute_predictions(
+    prediction: str, system_prompt: str = "", previous_tool_call: str | None = None
+) -> str:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
     if action == "code":
+        current_tool_call = _extract_tool_call(prediction)
+        if current_tool_call is not None and current_tool_call == previous_tool_call:
+            error = "Error: The exact same tool call was already executed; repeating it provides no new information."
+            feedback = await get_advisor_feedback(system_prompt, error, prediction)
+            return f"\n<advisor_feedback>\n{feedback}\n</advisor_feedback>\n\n", False
         # Content is already the Python code (extracted by
         # postprocess_predictions)
         code = content.strip()
         if code:
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("code_interpreter", {"code": code})
+            if not result.strip():
+                result = "Error: The Python code ran successfully but produced no stdout. Use print(...) to emit the result."
             next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
+            if result.lstrip().startswith("Error"):
+                feedback = await get_advisor_feedback(system_prompt, result, prediction)
+                next_obs += f"<advisor_feedback>\n{feedback}\n</advisor_feedback>\n\n"
             done = False
         else:
             next_obs = "\n\n<interpreter>\nError: No Python code found" "\n</interpreter>\n\n"
@@ -420,11 +489,9 @@ async def execute_predictions(prediction: str) -> str:
         next_obs = ""
         done = True
     else:
-        next_obs = (
-            "\nThe previous response was not a valid action. Either continue reasoning and end with "
-            "the line `#### \\boxed{answer}`, or call code_interpreter using exactly one valid "
-            "<tool_call> JSON block with no text after it.\n"
-        )
+        error = "No valid final answer or executable tool call could be parsed from the previous action."
+        feedback = await get_advisor_feedback(system_prompt, error, prediction)
+        next_obs = f"\n<advisor_feedback>\n{feedback}\n</advisor_feedback>\n\n"
         done = False
 
     return next_obs, done
@@ -523,6 +590,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     else:
         max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
     max_context_length = min(max_context_length, len(prompt_tokens_ids) + _int_env("MIXED_RETOOL_MAX_RESPONSE_LEN", 8192))
+    advisor_system_prompt = _extract_system_prompt(prompt)
+    previous_tool_call = None
+    existing_calls = re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", response, re.DOTALL)
+    if existing_calls:
+        previous_tool_call = re.sub(r"\s+", "", existing_calls[-1])
 
     def _save_partial_for_resume(current_turn: int, status=Sample.Status.ABORTED) -> Sample:
         sample.status = status
@@ -660,7 +732,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                         loss_masks += [1] * len(cur_response_token_ids)
 
                     _tool_start = time.monotonic()
-                    next_obs, done = await execute_predictions(cur_response)
+                    current_tool_call = _extract_tool_call(cur_response)
+                    next_obs, done = await execute_predictions(
+                        cur_response, advisor_system_prompt, previous_tool_call
+                    )
+                    if current_tool_call is not None:
+                        previous_tool_call = current_tool_call
                     if next_obs:
                         if "<interpreter>" in next_obs:
                             tool_call_count += 1
@@ -750,7 +827,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
 
         _tool_start = time.monotonic()
-        next_obs, done = await execute_predictions(cur_response)
+        current_tool_call = _extract_tool_call(cur_response)
+        next_obs, done = await execute_predictions(cur_response, advisor_system_prompt, previous_tool_call)
+        if current_tool_call is not None:
+            previous_tool_call = current_tool_call
         if done:
             break
 

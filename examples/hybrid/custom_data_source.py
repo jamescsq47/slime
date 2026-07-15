@@ -60,6 +60,7 @@ class CustomDataSource(DataSource):
         self.phase_aware_alternation = getattr(args, 'phase_aware_alternation', False)
         self.math_batches_per_cycle = getattr(args, 'math_batches_per_cycle', 1)
         self.qa_batches_per_cycle = getattr(args, 'qa_batches_per_cycle', 1)
+        self.batch_alternation_start_task = getattr(args, 'batch_alternation_start_task', 'math')
         self.phase_aware_train_task = getattr(args, 'phase_aware_train_task', 'qa')
         self.phase_aware_post_update_task = getattr(args, 'phase_aware_post_update_task', 'math')
         
@@ -218,7 +219,8 @@ class CustomDataSource(DataSource):
 
         logger.info(f"Loaded {len(self.math_samples)} math samples, {len(self.qa_samples)} QA samples")
         logger.info(f"Batch alternation mode: {self.math_batches_per_cycle} math batches, "
-                    f"{self.qa_batches_per_cycle} QA batches per cycle")
+                    f"{self.qa_batches_per_cycle} QA batches per cycle, "
+                    f"start_task={self.batch_alternation_start_task}")
         if self.phase_aware_alternation:
             logger.info(
                 f"Phase-aware alternation mode: train_task={self.phase_aware_train_task}, "
@@ -273,11 +275,13 @@ class CustomDataSource(DataSource):
         self.samples_per_batch = self.samples_per_prompt * self.batch_size
         
         # 创建交替序列
-        self.batch_sequence = []
-        for _ in range(self.math_batches_per_cycle):
-            self.batch_sequence.append("math")
-        for _ in range(self.qa_batches_per_cycle):
-            self.batch_sequence.append("qa")
+        blocks = {
+            "math": ["math"] * self.math_batches_per_cycle,
+            "qa": ["qa"] * self.qa_batches_per_cycle,
+        }
+        first = self.batch_alternation_start_task
+        second = "qa" if first == "math" else "math"
+        self.batch_sequence = blocks[first] + blocks[second]
         
         # 计算总共需要多少个batch
         total_math_prompts = len(self.math_samples)

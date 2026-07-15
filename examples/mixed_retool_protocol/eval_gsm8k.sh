@@ -26,17 +26,12 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+MIXED_DIR="$(cd -- "${SCRIPT_DIR}/../mixed" &>/dev/null && pwd)"
 BROWSECOMP_DIR="$(cd -- "${SCRIPT_DIR}/../browsecomp" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3-8B.sh"
 
-# BrowseComp eval environment.
-export LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL:?"export LOCAL_SEARCH_URL to the BrowseComp-Plus search server"}
-if [ "${BROWSECOMP_EM_ONLY_REWARD:-0}" != "1" ]; then
-   if [ -z "${GRADER_API_KEY:-${OPENAI_API_KEY:-}}" ]; then
-      echo "export GRADER_API_KEY (or OPENAI_API_KEY) for the BrowseComp LLM judge"
-      exit 1
-   fi
-fi
+export LOCAL_SEARCH_URL=${LOCAL_SEARCH_URL:-http://127.0.0.1:8000}
+export BROWSECOMP_EM_ONLY_REWARD=${BROWSECOMP_EM_ONLY_REWARD:-1}
 export GRADER_FALLBACK_MODEL=${GRADER_FALLBACK_MODEL:-${GRADER_MODEL:-}}
 export BROWSECOMP_MAX_TURNS=${BROWSECOMP_MAX_TURNS:-100}
 export BROWSECOMP_TURN_MAX_NEW_TOKENS=${BROWSECOMP_TURN_MAX_NEW_TOKENS:-2048}
@@ -67,14 +62,18 @@ CKPT_ARGS=(
 )
 # Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200/iter399_torch_dist
 
-WANDB_ARGS=(
-   --use-wandb
-   --wandb-project hybrid-qwen3-8b-eval
-   --wandb-group Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200
-   --wandb-key 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
-)
+WANDB_ARGS=()
 
 PROMPT_SET=/workspace/data/dapo-math-17k/dapo-math-17k.jsonl
+EVAL_SUITE=${EVAL_SUITE:-single}
+EVAL_DATASET=${EVAL_DATASET:-gsm8k}
+if [ "${EVAL_DATASET}" = "dapo_math_17k" ]; then
+   EVAL_DATA_PATH=${EVAL_DATA_PATH:-/workspace/data/dapo-math-17k/dapo-math-17k.jsonl}
+   EVAL_LABEL_KEY=label
+else
+   EVAL_DATA_PATH=${EVAL_DATA_PATH:-/workspace/data/gsm8k/test.parquet}
+   EVAL_LABEL_KEY=reward_model
+fi
 
 ROLLOUT_ARGS=(
    --input-key prompt
@@ -97,7 +96,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-aime.pt
+   --save-debug-rollout-data ${DEBUG_ROLLOUT_PATH:-${SCRIPT_DIR}/debug/eval/Qwen3-8B-${EVAL_SUITE}-${EVAL_DATASET}-protocol-full.pt}
 )
 
 
@@ -109,16 +108,16 @@ EVAL_ARGS=(
    #                    aime2024 /workspace/data/aime-2024/aime-2024.jsonl \
    #                    browsecomp /workspace/data/browsecomp/bc_test.jsonl
                       # dapo_math_17k /workspace/data/dapo-math-17k/dapo-math-17k.jsonl 
-   --eval-prompt-data gsm8k /workspace/data/gsm8k/test.parquet
+   --eval-prompt-data ${EVAL_DATASET} ${EVAL_DATA_PATH}
    # --eval-prompt-data browsecomp /workspace/data/browsecomp/bc_test.jsonl
    # Per-dataset overrides (Dataset 1: gsm8k / competition math)
-   --eval-dataset-override gsm8k.n_samples_per_eval_prompt=1
-   --eval-dataset-override gsm8k.max_response_len=8192
-   --eval-dataset-override gsm8k.label_key=reward_model
-   --eval-dataset-override gsm8k.task_type=math
-   --eval-dataset-override gsm8k.eval_reward_key=acc
-   --eval-dataset-override gsm8k.label_sub_key=ground_truth
-   --eval-dataset-override gsm8k.wandb_prefix=eval1
+   --eval-dataset-override ${EVAL_DATASET}.n_samples_per_eval_prompt=1
+   --eval-dataset-override ${EVAL_DATASET}.max_response_len=8192
+   --eval-dataset-override ${EVAL_DATASET}.input_key=prompt
+   --eval-dataset-override ${EVAL_DATASET}.label_key=${EVAL_LABEL_KEY}
+   --eval-dataset-override ${EVAL_DATASET}.task_type=math
+   --eval-dataset-override ${EVAL_DATASET}.eval_reward_key=acc
+   --eval-dataset-override ${EVAL_DATASET}.wandb_prefix=eval6
    # Per-dataset overrides (Dataset 2: nq_test / search QA)
    # --eval-dataset-override nq_test.n_samples_per_eval_prompt=1
    # --eval-dataset-override nq_test.input_key=prompt
@@ -165,6 +164,27 @@ EVAL_ARGS=(
    # --eval-dataset-override dapo_math_17k.wandb_prefix=eval6
 )
 
+if [ "${EVAL_SUITE}" = "aime" ]; then
+   EVAL_ARGS=(
+      --eval-interval 10
+      --eval-prompt-data aime25 /workspace/data/aime25/test.jsonl \
+                         aime2024 /workspace/data/aime-2024/aime-2024.jsonl
+      --eval-dataset-override aime25.n_samples_per_eval_prompt=32
+      --eval-dataset-override aime25.max_response_len=32768
+      --eval-dataset-override aime25.input_key=problem
+      --eval-dataset-override aime25.label_key=answer
+      --eval-dataset-override aime25.task_type=math
+      --eval-dataset-override aime25.eval_reward_key=acc
+      --eval-dataset-override aime25.wandb_prefix=eval4
+      --eval-dataset-override aime2024.n_samples_per_eval_prompt=32
+      --eval-dataset-override aime2024.max_response_len=32768
+      --eval-dataset-override aime2024.label_key=label
+      --eval-dataset-override aime2024.task_type=math
+      --eval-dataset-override aime2024.eval_reward_key=acc
+      --eval-dataset-override aime2024.wandb_prefix=eval5
+   )
+fi
+
 
 PERF_ARGS=(
    --tensor-model-parallel-size 2
@@ -206,16 +226,16 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.7
-   --sglang-server-concurrency 8
+   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC:-0.7}
+   --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY:-8}
    --sglang-router-disable-health-check
    --sglang-context-length ${SGLANG_CTX_LEN}
 )
 
 CUSTOM_ARGS=(
    --data-source-path custom_data_source.CustomDataSource
-   --custom-generate-function-path generate_with_hybrid.generate_unified
-   --custom-rm-path generate_with_hybrid.reward_func_unified
+   --custom-generate-function-path generate_with_hybrid_protocol.generate_unified
+   --custom-rm-path generate_with_hybrid_protocol.reward_func_unified
    --math-data-path /workspace/data/dapo-math-17k/dapo-math-17k.jsonl
    --qa-data-path /workspace/data/browsecomp/bc_test.jsonl
    --math-ratio 0
@@ -256,7 +276,7 @@ done
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${BROWSECOMP_DIR}\",
+    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:${MIXED_DIR}:${BROWSECOMP_DIR}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"LOCAL_SEARCH_URL\": \"${LOCAL_SEARCH_URL}\",
     \"GRADER_API_KEY\": \"${GRADER_API_KEY:-${OPENAI_API_KEY:-}}\",

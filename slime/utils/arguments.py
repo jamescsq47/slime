@@ -690,6 +690,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                                 help='Number of math batches per cycle in alternation mode')
             parser.add_argument('--qa-batches-per-cycle', type=int, default=1,
                                 help='Number of QA batches per cycle in alternation mode')
+            parser.add_argument(
+                '--batch-alternation-start-task',
+                type=str,
+                default='math',
+                choices=['math', 'qa'],
+                help='Task dispatched first in each fixed batch-alternation cycle.',
+            )
             parser.add_argument('--phase-aware-alternation', action='store_true',
                                 help='Enable phase-aware alternation: prefer QA during training and math after policy update.')
             parser.add_argument('--phase-aware-train-task', type=str, default='qa', choices=['math', 'qa'],

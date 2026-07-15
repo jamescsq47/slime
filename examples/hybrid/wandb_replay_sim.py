@@ -62,6 +62,7 @@ class DynamicTimePool:
         burst_scale=CALIBRATED_BURST_SCALE,
         quiet_scale=CALIBRATED_QUIET_SCALE,
         train_time_profile=None,
+        math_time_scale=1.0,
     ):
         self.steps = profile["steps"]
         self.train_time_steps = (train_time_profile or profile)["steps"]
@@ -76,6 +77,7 @@ class DynamicTimePool:
         self.slow_scale = slow_scale
         self.burst_scale = burst_scale
         self.quiet_scale = quiet_scale
+        self.math_time_scale = max(0.0, float(math_time_scale))
         self.base = {task: self._load_samples(path) for task, path in SAMPLE_FILES.items()}
         self.base_mean = {task: float(np.mean(values)) for task, values in self.base.items()}
         self.base_moment = {
@@ -147,6 +149,8 @@ class DynamicTimePool:
             if step >= start_step:
                 phase_scale = candidate_scale
         duration *= phase_scale
+        if task == "math":
+            duration *= self.math_time_scale
         return self.group_time_scale * duration
 
     def train_time(self, step):
@@ -193,8 +197,18 @@ class FullyAsyncReplay:
         lag_debt_beta=0.0,
         lag_debt_scale=256.0,
         lag_debt_cap=16.0,
+        complement_gain=0.5,
+        complement_min_math=8,
+        complement_max_math=24,
+        stable_lag_gain=0.0,
+        stable_lag_scale=256.0,
+        complement_ema_alpha=0.25,
+        complement_deadband=1.0,
+        complement_max_target_change=2,
+        global_block_size=4,
         completed_cap=None,
         train_time_profile=None,
+        math_time_scale=1.0,
     ):
         self.profile = profile
         self.config = profile["config"]
@@ -213,6 +227,7 @@ class FullyAsyncReplay:
             burst_scale,
             quiet_scale,
             train_time_profile,
+            math_time_scale,
         )
         self.parallel = int(self.config.get("rollout_batch_size") or 32)
         self.batch_size = self.parallel
@@ -243,6 +258,21 @@ class FullyAsyncReplay:
         self.lag_debt_beta = float(lag_debt_beta)
         self.lag_debt_scale = max(1.0, float(lag_debt_scale))
         self.lag_debt_cap = max(0.0, float(lag_debt_cap))
+        self.complement_gain = max(0.0, float(complement_gain))
+        self.complement_min_math = max(0, int(complement_min_math))
+        self.complement_max_math = min(self.batch_size, int(complement_max_math))
+        self.stable_lag_gain = max(0.0, float(stable_lag_gain))
+        self.stable_lag_scale = max(1.0, float(stable_lag_scale))
+        self.complement_ema_alpha = min(1.0, max(0.0, float(complement_ema_alpha)))
+        self.complement_deadband = max(0.0, float(complement_deadband))
+        self.complement_max_target_change = max(0, int(complement_max_target_change))
+        self.complement_error_ema = 0.0
+        self.complement_previous_target = int(round(self.batch_size * self.math_ratio))
+        self.pending_stable_targets = []
+        self.stable_cycle_tasks = []
+        self.stable_cycle_probability = None
+        self.stable_cycle_remaining = 0
+        self.global_block_size = max(1, int(global_block_size))
         # A policy is selected once after each 32-group training batch is
         # collected.  Initial lane filling is random because no previous batch
         # exists yet from which to make a dynamic decision.
@@ -276,7 +306,54 @@ class FullyAsyncReplay:
     def _select_step_schedule(self, batch):
         """Select the dispatch policy for the just-starting train/update step."""
         schedule = self.scheduling
-        if schedule in ("all_math", "all_qa", "global_drr", "phase_debt", "phase_lag_debt"):
+        if schedule in ("complement_exact", "complement_prob", "complement_damped", "complement_lag_damped", "complement_ema_slew"):
+            math_count = sum(group.task == "math" for group in batch)
+            if schedule in ("complement_exact", "complement_prob"):
+                target_math = self.batch_size - math_count
+            else:
+                # Negative feedback around 16:16. A gain below one avoids the
+                # 20:12 -> 12:20 -> 20:12 oscillation of exact complementing.
+                composition_error = math_count - self.batch_size * self.math_ratio
+                if schedule == "complement_ema_slew":
+                    self.complement_error_ema = (
+                        (1 - self.complement_ema_alpha) * self.complement_error_ema
+                        + self.complement_ema_alpha * composition_error
+                    )
+                    control_error = (
+                        0.0
+                        if abs(self.complement_error_ema) <= self.complement_deadband
+                        else self.complement_error_ema
+                    )
+                else:
+                    control_error = composition_error
+                target_math = self.batch_size * self.math_ratio - self.complement_gain * control_error
+                if schedule == "complement_lag_damped":
+                    pressure = self._lag_pressure()
+                    # More stale Math pressure => dispatch fewer new Math groups.
+                    target_math -= self.stable_lag_gain * (
+                        pressure["math"] - pressure["qa"]
+                    ) / self.stable_lag_scale
+            if schedule in ("complement_exact", "complement_prob"):
+                target_math = int(round(max(0, min(self.batch_size, target_math))))
+            else:
+                target_math = int(round(max(
+                    self.complement_min_math,
+                    min(self.complement_max_math, target_math),
+                )))
+            if schedule == "complement_ema_slew":
+                limit = self.complement_max_target_change
+                target_math = max(
+                    self.complement_previous_target - limit,
+                    min(self.complement_previous_target + limit, target_math),
+                )
+                self.complement_previous_target = target_math
+            self.pending_stable_targets.append(target_math)
+            self.step_schedule_history.append(f"{schedule}:{target_math}")
+            return
+        if schedule in (
+            "all_math", "all_qa", "global_drr", "phase_debt", "phase_lag_debt",
+            "global_block_math", "global_block_qa",
+        ):
             self.active_step_schedule = schedule
             self.schedule_cycle_started = True
             self.step_schedule_history.append(schedule)
@@ -325,6 +402,46 @@ class FullyAsyncReplay:
         self.step_schedule_history.append(schedule)
 
     def _new_task(self):
+        if self.scheduling in (
+            "complement_exact",
+            "complement_prob",
+            "complement_damped",
+            "complement_lag_damped",
+            "complement_ema_slew",
+        ):
+            if self.stable_cycle_remaining == 0:
+                target_math = (
+                    self.pending_stable_targets.pop(0)
+                    if self.pending_stable_targets
+                    else int(round(self.batch_size * self.math_ratio))
+                )
+                self.stable_cycle_remaining = self.batch_size
+                if self.scheduling == "complement_prob":
+                    self.stable_cycle_probability = target_math / self.batch_size
+                    self.stable_cycle_tasks = []
+                else:
+                    self.stable_cycle_probability = None
+                    self.stable_cycle_tasks = (
+                        ["math"] * target_math + ["qa"] * (self.batch_size - target_math)
+                    )
+                    self.rng.shuffle(self.stable_cycle_tasks)
+            if self.stable_cycle_probability is None:
+                task = self.stable_cycle_tasks.pop()
+            else:
+                task = "math" if self.rng.random() < self.stable_cycle_probability else "qa"
+            self.stable_cycle_remaining -= 1
+            self.new_dispatch_counts[task] += 1
+            return task
+
+        if self.scheduling in ("global_block_math", "global_block_qa"):
+            first = "math" if self.scheduling == "global_block_math" else "qa"
+            block_index = (
+                self.new_dispatch_counts["math"] + self.new_dispatch_counts["qa"]
+            ) // self.global_block_size
+            task = first if block_index % 2 == 0 else ("qa" if first == "math" else "math")
+            self.new_dispatch_counts[task] += 1
+            return task
+
         if (
             self.active_step_schedule != "fixed"
             and sum(self.step_schedule_counts.values()) >= sum(self.phase_aware_quotas.values())
@@ -529,6 +646,15 @@ def summarize(records, profile, train_time_profile=None):
         records[i]["phase_aware_train_task"] != records[i - 1]["phase_aware_train_task"]
         for i in range(1, len(records))
     )
+    math_groups = [row["math_groups"] for row in records]
+    adjacent_math_delta = [abs(b - a) for a, b in zip(math_groups, math_groups[1:])]
+    nonzero_sides = [1 if value > 16 else -1 for value in math_groups if value != 16]
+    composition_side_switches = sum(a != b for a, b in zip(nonzero_sides, nonzero_sides[1:]))
+    if len(math_groups) > 1 and np.std(math_groups[:-1]) > 0 and np.std(math_groups[1:]) > 0:
+        composition_lag1_correlation = float(np.corrcoef(math_groups[:-1], math_groups[1:])[0, 1])
+    else:
+        composition_lag1_correlation = 0.0
+    pair_errors = [abs((a + b) / 2 - 16) for a, b in zip(math_groups, math_groups[1:])]
     return {
         "steps": len(records),
         "sim_train_time": mean("train_time"),
@@ -538,6 +664,15 @@ def summarize(records, profile, train_time_profile=None):
         "sim_step_time": mean("step_time"),
         "real_step_time": float(np.mean(real_step)),
         "sim_math_groups": mean("math_groups"),
+        "sim_math_groups_std": float(np.std(math_groups)),
+        "sim_math_groups_abs_error_from_16": float(np.mean([abs(value - 16) for value in math_groups])),
+        "sim_math_groups_adjacent_abs_delta": float(np.mean(adjacent_math_delta)) if adjacent_math_delta else 0.0,
+        "sim_composition_side_switches": float(composition_side_switches),
+        "sim_composition_lag1_correlation": composition_lag1_correlation,
+        "sim_two_step_math_abs_error_from_16": float(np.mean(pair_errors)) if pair_errors else 0.0,
+        "sim_math_groups_outside_12_20_ratio": float(np.mean([
+            value < 12 or value > 20 for value in math_groups
+        ])),
         "real_math_groups": float(np.mean(real_math_groups)),
         "sim_completed_store_size": mean("completed_store_size"),
         "real_completed_store_size": float(np.mean(real_store)),
@@ -585,6 +720,12 @@ def main():
     parser.add_argument("--burst-scale", type=float, default=CALIBRATED_BURST_SCALE)
     parser.add_argument("--quiet-scale", type=float, default=CALIBRATED_QUIET_SCALE)
     parser.add_argument(
+        "--math-time-scale",
+        type=float,
+        default=1.0,
+        help="Multiply sampled Math rollout group durations by this factor.",
+    )
+    parser.add_argument(
         "--scheduling",
         choices=(
             "fixed",
@@ -605,6 +746,13 @@ def main():
             "global_drr",
             "phase_debt",
             "phase_lag_debt",
+            "complement_exact",
+            "complement_prob",
+            "complement_damped",
+            "complement_lag_damped",
+            "complement_ema_slew",
+            "global_block_math",
+            "global_block_qa",
             "phase_aware",  # legacy experimental mode
         ),
         default="fixed",
@@ -622,6 +770,15 @@ def main():
     parser.add_argument("--lag-debt-beta", type=float, default=0.0)
     parser.add_argument("--lag-debt-scale", type=float, default=256.0)
     parser.add_argument("--lag-debt-cap", type=float, default=16.0)
+    parser.add_argument("--complement-gain", type=float, default=0.5)
+    parser.add_argument("--complement-min-math", type=int, default=8)
+    parser.add_argument("--complement-max-math", type=int, default=24)
+    parser.add_argument("--stable-lag-gain", type=float, default=0.0)
+    parser.add_argument("--stable-lag-scale", type=float, default=256.0)
+    parser.add_argument("--complement-ema-alpha", type=float, default=0.25)
+    parser.add_argument("--complement-deadband", type=float, default=1.0)
+    parser.add_argument("--complement-max-target-change", type=int, default=2)
+    parser.add_argument("--global-block-size", type=int, choices=(2, 4, 8, 16, 32), default=4)
     parser.add_argument(
         "--phase-aware-lag-margin",
         type=float,
@@ -672,8 +829,18 @@ def main():
             lag_debt_beta=args.lag_debt_beta,
             lag_debt_scale=args.lag_debt_scale,
             lag_debt_cap=args.lag_debt_cap,
+            complement_gain=args.complement_gain,
+            complement_min_math=args.complement_min_math,
+            complement_max_math=args.complement_max_math,
+            stable_lag_gain=args.stable_lag_gain,
+            stable_lag_scale=args.stable_lag_scale,
+            complement_ema_alpha=args.complement_ema_alpha,
+            complement_deadband=args.complement_deadband,
+            complement_max_target_change=args.complement_max_target_change,
+            global_block_size=args.global_block_size,
             completed_cap=args.completed_cap,
             train_time_profile=train_time_profile,
+            math_time_scale=args.math_time_scale,
         ).run(args.steps)
         summaries.append(summarize(records, profile, train_time_profile))
         if seed == 0:

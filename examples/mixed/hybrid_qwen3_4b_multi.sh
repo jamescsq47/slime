@@ -173,7 +173,10 @@ CUSTOM_ARGS=(
    # --count-aware-alternation
    # --math-batches-per-cycle 16
    # --qa-batches-per-cycle 16
+   # --batch-alternation-start-task qa
    # --batch-alternation 
+#   --phase-aware-train-task qa
+#   --phase-aware-post-update-task math
    # --mask-offpolicy-in-partial-rollout 
 #    --dynamic-alternation
 #    --dynamic-alternation-alpha 1 # lag-based ratio weight; final=(1-alpha)*math-ratio + alpha*lag-ratio
