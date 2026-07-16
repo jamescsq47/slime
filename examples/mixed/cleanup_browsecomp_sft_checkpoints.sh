@@ -34,6 +34,12 @@ cleanup_once() {
     iteration=$((10#${name#iter_}))
     completed_steps=$((iteration + 1))
 
+    # A .keep marker provides an explicit escape hatch for manually pinned
+    # recovery points and protects them across cleaner restarts/config changes.
+    if [[ -e "${CHECKPOINT_DIR}/${name}/.keep" ]]; then
+      continue
+    fi
+
     # Milestones are zero-based iterations: epoch 25 ends at step 849 when
     # there are 34 optimizer steps per epoch.
     if (( completed_steps % MILESTONE_STEPS == 0 )); then
