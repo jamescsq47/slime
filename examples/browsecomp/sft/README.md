@@ -45,8 +45,10 @@ NVIDIA GPU is visible.
 
 For this 558-record dataset and batch size 16, slime runs 34 optimizer steps
 per epoch. `examples/mixed/cleanup_browsecomp_sft_checkpoints.sh` can run next
-to training to retain permanent checkpoints every 20 epochs (iterations 679,
-1359, 2039, 2719, and 3399). For safe recovery it also retains the current
+to training to retain permanent checkpoints every 25 epochs (iterations 849,
+1699, 2549, and 3399). With the default mixed RL setup, 25 SFT epochs expose
+13,600 trajectories, close to the 12,800 BrowseComp trajectories in 100 mixed
+RL steps at a 0.5 BrowseComp ratio. For safe recovery it also retains the current
 `latest` checkpoint and the two newest directories while a checkpoint may be
 in flight.
 The default global batch is 16 to bound synchronization skew from uneven

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Keep 20-epoch SFT milestones plus safe rolling checkpoints while training.
+# Keep 25-epoch SFT milestones plus safe rolling checkpoints while training.
 set -euo pipefail
 
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-/workspace/Qwen3-8B-browsecomp-sft}
 STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-34}
-KEEP_EVERY_EPOCHS=${KEEP_EVERY_EPOCHS:-20}
+KEEP_EVERY_EPOCHS=${KEEP_EVERY_EPOCHS:-25}
 POLL_SECONDS=${POLL_SECONDS:-60}
 DRY_RUN=${DRY_RUN:-0}
 RUN_ONCE=${RUN_ONCE:-0}
@@ -34,7 +34,7 @@ cleanup_once() {
     iteration=$((10#${name#iter_}))
     completed_steps=$((iteration + 1))
 
-    # Milestones are zero-based iterations: epoch 20 ends at step 679 when
+    # Milestones are zero-based iterations: epoch 25 ends at step 849 when
     # there are 34 optimizer steps per epoch.
     if (( completed_steps % MILESTONE_STEPS == 0 )); then
       continue
