@@ -53,6 +53,11 @@ cleanup_once() {
     # Milestones are zero-based iterations: epoch 25 ends at step 849 when
     # there are 34 optimizer steps per epoch.
     if (( completed_steps % MILESTONE_STEPS == 0 )); then
+      # Persist an explicit marker so milestone retention is visible and can
+      # be audited independently of the arithmetic in this cleaner.
+      if [[ "${DRY_RUN}" != "1" ]]; then
+        touch "${CHECKPOINT_DIR}/${name}/.keep"
+      fi
       continue
     fi
     if (( iteration == latest )) || [[ "${name}" == "${newest}" || "${name}" == "${second_newest}" ]]; then
