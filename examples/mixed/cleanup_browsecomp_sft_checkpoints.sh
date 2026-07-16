@@ -9,6 +9,16 @@ POLL_SECONDS=${POLL_SECONDS:-60}
 DRY_RUN=${DRY_RUN:-0}
 RUN_ONCE=${RUN_ONCE:-0}
 
+# Prevent stale cleaners with older retention rules from running concurrently.
+# The lock lives outside the checkpoint directory so checkpoint writes cannot
+# replace it. RUN_ONCE checks use a separate lock only when explicitly set.
+LOCK_FILE=${LOCK_FILE:-/tmp/browsecomp_sft_checkpoint_cleanup.lock}
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "another BrowseComp SFT checkpoint cleaner is already running" >&2
+  exit 1
+fi
+
 MILESTONE_STEPS=$((STEPS_PER_EPOCH * KEEP_EVERY_EPOCHS))
 
 cleanup_once() {
