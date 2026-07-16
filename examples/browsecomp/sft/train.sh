@@ -52,8 +52,11 @@ DP=$((NUM_GPUS / MODEL_PARALLEL))
 # CP is disabled because FlashAttention 2.8's variable-length CP path hangs on
 # this Ampere host.  The longest retained sample is 31,717 tokens, so leave a
 # small full-sequence packing margin.
-MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-12288}
-SFT_MAX_SEQ_LEN=${SFT_MAX_SEQ_LEN:-12288}
+# 12,288 occasionally peaks above 48GB during backward for an unlucky
+# dynamic-pack composition on RTX A6000. 10,240 leaves enough activation
+# headroom; sft_rollout compacts old evidence payloads for longer trajectories.
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-10240}
+SFT_MAX_SEQ_LEN=${SFT_MAX_SEQ_LEN:-10240}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-16}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}
 NUM_EPOCH=${NUM_EPOCH:-100}

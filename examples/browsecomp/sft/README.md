@@ -57,7 +57,9 @@ The NCCL watchdog heartbeat is 3600 seconds so long FlashAttention/recompute
 kernels do not trigger PyTorch's shorter watchdog false positive.
 SFT cross-entropy log probabilities are computed in 512-token chunks to avoid
 materializing a multi-gigabyte FP32 `[sequence, vocab]` temporary.
-The launcher uses FlashAttention with a 12,288-token training context. Older
+The launcher uses FlashAttention with a 10,240-token training context on 48GB
+RTX A6000 GPUs. The earlier 12,288-token limit could exceed 48GB during
+backward for unlucky dynamic-pack compositions. Older
 evidence payloads are compacted by `sft_rollout.py` to keep every retained
 trajectory within that bound.
 
