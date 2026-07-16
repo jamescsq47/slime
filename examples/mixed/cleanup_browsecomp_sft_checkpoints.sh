@@ -5,6 +5,7 @@ set -euo pipefail
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-/workspace/Qwen3-8B-browsecomp-sft}
 STEPS_PER_EPOCH=${STEPS_PER_EPOCH:-34}
 KEEP_EVERY_EPOCHS=${KEEP_EVERY_EPOCHS:-25}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-100}
 POLL_SECONDS=${POLL_SECONDS:-60}
 DRY_RUN=${DRY_RUN:-0}
 RUN_ONCE=${RUN_ONCE:-0}
@@ -18,8 +19,6 @@ if ! flock -n 9; then
   echo "another BrowseComp SFT checkpoint cleaner is already running" >&2
   exit 1
 fi
-
-MILESTONE_STEPS=$((STEPS_PER_EPOCH * KEEP_EVERY_EPOCHS))
 
 cleanup_once() {
   [[ -d "${CHECKPOINT_DIR}" ]] || return 0
@@ -39,10 +38,38 @@ cleanup_once() {
   (( count >= 1 )) && newest=${checkpoints[count-1]}
   (( count >= 2 )) && second_newest=${checkpoints[count-2]}
 
-  local name iteration completed_steps
+  # Record which 25-epoch boundaries already have a permanently retained
+  # checkpoint. A save schedule can be offset by resume (for example, a run
+  # resumed at iteration 1019 with --save-interval 100 will never create
+  # iter_0001699). In that case retain the first checkpoint written after the
+  # boundary instead of silently losing the milestone altogether.
+  declare -A retained_milestones=()
+  local marker milestone_epoch
+  for name in "${checkpoints[@]}"; do
+    for marker in "${CHECKPOINT_DIR}/${name}"/.keep_epoch_*; do
+      [[ -e "${marker}" ]] || continue
+      milestone_epoch=${marker##*_}
+      retained_milestones["${milestone_epoch}"]=1
+    done
+  done
+
+  local name iteration completed_steps milestone_steps
   for name in "${checkpoints[@]}"; do
     iteration=$((10#${name#iter_}))
     completed_steps=$((iteration + 1))
+
+    for ((milestone_epoch=KEEP_EVERY_EPOCHS; milestone_epoch<=TOTAL_EPOCHS; milestone_epoch+=KEEP_EVERY_EPOCHS)); do
+      milestone_steps=$((STEPS_PER_EPOCH * milestone_epoch))
+      if (( completed_steps >= milestone_steps )) && [[ -z "${retained_milestones[${milestone_epoch}]:-}" ]]; then
+        if [[ "${DRY_RUN}" == "1" ]]; then
+          echo "would retain ${CHECKPOINT_DIR}/${name} for epoch ${milestone_epoch}"
+        else
+          touch "${CHECKPOINT_DIR}/${name}/.keep"
+          touch "${CHECKPOINT_DIR}/${name}/.keep_epoch_${milestone_epoch}"
+        fi
+        retained_milestones["${milestone_epoch}"]=1
+      fi
+    done
 
     # A .keep marker provides an explicit escape hatch for manually pinned
     # recovery points and protects them across cleaner restarts/config changes.
@@ -50,16 +77,6 @@ cleanup_once() {
       continue
     fi
 
-    # Milestones are zero-based iterations: epoch 25 ends at step 849 when
-    # there are 34 optimizer steps per epoch.
-    if (( completed_steps % MILESTONE_STEPS == 0 )); then
-      # Persist an explicit marker so milestone retention is visible and can
-      # be audited independently of the arithmetic in this cleaner.
-      if [[ "${DRY_RUN}" != "1" ]]; then
-        touch "${CHECKPOINT_DIR}/${name}/.keep"
-      fi
-      continue
-    fi
     if (( iteration == latest )) || [[ "${name}" == "${newest}" || "${name}" == "${second_newest}" ]]; then
       continue
     fi
