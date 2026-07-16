@@ -42,6 +42,13 @@ If `SAVE_PATH/latest_checkpointed_iteration.txt` exists, `train.sh`
 automatically resumes model, optimizer, scheduler, rollout id, and dataset
 cursor from that checkpoint. It also fails before starting Ray when no usable
 NVIDIA GPU is visible.
+
+For this 558-record dataset and batch size 16, slime runs 34 optimizer steps
+per epoch. `examples/mixed/cleanup_browsecomp_sft_checkpoints.sh` can run next
+to training to retain permanent checkpoints every 20 epochs (iterations 679,
+1359, 2039, 2719, and 3399). For safe recovery it also retains the current
+`latest` checkpoint and the two newest directories while a checkpoint may be
+in flight.
 The default global batch is 16 to bound synchronization skew from uneven
 long trajectories; distributed collectives use a 30-minute timeout.
 Dynamic-batch microbatch-count metadata uses the DP Gloo group so the first
