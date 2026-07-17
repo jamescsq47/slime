@@ -72,14 +72,29 @@ def generate_rollout(args, rollout_id, data_buffer, evaluation=False):
     samples = data_buffer.get_samples(args.rollout_batch_size)
     for wrapped_sample in samples:
         (sample,) = wrapped_sample
-        messages = sample.prompt
-        tools = sample.metadata.get("tools")
-        compacted, token_ids, loss_mask, removed = _compact_messages(
-            messages, tools, MASK_GENERATOR, max_tokens
-        )
-        if len(token_ids) != len(loss_mask):
+        metadata = sample.metadata or {}
+        exact_tokens = metadata.get("pretokenized_tokens")
+        exact_mask = metadata.get("pretokenized_loss_mask")
+        exact_mode = exact_tokens is not None or exact_mask is not None
+        if exact_mode:
+            # Math rollouts are exported with their original RL mask.  In
+            # particular, interpreter observations remain unsupervised.
+            if not isinstance(exact_tokens, list) or not isinstance(exact_mask, list):
+                raise ValueError("incomplete pretokenized SFT fields")
+            if not exact_mask or len(exact_tokens) < len(exact_mask) or len(exact_tokens) > max_tokens:
+                raise ValueError("invalid or over-budget pretokenized SFT trajectory")
+            token_ids, loss_mask, removed = exact_tokens, exact_mask, 0
+            response_length = len(loss_mask)
+        else:
+            messages = sample.prompt
+            tools = metadata.get("tools")
+            compacted, token_ids, loss_mask, removed = _compact_messages(
+                messages, tools, MASK_GENERATOR, max_tokens
+            )
+            response_length = MASK_GENERATOR.get_response_lengths([loss_mask])[0]
+        if not exact_mode and len(token_ids) != len(loss_mask):
+            # `loss_mask` is response-relative for pretokenized rollouts.
             raise ValueError(f"mismatched SFT tokens/mask: {len(token_ids)} != {len(loss_mask)}")
-        response_length = MASK_GENERATOR.get_response_lengths([loss_mask])[0]
         if response_length == 0:
             raise ValueError("SFT trajectory has no supervised assistant tokens")
 

@@ -60,6 +60,14 @@ SFT_MAX_SEQ_LEN=${SFT_MAX_SEQ_LEN:-10240}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-16}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}
 NUM_EPOCH=${NUM_EPOCH:-100}
+SFT_SAVE_INTERVAL=${SFT_SAVE_INTERVAL:-100}
+SFT_LR=${SFT_LR:-1e-6}
+SFT_MIN_LR=${SFT_MIN_LR:-1e-7}
+SFT_LR_DECAY_STYLE=${SFT_LR_DECAY_STYLE:-cosine}
+SFT_LR_WARMUP_FRACTION=${SFT_LR_WARMUP_FRACTION:-0.01}
+SFT_WEIGHT_DECAY=${SFT_WEIGHT_DECAY:-0.05}
+SFT_ADAM_BETA1=${SFT_ADAM_BETA1:-0.9}
+SFT_ADAM_BETA2=${SFT_ADAM_BETA2:-0.95}
 
 echo "Qwen3-8B SFT topology: GPUs=${NUM_GPUS} memory=${GPU_MEMORY_MIB:-unknown}MiB NVLinkRefs=${NVLINK_COUNT} TP=${TP} CP=${CP} PP=${PP} DP=${DP}"
 echo "SFT data=${SFT_DATA} epochs=${NUM_EPOCH} save=${SAVE_PATH}"
@@ -69,6 +77,14 @@ DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
 ray stop --force >/dev/null 2>&1 || true
 ray start --head --node-ip-address "${MASTER_ADDR}" --num-gpus "${NUM_GPUS}" \
   --dashboard-port "${DASHBOARD_PORT}" --disable-usage-stats
+
+# `ray start` may return just before the dashboard accepts job submissions.
+# Wait explicitly so a freshly stopped sampling cluster cannot race the SFT job.
+for _ in $(seq 1 30); do
+  ray job list --address="http://${MASTER_ADDR}:${DASHBOARD_PORT}" >/dev/null 2>&1 && break
+  sleep 1
+done
+ray job list --address="http://${MASTER_ADDR}:${DASHBOARD_PORT}" >/dev/null
 
 HAS_NVLINK=0
 [[ "${NVLINK_COUNT}" -gt 0 ]] && HAS_NVLINK=1
@@ -82,7 +98,7 @@ ray job submit --address="http://${MASTER_ADDR}:${DASHBOARD_PORT}" \
     "${MODEL_ARGS[@]}" \
     --hf-checkpoint "${HF_CHECKPOINT}" --ref-load "${REF_LOAD}" \
     "${LOAD_ARGS[@]}" \
-    --save "${SAVE_PATH}" --save-interval 100 \
+    --save "${SAVE_PATH}" --save-interval "${SFT_SAVE_INTERVAL}" \
     --rollout-function-path examples.browsecomp.sft.sft_rollout.generate_rollout \
     --prompt-data "${SFT_DATA}" --input-key messages --rollout-shuffle \
     --num-epoch "${NUM_EPOCH}" --rollout-batch-size "${ROLLOUT_BATCH_SIZE}" \
@@ -99,9 +115,9 @@ ray job submit --address="http://${MASTER_ADDR}:${DASHBOARD_PORT}" \
     --use-distributed-optimizer \
     --use-dynamic-batch-size --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}" \
     --recompute-granularity full --recompute-method uniform --recompute-num-layers 1 \
-    --optimizer adam --lr 1e-6 --min-lr 1e-7 --lr-decay-style cosine \
-    --lr-warmup-fraction 0.01 --weight-decay 0.05 \
-    --adam-beta1 0.9 --adam-beta2 0.95 \
+    --optimizer adam --lr "${SFT_LR}" --min-lr "${SFT_MIN_LR}" --lr-decay-style "${SFT_LR_DECAY_STYLE}" \
+    --lr-warmup-fraction "${SFT_LR_WARMUP_FRACTION}" --weight-decay "${SFT_WEIGHT_DECAY}" \
+    --adam-beta1 "${SFT_ADAM_BETA1}" --adam-beta2 "${SFT_ADAM_BETA2}" \
     --attention-dropout 0.0 --hidden-dropout 0.0 \
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 \
     --attention-backend flash
