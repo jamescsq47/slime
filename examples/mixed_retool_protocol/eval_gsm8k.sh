@@ -234,7 +234,6 @@ SGLANG_ARGS=(
 
 CUSTOM_ARGS=(
    --data-source-path custom_data_source.CustomDataSource
-   --custom-generate-function-path generate_with_hybrid_protocol.generate_unified
    --custom-rm-path generate_with_hybrid_protocol.reward_func_unified
    --math-data-path /workspace/data/dapo-math-17k/dapo-math-17k.jsonl
    --qa-data-path /workspace/data/browsecomp/bc_test.jsonl
@@ -246,6 +245,10 @@ CUSTOM_ARGS=(
    # --lag-version 3 \
    #  --grad-log-dir /workspace/slime/examples/hybrid/debug/math
 )
+
+if [ "${DISABLE_CUSTOM_GENERATE:-0}" != "1" ]; then
+   CUSTOM_ARGS+=(--custom-generate-function-path generate_with_hybrid_protocol.generate_unified)
+fi
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1

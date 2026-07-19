@@ -13,7 +13,9 @@ set -e
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# Colocate enables SGLang's TorchMemorySaver. It is incompatible with
+# PyTorch's expandable_segments allocator, so retain the native allocator.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-backend:native}
 
 # 网络配置 - 默认沿用当前集群，换机器时通过环境变量覆盖。
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ibp169s0f1}
@@ -58,7 +60,7 @@ MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
 MIXED_RETOOL_MAX_RESPONSE_LEN=${MIXED_RETOOL_MAX_RESPONSE_LEN:-8192}
 MIXED_BROWSECOMP_MAX_RESPONSE_LEN=${MIXED_BROWSECOMP_MAX_RESPONSE_LEN:-36864}
 BROWSECOMP_MAX_SEQ_LEN=${BROWSECOMP_MAX_SEQ_LEN:-${MIXED_BROWSECOMP_MAX_RESPONSE_LEN}}
-SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-new/}
+SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-sync/}
 HF_CHECKPOINT=${HF_CHECKPOINT:-/workspace/Qwen3-8B}
 REF_LOAD=${REF_LOAD:-/workspace/Qwen3-8B_torch_dist}
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-2}
@@ -81,9 +83,8 @@ WANDB_ARGS=(
    --wandb-project mixed-qwen3-8b-sync
    --wandb-group qwen3-8B-browsecomp-retool-sync-0.5-51200-51200
 )
-if [ -n "${WANDB_KEY:-}" ]; then
-   WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
-fi
+# W&B reads WANDB_API_KEY from the environment. Do not pass credentials on the
+# command line: parsed CLI arguments are logged to the run config.
 
 PROMPT_SET=/workspace/data/dapo-math-17k/dapo-math-17k.jsonl
 BROWSECOMP_DATA_DIR=${BROWSECOMP_DATA_DIR:-/workspace/data/browsecomp}
@@ -218,6 +219,7 @@ RUNTIME_ENV_JSON="{
     \"GRADER_MODEL\": \"${GRADER_MODEL:-}\",
     \"GRADER_FALLBACK_MODEL\": \"${GRADER_FALLBACK_MODEL:-}\",
     \"GRADER_API_VERSION\": \"${GRADER_API_VERSION:-}\",
+    \"WANDB_API_KEY\": \"${WANDB_API_KEY:-}\",
     \"BROWSECOMP_MAX_TURNS\": \"${BROWSECOMP_MAX_TURNS}\",
     \"BROWSECOMP_TURN_MAX_NEW_TOKENS\": \"${BROWSECOMP_TURN_MAX_NEW_TOKENS}\",
     \"BROWSECOMP_MUST_SEARCH\": \"${BROWSECOMP_MUST_SEARCH}\",

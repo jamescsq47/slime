@@ -434,8 +434,7 @@ async def generate_rollout_async(
         print("record tool call counts for analysis")
         tool_time_counts = []
         sample_time_counts = []
-        code_call_counts = []
-        search_call_counts = []
+        tool_time_ratios = []
         metrics_to_log = {}
         task_types = []
         math_samples = []  
@@ -447,10 +446,10 @@ async def generate_rollout_async(
                     tool_time_counts.append(sample.tool_time)
                 if hasattr(sample, 'sample_time'):
                     sample_time_counts.append(sample.sample_time)
-                if hasattr(sample, 'code_call_count'):
-                    code_call_counts.append(sample.code_call_count)
-                if hasattr(sample, 'search_call_count'):
-                    search_call_counts.append(sample.search_call_count)
+                if hasattr(sample, 'tool_time') and hasattr(sample, 'sample_time'):
+                    tool_time_ratios.append(
+                        sample.tool_time / sample.sample_time if sample.sample_time > 0 else 0.0
+                    )
                 if hasattr(sample, 'metadata'):
                     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
                     task_type = metadata.get("task_type", "error") 
@@ -499,6 +498,18 @@ async def generate_rollout_async(
             qa_reward_avg = sum(_get_reward_score(s.reward) for s in qa_samples) / total_qa if total_qa > 0 else 0
             math_acc_avg = _average_acc(math_samples)
             qa_acc_avg = _average_acc(qa_samples)
+
+            # Keep the synchronous metrics aligned with the mixed fully-async
+            # rollout.  Tool-call counts are attached dynamically by the custom
+            # generators, so use a zero default for samples which made no call.
+            math_tool_call_counts = [getattr(s, "tool_call_count", 0) or 0 for s in math_samples]
+            qa_tool_call_counts = [getattr(s, "tool_call_count", 0) or 0 for s in qa_samples]
+            math_tool_calls_ratio = (
+                sum(1 for count in math_tool_call_counts if count > 0) / total_math if total_math > 0 else 0.0
+            )
+            qa_tool_calls_ratio = (
+                sum(1 for count in qa_tool_call_counts if count > 0) / total_qa if total_qa > 0 else 0.0
+            )
             
             # Calculate math task sample_time stats
             math_sample_times = [s.sample_time for s in math_samples if hasattr(s, 'sample_time')]
@@ -527,6 +538,13 @@ async def generate_rollout_async(
                 "tool/qa_reward": qa_reward_avg,
                 "tool/math_acc": math_acc_avg,
                 "tool/qa_acc": qa_acc_avg,
+                # Match fully_async_rollout.py: math code calls are averaged
+                # over math samples only, while the legacy-named search metric
+                # is QA external-tool calls (search + open_page) over QA only.
+                "tool/avg_code_call_count": sum(math_tool_call_counts) / total_math if total_math > 0 else 0.0,
+                "tool/avg_search_call_count": sum(qa_tool_call_counts) / total_qa if total_qa > 0 else 0.0,
+                "tool/math_tool_calls_ratio": math_tool_calls_ratio,
+                "tool/qa_tool_calls_ratio": qa_tool_calls_ratio,
                 "tool/math_sample_time_max": math_sample_time_max,
                 "tool/math_sample_time_avg": math_sample_time_avg,
                 "tool/qa_sample_time_max": qa_sample_time_max,
@@ -540,17 +558,11 @@ async def generate_rollout_async(
         if tool_time_counts:
             avg_tool_times = sum(tool_time_counts) / len(tool_time_counts)
             avg_sample_times = sum(sample_time_counts) / len(sample_time_counts) if sample_time_counts else 0.0
-            avg_tool_times_ratio_per_sample = [
-                t / s if s > 0 else 0.0
-                for t, s in zip(tool_time_counts, sample_time_counts)
-            ]
 
             metrics_to_log.update({
                 "tool/avg_tool_calls_time": avg_tool_times,
                 "tool/avg_sample_time": avg_sample_times,
-                "tool/avg_tool_time_ratio_per_sample": sum(avg_tool_times_ratio_per_sample) / len(avg_tool_times_ratio_per_sample) if avg_tool_times_ratio_per_sample else 0.0,
-                "tool/avg_code_call_count": sum(code_call_counts) / len(code_call_counts) if code_call_counts else 0.0,
-                "tool/avg_search_call_count": sum(search_call_counts) / len(search_call_counts) if search_call_counts else 0.0,
+                "tool/avg_tool_time_ratio_per_sample": sum(tool_time_ratios) / len(tool_time_ratios) if tool_time_ratios else 0.0,
             })
             
         

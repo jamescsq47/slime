@@ -63,7 +63,7 @@ MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
 MIXED_RETOOL_MAX_RESPONSE_LEN=${MIXED_RETOOL_MAX_RESPONSE_LEN:-8192}
 MIXED_BROWSECOMP_MAX_RESPONSE_LEN=${MIXED_BROWSECOMP_MAX_RESPONSE_LEN:-36864}
 BROWSECOMP_MAX_SEQ_LEN=${BROWSECOMP_MAX_SEQ_LEN:-${MIXED_BROWSECOMP_MAX_RESPONSE_LEN}}
-SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-new/}
+SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/}
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 ACTOR_GPUS_PER_NODE=${ACTOR_GPUS_PER_NODE:-8}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-8}
@@ -171,10 +171,10 @@ CUSTOM_ARGS=(
    --mask-offpolicy-math 51200
    --mask-offpolicy-qa 51200
    # --count-aware-alternation
-   # --math-batches-per-cycle 16
-   # --qa-batches-per-cycle 16
-   # --batch-alternation-start-task qa
-   # --batch-alternation 
+   --math-batches-per-cycle 4
+   --qa-batches-per-cycle 4
+   --batch-alternation-start-task qa
+   --batch-alternation 
 #   --phase-aware-train-task qa
 #   --phase-aware-post-update-task math
    # --mask-offpolicy-in-partial-rollout 

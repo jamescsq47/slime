@@ -60,7 +60,7 @@ echo "=== Running hybrid async benchmark: mode=${MODE} ==="
 CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/iter199_torch_dist
+   --ref-load /workspace/Qwen3-8B-browsecomp-sft/iter1699_torch_dist
    # --load /root/Qwen3-4B_slime/
 #    --save /workspace/Qwen3-4B_sync_hybrid0.5/
 #    --save-interval 100s
@@ -70,7 +70,7 @@ CKPT_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project hybrid-qwen3-8b-eval
-   --wandb-group Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200
+   --wandb-group Qwen3-8B-browsecomp-sft
    --wandb-key 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
 )
 
@@ -97,7 +97,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   # --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-iter199.pt
+   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-sft-iter1699.pt
 )
 
 
@@ -141,7 +141,7 @@ EVAL_ARGS=(
    --eval-dataset-override browsecomp.task_type=qa
    --eval-dataset-override browsecomp.eval_reward_key=score
    --eval-dataset-override browsecomp.wandb_prefix=eval7
-   # # Per-dataset overrides (Dataset 4: aime / math)
+   # Per-dataset overrides (Dataset 4: aime / math)
    # --eval-dataset-override aime25.n_samples_per_eval_prompt=32
    # --eval-dataset-override aime25.max_response_len=32768
    # --eval-dataset-override aime25.input_key=problem

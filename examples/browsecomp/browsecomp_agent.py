@@ -21,6 +21,7 @@ Environment variables:
 
 import logging
 import os
+import time
 from copy import deepcopy
 from typing import Any
 
@@ -133,8 +134,6 @@ async def _generate_step(
 
 async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False) -> Sample:
     """slime custom generate entry point for BrowseComp ReAct rollouts."""
-    assert not args.partial_rollout, "BrowseComp agent rollouts do not support partial_rollout."
-
     metadata = sample.metadata or {}
     question = metadata.get("question")
     label_answer = metadata.get("answer") or sample.label
@@ -156,19 +155,51 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     per_turn_max_tokens = min(turn_max_new_tokens, sampling_params.get("max_new_tokens") or turn_max_new_tokens)
 
+    resume_state = metadata.get("browsecomp_partial_state") if args.partial_rollout else None
+    is_resume = sample.status == Sample.Status.ABORTED and isinstance(resume_state, dict)
     if not sample.tokens:
         sample.tokens = _encode_initial_prompt(state.tokenizer, sample.prompt)
-    response_tokens: list[int] = []
-    sample.loss_mask = []
-    sample.rollout_log_probs = []
+        metadata["browsecomp_prompt_length"] = len(sample.tokens)
+    if is_resume:
+        prompt_length = int(metadata.get("browsecomp_prompt_length", len(sample.tokens) - sample.response_length))
+        response_tokens = list(sample.tokens[prompt_length:])
+        sample.loss_mask = list(sample.loss_mask or [])
+        sample.rollout_log_probs = list(sample.rollout_log_probs or [])
+        sample.status = Sample.Status.PENDING
+    else:
+        response_tokens: list[int] = []
+        sample.loss_mask = []
+        sample.rollout_log_probs = []
 
     messages = deepcopy(sample.prompt) if isinstance(sample.prompt, list) else None
     env = BrowseCompEnv(question=question, label_answer=label_answer, must_search=must_search)
     stop_reason = "max_turns"
-    num_turns = 0
+    num_turns = int(resume_state.get("num_turns", 0)) if is_resume else 0
+    accrued_sample_time = float(getattr(sample, "sample_time", 0.0) or 0.0) if is_resume else 0.0
+    tool_time = float(getattr(sample, "tool_time", 0.0) or 0.0) if is_resume else 0.0
+    pending_response_text = str(resume_state.get("pending_response_text", "")) if is_resume else ""
+    segment_started = time.monotonic()
+    if is_resume:
+        env.visited_pages = set(resume_state.get("visited_pages", []))
+        env.stats.update(resume_state.get("tool_stats", {}))
+        predicted = resume_state.get("predicted_answer")
+        env.predicted_answer = tuple(predicted) if predicted else None
+
+    def save_partial_state() -> None:
+        metadata["browsecomp_partial_state"] = {
+            "num_turns": num_turns,
+            "visited_pages": sorted(env.visited_pages),
+            "tool_stats": dict(env.stats),
+            "predicted_answer": list(env.predicted_answer) if env.predicted_answer else None,
+            "pending_response_text": pending_response_text,
+        }
+        sample.response = state.tokenizer.decode(response_tokens, skip_special_tokens=False)
+        sample.response_length = len(response_tokens)
+        sample.sample_time = accrued_sample_time + (time.monotonic() - segment_started)
+        sample.tool_time = tool_time
 
     try:
-        for _turn in range(max_turns):
+        for _turn in range(num_turns, max_turns):
             if max_seq_len is not None and len(sample.tokens) + per_turn_max_tokens + BUDGET_MARGIN >= max_seq_len:
                 sample.status = Sample.Status.TRUNCATED
                 stop_reason = "budget"
@@ -181,20 +212,26 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             )
             num_turns += 1
             _append_tokens(sample, response_tokens, new_tokens, new_logprobs, loss_mask_value=1)
-
-            if messages is not None:
-                messages.append({"role": "assistant", "content": response_text})
+            action_response_text = pending_response_text + response_text
 
             if finish_type == "abort":
+                pending_response_text = action_response_text
                 sample.status = Sample.Status.ABORTED
                 stop_reason = "abort"
+                save_partial_state()
                 break
             if finish_type == "length":
                 sample.status = Sample.Status.TRUNCATED
                 stop_reason = "length"
                 break
 
-            result = await env.run_action(response_text)
+            pending_response_text = ""
+            if messages is not None:
+                messages.append({"role": "assistant", "content": action_response_text})
+
+            tool_started = time.monotonic()
+            result = await env.run_action(action_response_text)
+            tool_time += time.monotonic() - tool_started
             if result.get("action") == "finish":
                 sample.status = Sample.Status.COMPLETED
                 stop_reason = "finish"
@@ -212,6 +249,11 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
     finally:
         await env.close()
 
+    if sample.status != Sample.Status.ABORTED:
+        metadata.pop("browsecomp_partial_state", None)
+        sample.sample_time = accrued_sample_time + (time.monotonic() - segment_started)
+        sample.tool_time = tool_time
+
     predicted_answer, explanation, confidence = env.predicted_answer or (None, None, None)
     sample.metadata.update(
         {
@@ -222,6 +264,8 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             "stop_reason": stop_reason,
             "tool_stats": dict(env.stats),
             "visited_pages": len(env.visited_pages),
+            "tool_time": sample.tool_time,
+            "sample_time": sample.sample_time,
         }
     )
     sample.response = state.tokenizer.decode(response_tokens, skip_special_tokens=False)
