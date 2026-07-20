@@ -29,6 +29,13 @@ def init_tracking(args, primary: bool = True, **kwargs):
         wandb_utils.init_wandb_primary(args, **kwargs)
     else:
         wandb_utils.init_wandb_secondary(args, **kwargs)
+    if getattr(args, "use_slime_dashboard", False):
+        try:
+            from slime.dashboard.backend import init_dashboard
+
+            init_dashboard(args, primary=primary)
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to initialize optional Slime dashboard")
 
 
 def update_tracking_open_metrics(args, router_addr):
@@ -36,6 +43,13 @@ def update_tracking_open_metrics(args, router_addr):
 
 
 def finish_tracking(args):
+    if getattr(args, "use_slime_dashboard", False):
+        try:
+            from slime.dashboard.backend import finish_dashboard
+
+            finish_dashboard()
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to finish optional Slime dashboard")
     if not args.use_wandb:
         return
     try:
@@ -53,3 +67,11 @@ def log(args, metrics, step_key: str):
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
         _TensorboardAdapter(args).log(data=metrics_except_step, step=metrics[step_key])
+
+    if getattr(args, "use_slime_dashboard", False):
+        try:
+            from slime.dashboard.backend import log_metrics
+
+            log_metrics(metrics, step=metrics.get(step_key), step_key=step_key)
+        except Exception:
+            logging.getLogger(__name__).debug("Failed to mirror metrics to optional Slime dashboard", exc_info=True)

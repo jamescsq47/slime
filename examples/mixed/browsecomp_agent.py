@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 
 from browsecomp_env import BrowseCompEnv, SearchBackendError
+from slime.dashboard.api import span as dashboard_span
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
@@ -358,9 +359,18 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
 
             cur_sampling_params = sampling_params.copy()
             cur_sampling_params["max_new_tokens"] = per_turn_max_tokens
-            response_text, new_tokens, new_logprobs, finish_type = await _generate_step(
-                url, sample.tokens, cur_sampling_params
-            )
+            with dashboard_span(
+                args,
+                sample,
+                "generation_turn",
+                attrs={"task_type": "qa", "turn": num_turns + 1, "max_new_tokens": per_turn_max_tokens},
+            ) as generation_span:
+                response_text, new_tokens, new_logprobs, finish_type = await _generate_step(
+                    url, sample.tokens, cur_sampling_params
+                )
+                generation_span.update(
+                    {"finish_reason": finish_type, "completion_tokens": len(new_tokens)}
+                )
             _append_tokens(sample, response_tokens, new_tokens, new_logprobs, loss_mask_value=1)
 
             if finish_type == "abort":
@@ -379,7 +389,26 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
                 skip_special_tokens=False,
             )
             _tool_start = time.monotonic()
-            result = await env.run_action(assistant_text)
+            tool_stats_before = dict(env.stats)
+            with dashboard_span(
+                args,
+                sample,
+                "tool_call",
+                attrs={"task_type": "qa", "turn": num_turns},
+            ) as tool_span:
+                result = await env.run_action(assistant_text)
+                tool_actions = {
+                    name: int(env.stats.get(name, 0)) - int(tool_stats_before.get(name, 0))
+                    for name in ("search", "open_page")
+                }
+                tool_actions = {name: count for name, count in tool_actions.items() if count > 0}
+                tool_span.update(
+                    {
+                        "action": result.get("action", ",".join(tool_actions) or "invalid"),
+                        "tool_calls": sum(tool_actions.values()),
+                        "is_tool_call": bool(tool_actions),
+                    }
+                )
             _tool_time += time.monotonic() - _tool_start
             if result.get("action") == "finish":
                 stop_reason = "finish"

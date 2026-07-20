@@ -60,7 +60,7 @@ echo "=== Running hybrid async benchmark: mode=${MODE} ==="
 CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /workspace/Qwen3-8B-browsecomp-sft/iter1699_torch_dist
+   --ref-load /workspace/Qwen3-8B_torch_dist
    # --load /root/Qwen3-4B_slime/
 #    --save /workspace/Qwen3-4B_sync_hybrid0.5/
 #    --save-interval 100s
@@ -97,7 +97,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-sft-iter1699.pt
+   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/model-name-browsecomp.pt
 )
 
 
@@ -133,7 +133,7 @@ EVAL_ARGS=(
    # --eval-dataset-override browsecomp.wandb_prefix=eval3
    # --eval-dataset-override browsecomp.task_type=qa
    # Per-dataset overrides (Dataset 7: BrowseComp / factual QA with browsing)
-   --eval-dataset-override browsecomp.n_samples_per_eval_prompt=16
+   --eval-dataset-override browsecomp.n_samples_per_eval_prompt=64
    --eval-dataset-override browsecomp.max_response_len=${EVAL_BROWSECOMP_MAX_RESPONSE_LEN}
    --eval-dataset-override browsecomp.input_key=prompt
    --eval-dataset-override browsecomp.label_key=label

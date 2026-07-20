@@ -63,7 +63,7 @@ MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-20480}
 MIXED_RETOOL_MAX_RESPONSE_LEN=${MIXED_RETOOL_MAX_RESPONSE_LEN:-8192}
 MIXED_BROWSECOMP_MAX_RESPONSE_LEN=${MIXED_BROWSECOMP_MAX_RESPONSE_LEN:-36864}
 BROWSECOMP_MAX_SEQ_LEN=${BROWSECOMP_MAX_SEQ_LEN:-${MIXED_BROWSECOMP_MAX_RESPONSE_LEN}}
-SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/}
+SAVE_PATH=${SAVE_PATH:-/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-qafirst/}
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 ACTOR_GPUS_PER_NODE=${ACTOR_GPUS_PER_NODE:-8}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-8}
@@ -86,6 +86,22 @@ WANDB_ARGS=(
 )
 if [ -n "${WANDB_KEY:-}" ]; then
    WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
+fi
+
+# Optional local-first monitoring. Disabled by default and independent of
+# --dump-details so long runs do not write per-step tensor dumps.
+ENABLE_SLIME_DASHBOARD=${ENABLE_SLIME_DASHBOARD:-0}
+SLIME_DASHBOARD_DIR=${SLIME_DASHBOARD_DIR:-${SAVE_PATH%/}/dashboard}
+DASHBOARD_ARGS=()
+if [ "${ENABLE_SLIME_DASHBOARD}" = "1" ]; then
+   DASHBOARD_ARGS+=(
+      --use-slime-dashboard
+      --slime-dashboard-dir "${SLIME_DASHBOARD_DIR}"
+      --slime-dashboard-gpu-sample-interval "${SLIME_DASHBOARD_GPU_SAMPLE_INTERVAL:-1}"
+      --slime-dashboard-sglang-scrape-interval "${SLIME_DASHBOARD_SGLANG_SCRAPE_INTERVAL:-2}"
+      --slime-dashboard-flush-interval "${SLIME_DASHBOARD_FLUSH_INTERVAL:-5}"
+   )
+   echo "Slime dashboard telemetry: ${SLIME_DASHBOARD_DIR}"
 fi
 
 PROMPT_SET=/workspace/data/dapo-math-17k/dapo-math-17k.jsonl
@@ -299,6 +315,7 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${WANDB_ARGS[@]} \
+   ${DASHBOARD_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \

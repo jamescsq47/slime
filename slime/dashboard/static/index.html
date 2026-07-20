@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Slime Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Slime Dashboard</h1>
+        <p id="runMeta">Waiting for telemetry</p>
+      </div>
+      <div class="controls">
+        <label>Window
+          <select id="windowMinutes">
+            <option value="10">10 min</option>
+            <option value="30" selected>30 min</option>
+            <option value="60">1 hour</option>
+            <option value="240">4 hours</option>
+          </select>
+        </label>
+        <button id="refresh" type="button">Refresh</button>
+        <span id="updated">not loaded</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="summary" id="summary"></section>
+      <section>
+        <div class="section-title">
+          <h2>GPU utilization</h2>
+          <span>NVML physical-device samples by node and GPU</span>
+        </div>
+        <canvas id="gpuChart" height="280" data-height="280"></canvas>
+        <div class="legend" id="gpuLegend"></div>
+      </section>
+      <section>
+        <div class="section-title">
+          <h2>SGLang requests</h2>
+          <span>sum across router workers for each scrape</span>
+        </div>
+        <canvas id="requestChart" height="240" data-height="240"></canvas>
+        <div class="legend" id="requestLegend"></div>
+      </section>
+      <section>
+        <div class="section-title">
+          <h2>Generation and tool turns</h2>
+          <span>per-sample spans emitted by mixed rollout generators</span>
+        </div>
+        <div class="trace-grid" id="traceSummary"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>time</th><th>sample</th><th>task</th><th>turn</th><th>span</th><th>duration</th><th>detail</th></tr></thead>
+            <tbody id="traceRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

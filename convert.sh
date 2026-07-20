@@ -12,7 +12,7 @@ SLIME_ROOT="/workspace/slime"           # slime repo root (where tools/ lives)
 
 # ── Model paths to convert (edit this list) ──────────────────────────────────
 MODEL_DIRS=(
-    "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4"
+    "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-trial2"
     # "/workspace/Qwen3-8B_hybrid_mask256_512_dynamic"
 )
 # ─────────────────────────────────────────────────────────────────────────────

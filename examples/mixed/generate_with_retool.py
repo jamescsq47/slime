@@ -12,6 +12,7 @@ try:
 except ImportError as e:
     raise ImportError("Jinja2 is required. Please install it with: pip install jinja2") from e
 
+from slime.dashboard.api import span as dashboard_span
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
@@ -618,7 +619,25 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         except ImportError:
             pass  # wandb not available
 
-        output = await post(url, payload)
+        with dashboard_span(
+            args,
+            sample,
+            "generation_turn",
+            attrs={
+                "task_type": "math",
+                "turn": turn + 1,
+                "max_new_tokens": per_turn_sampling_params["max_new_tokens"],
+            },
+        ) as generation_span:
+            output = await post(url, payload)
+            meta_info = output.get("meta_info", {})
+            finish_reason = meta_info.get("finish_reason", {})
+            generation_span.update(
+                {
+                    "finish_reason": finish_reason.get("type", "unknown"),
+                    "completion_tokens": meta_info.get("completion_tokens"),
+                }
+            )
 
         # Handle abort
         if output["meta_info"]["finish_reason"]["type"] == "abort":
@@ -660,7 +679,22 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                         loss_masks += [1] * len(cur_response_token_ids)
 
                     _tool_start = time.monotonic()
-                    next_obs, done = await execute_predictions(cur_response)
+                    with dashboard_span(
+                        args,
+                        sample,
+                        "tool_call",
+                        attrs={"task_type": "math", "turn": turn + 1},
+                    ) as tool_span:
+                        next_obs, done = await execute_predictions(cur_response)
+                        is_tool_call = "<interpreter>" in (next_obs or "")
+                        tool_span.update(
+                            {
+                                "done": done,
+                                "observation_chars": len(next_obs or ""),
+                                "tool_calls": int(is_tool_call),
+                                "is_tool_call": is_tool_call,
+                            }
+                        )
                     if next_obs:
                         if "<interpreter>" in next_obs:
                             tool_call_count += 1
@@ -750,7 +784,22 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
 
         _tool_start = time.monotonic()
-        next_obs, done = await execute_predictions(cur_response)
+        with dashboard_span(
+            args,
+            sample,
+            "tool_call",
+            attrs={"task_type": "math", "turn": turn + 1},
+        ) as tool_span:
+            next_obs, done = await execute_predictions(cur_response)
+            is_tool_call = "<interpreter>" in (next_obs or "")
+            tool_span.update(
+                {
+                    "done": done,
+                    "observation_chars": len(next_obs or ""),
+                    "tool_calls": int(is_tool_call),
+                    "is_tool_call": is_tool_call,
+                }
+            )
         if done:
             break
 

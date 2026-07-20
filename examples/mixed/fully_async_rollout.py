@@ -8,6 +8,8 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from slime.dashboard.api import event as dashboard_event
+from slime.dashboard.api import metrics as dashboard_metrics
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.sglang_rollout import GenerateState, abort, eval_rollout, generate_and_rm_group
 from slime.utils.async_utils import run
@@ -343,6 +345,19 @@ class AsyncRolloutWorker:
                     "queue/output_queue_size": queue_size,
                     "queue/queue_utilization": queue_size / max(1, self.max_completed_samples)
                 })
+                dashboard_metrics(
+                    self.args,
+                    {
+                        "fully_async/live/completed_store_size": queue_size,
+                        "fully_async/live/inflight_groups": len(self.state.pendings),
+                        "fully_async/live/inflight_requests_upper_bound": (
+                            len(self.state.pendings) * self.args.n_samples_per_prompt
+                        ),
+                        "fully_async/live/stale_samples": self.get_stale_sample_count(),
+                    },
+                    step=getattr(self.args, "current_rollout_id", -1),
+                    step_key="rollout/step",
+                )
                 time.sleep(5)  
             except Exception as e:
                 print(f"Error monitoring queue: {e}")
@@ -415,6 +430,17 @@ class AsyncRolloutWorker:
                 self.evicted_by_version += len(records)
             for record in records:
                 self._drop_sample_tracking_locked(record.sample_id)
+                dashboard_event(
+                    self.args,
+                    record.group,
+                    "fully_async_evicted",
+                    attrs={
+                        "reason": "version_window" if version_eviction else "completed_store_overflow",
+                        "sample_id": record.sample_id,
+                        "generated_policy_version": record.policy_version,
+                        "current_policy_version": self.policy_version,
+                    },
+                )
 
     def _evict_records_outside_window_locked(self, current_policy_version: int | None = None) -> int:
         if not self._uses_window_evict_policy():
@@ -470,8 +496,24 @@ class AsyncRolloutWorker:
             if not self._uses_window_evict_policy() and len(self.completed_records) >= self.max_completed_samples:
                 with self.control_lock:
                     self.dropped_samples += 1
+                dashboard_event(
+                    self.args,
+                    group,
+                    "fully_async_dropped",
+                    attrs={"reason": "completed_store_full", "sample_id": sample_id},
+                )
                 raise queue.Full
             self.completed_records.append(record)
+            dashboard_event(
+                self.args,
+                group,
+                "fully_async_buffer_enter",
+                attrs={
+                    "sample_id": sample_id,
+                    "generated_policy_version": record.policy_version,
+                    "current_policy_version": self.policy_version,
+                },
+            )
             if self._uses_window_evict_policy():
                 self._evict_records_outside_window_locked(self.policy_version)
                 self._trim_completed_records_locked()
@@ -564,7 +606,19 @@ class AsyncRolloutWorker:
         if sample_id is None:
             sample_id = _extract_sample_id(group)
         self._discard_recycled_sample_id(sample_id)
-        self._enqueue_sample(sample_id, group)
+        dashboard_event(
+            self.args,
+            group,
+            "fully_async_generation_complete",
+            attrs={"sample_id": sample_id, "current_policy_version": self.policy_version},
+        )
+        if not self._enqueue_sample(sample_id, group):
+            dashboard_event(
+                self.args,
+                group,
+                "fully_async_dropped",
+                attrs={"reason": "output_queue_full", "sample_id": sample_id},
+            )
         return True
 
     def _annotate_sample(self, sample_id: int | None, group: list[Sample]):
@@ -816,6 +870,19 @@ class AsyncRolloutWorker:
                         self.sample_id_counter -= 1
                     self._add_stale_sample_id(sample_id)
                     self._annotate_sample(sample_id, group)
+                    dashboard_event(
+                        self.args,
+                        group,
+                        "fully_async_dispatch",
+                        attrs={
+                            "sample_id": sample_id,
+                            "policy_version": self.policy_version,
+                            "rollout_id": getattr(self.args, "current_rollout_id", -1),
+                            "task_type": (
+                                group[0].metadata.get("task_type", "unknown") if group else "unknown"
+                            ),
+                        },
+                    )
 
                     task = asyncio.create_task(
                         generate_and_rm_group(
@@ -955,6 +1022,17 @@ class AsyncRolloutWorker:
             else:
                 selected_records = self.completed_records[:limit]
                 del self.completed_records[:limit]
+        for record in selected_records:
+            dashboard_event(
+                self.args,
+                record.group,
+                "fully_async_selected",
+                attrs={
+                    "sample_id": record.sample_id,
+                    "generated_policy_version": record.policy_version,
+                    "current_policy_version": current_policy_version,
+                },
+            )
         return [(record.sample_id, record.group) for record in selected_records]
 
     def get_completed_groups(self) -> list[tuple[int | None, list[Sample]]]:
@@ -1036,12 +1114,24 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutF
                 if getattr(args, "partial_rollout", False):
                     try:
                         data_buffer.add_samples([group])
+                        dashboard_event(
+                            args,
+                            group,
+                            "fully_async_recycled",
+                            attrs={"reason": "aborted_partial", "sample_id": sample_id},
+                        )
                         worker._mark_sample_recycled(sample_id)
                         print(f"Returned aborted sample {sample_id} to data buffer", flush=True)
                     except Exception as exc:
                         print(f"Failed to return aborted sample {sample_id} to buffer: {exc}", flush=True)
                     continue
                 else:
+                    dashboard_event(
+                        args,
+                        group,
+                        "fully_async_dropped",
+                        attrs={"reason": "aborted_without_partial", "sample_id": sample_id},
+                    )
                     worker._mark_sample_consumed(sample_id)
                     print(f"Dropped aborted sample {sample_id} directly because partial_rollout is False", flush=True)
                     continue
@@ -1055,6 +1145,16 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutF
                 do_print = False
 
             data.append(group)
+            dashboard_event(
+                args,
+                group,
+                "fully_async_train_consume",
+                attrs={
+                    "sample_id": sample_id,
+                    "rollout_id": rollout_id,
+                    "current_policy_version": worker.policy_version,
+                },
+            )
             worker._mark_sample_consumed(sample_id)
             processed_any = True
 

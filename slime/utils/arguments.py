@@ -1277,6 +1277,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--wandb-run-id", type=str, default=None)
             return parser
 
+        def add_dashboard_arguments(parser):
+            group = parser.add_argument_group("slime dashboard")
+            group.add_argument(
+                "--use-slime-dashboard",
+                action="store_true",
+                default=False,
+                help="Collect failure-isolated GPU, SGLang request, and rollout lifecycle telemetry.",
+            )
+            group.add_argument(
+                "--slime-dashboard-dir",
+                type=str,
+                default=None,
+                help="Shared directory for append-only dashboard telemetry. Defaults to <save>/dashboard.",
+            )
+            group.add_argument("--slime-dashboard-flush-interval", type=float, default=5.0)
+            group.add_argument("--slime-dashboard-gpu-sample-interval", type=float, default=1.0)
+            group.add_argument("--slime-dashboard-sglang-scrape-interval", type=float, default=2.0)
+            group.add_argument("--slime-dashboard-max-buffered-records", type=int, default=500_000)
+            return parser
+
         # tensorboard
         def add_tensorboard_arguments(parser):
             # tb_project_name, tb_experiment_name
@@ -1572,6 +1592,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_algo_arguments(parser)
         parser = add_on_policy_distillation_arguments(parser)
         parser = add_wandb_arguments(parser)
+        parser = add_dashboard_arguments(parser)
         parser = add_tensorboard_arguments(parser)
         parser = add_router_arguments(parser)
         parser = add_debug_arguments(parser)
@@ -1728,6 +1749,21 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    if args.use_slime_dashboard:
+        if args.slime_dashboard_dir is None:
+            if not args.save:
+                raise ValueError("--use-slime-dashboard requires --slime-dashboard-dir or --save")
+            args.slime_dashboard_dir = os.path.join(args.save, "dashboard")
+        for name in (
+            "slime_dashboard_flush_interval",
+            "slime_dashboard_gpu_sample_interval",
+            "slime_dashboard_sglang_scrape_interval",
+        ):
+            if getattr(args, name) <= 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be positive")
+        if args.slime_dashboard_max_buffered_records <= 0:
+            raise ValueError("--slime-dashboard-max-buffered-records must be positive")
 
     if args.use_slime_router:
         logger.warning(

@@ -41,6 +41,17 @@ _TRACE_HANDLE_STACK: contextvars.ContextVar[tuple[tuple[TraceHandle, ...], ...]]
     default=(),
 )
 _TRACE_AUTO_INFER_WARNED: set[str] = set()
+_TRACE_EVENT_SINKS: list[Callable[[dict[str, Any]], None]] = []
+
+
+def add_trace_event_sink(sink: Callable[[dict[str, Any]], None]) -> None:
+    if sink not in _TRACE_EVENT_SINKS:
+        _TRACE_EVENT_SINKS.append(sink)
+
+
+def remove_trace_event_sink(sink: Callable[[dict[str, Any]], None]) -> None:
+    if sink in _TRACE_EVENT_SINKS:
+        _TRACE_EVENT_SINKS.remove(sink)
 
 
 @dataclass
@@ -452,6 +463,11 @@ def _append_event(
     if attrs:
         event["attrs"] = dict(attrs)
     handle.carrier["events"].append(event)
+    for sink in tuple(_TRACE_EVENT_SINKS):
+        try:
+            sink(event)
+        except Exception as exc:
+            _log_trace_error(f"event_sink:{name}", exc)
     return event
 
 

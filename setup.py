@@ -35,8 +35,9 @@ setup(
     version="0.2.4",
     packages=find_packages(include=["slime*", "slime_plugins*"]),
     include_package_data=True,
+    package_data={"slime.dashboard": ["static/*"]},
     install_requires=_fetch_requirements("requirements.txt"),
-    extras_require={},
+    extras_require={"dashboard": ["fastapi", "uvicorn", "prometheus_client", "nvidia-ml-py"]},
     python_requires=">=3.10",
     classifiers=[
         "Programming Language :: Python :: 3.10",

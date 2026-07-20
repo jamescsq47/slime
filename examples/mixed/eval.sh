@@ -60,7 +60,7 @@ echo "=== Running hybrid async benchmark: mode=${MODE} ==="
 CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/iter199_torch_dist
+   --ref-load /workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-trial2/iter199_torch_dist
    # --load /root/Qwen3-4B_slime/
 #    --save /workspace/Qwen3-4B_sync_hybrid0.5/
 #    --save-interval 100s
@@ -97,29 +97,29 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   # --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-iter199.pt
+   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-trial2-iter199.pt
 )
 
 
 EVAL_ARGS=(
    --eval-interval 10
    # All name/path pairs go under a single --eval-prompt-data (uses nargs='+')
-   # --eval-prompt-data gsm8k /workspace/data/gsm8k/test.parquet \
-   #                    aime25 /workspace/data/aime25/test.jsonl \
-   #                    aime2024 /workspace/data/aime-2024/aime-2024.jsonl \
-   #                    browsecomp /workspace/data/browsecomp/bc_test.jsonl
+   --eval-prompt-data gsm8k /workspace/data/gsm8k/test.parquet \
+                      aime25 /workspace/data/aime25/test.jsonl \
+                      aime2024 /workspace/data/aime-2024/aime-2024.jsonl \
+                      browsecomp /workspace/data/browsecomp/bc_test.jsonl
                       # dapo_math_17k /workspace/data/dapo-math-17k/dapo-math-17k.jsonl 
    # --eval-prompt-data gsm8k /workspace/data/gsm8k/test.parquet \
    #                    browsecomp /workspace/data/browsecomp/bc_test.jsonl
-   --eval-prompt-data browsecomp /workspace/data/browsecomp/bc_test.jsonl
+   # --eval-prompt-data browsecomp /workspace/data/browsecomp/bc_test.jsonl
    # Per-dataset overrides (Dataset 1: gsm8k / competition math)
-   # --eval-dataset-override gsm8k.n_samples_per_eval_prompt=1
-   # --eval-dataset-override gsm8k.max_response_len=8192
-   # --eval-dataset-override gsm8k.label_key=reward_model
-   # --eval-dataset-override gsm8k.task_type=math
-   # --eval-dataset-override gsm8k.eval_reward_key=acc
-   # --eval-dataset-override gsm8k.label_sub_key=ground_truth
-   # --eval-dataset-override gsm8k.wandb_prefix=eval1
+   --eval-dataset-override gsm8k.n_samples_per_eval_prompt=1
+   --eval-dataset-override gsm8k.max_response_len=8192
+   --eval-dataset-override gsm8k.label_key=reward_model
+   --eval-dataset-override gsm8k.task_type=math
+   --eval-dataset-override gsm8k.eval_reward_key=acc
+   --eval-dataset-override gsm8k.label_sub_key=ground_truth
+   --eval-dataset-override gsm8k.wandb_prefix=eval1
    # Per-dataset overrides (Dataset 2: nq_test / search QA)
    # --eval-dataset-override nq_test.n_samples_per_eval_prompt=1
    # --eval-dataset-override nq_test.input_key=prompt
@@ -142,20 +142,20 @@ EVAL_ARGS=(
    --eval-dataset-override browsecomp.eval_reward_key=score
    --eval-dataset-override browsecomp.wandb_prefix=eval7
    # # Per-dataset overrides (Dataset 4: aime / math)
-   # --eval-dataset-override aime25.n_samples_per_eval_prompt=32
-   # --eval-dataset-override aime25.max_response_len=32768
-   # --eval-dataset-override aime25.input_key=problem
-   # --eval-dataset-override aime25.label_key=answer
-   # --eval-dataset-override aime25.task_type=math
-   # --eval-dataset-override aime25.eval_reward_key=acc
-   # --eval-dataset-override aime25.wandb_prefix=eval4
-   # # Per-dataset overrides (Dataset 5: aime2024 / math)
-   # --eval-dataset-override aime2024.n_samples_per_eval_prompt=32
-   # --eval-dataset-override aime2024.max_response_len=32768
-   # --eval-dataset-override aime2024.label_key=label
-   # --eval-dataset-override aime2024.task_type=math
-   # --eval-dataset-override aime2024.eval_reward_key=acc
-   # --eval-dataset-override aime2024.wandb_prefix=eval5
+   --eval-dataset-override aime25.n_samples_per_eval_prompt=32
+   --eval-dataset-override aime25.max_response_len=32768
+   --eval-dataset-override aime25.input_key=problem
+   --eval-dataset-override aime25.label_key=answer
+   --eval-dataset-override aime25.task_type=math
+   --eval-dataset-override aime25.eval_reward_key=acc
+   --eval-dataset-override aime25.wandb_prefix=eval4
+   # Per-dataset overrides (Dataset 5: aime2024 / math)
+   --eval-dataset-override aime2024.n_samples_per_eval_prompt=32
+   --eval-dataset-override aime2024.max_response_len=32768
+   --eval-dataset-override aime2024.label_key=label
+   --eval-dataset-override aime2024.task_type=math
+   --eval-dataset-override aime2024.eval_reward_key=acc
+   --eval-dataset-override aime2024.wandb_prefix=eval5
    # Per-dataset overrides (Dataset 6: dapo_math_17k / math)
    # --eval-dataset-override dapo_math_17k.n_samples_per_eval_prompt=1
    # --eval-dataset-override dapo_math_17k.max_response_len=8192

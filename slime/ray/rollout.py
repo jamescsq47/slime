@@ -382,6 +382,10 @@ class RolloutManager:
             self.servers = start_rollout_servers(args, pg)
 
         init_tracking(args, primary=False)
+        if getattr(self.args, "use_slime_dashboard", False):
+            from slime.dashboard.backend import register_rollout_manager
+
+            register_rollout_manager(self.args, self._get_metrics_router_addr())
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
         self._fully_async_log_step = 0
