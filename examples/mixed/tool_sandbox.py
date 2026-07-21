@@ -11,7 +11,7 @@ import asyncio
 import gc
 import os
 import re
-import subprocess
+import resource
 import tempfile
 from contextlib import contextmanager
 from typing import Any
@@ -22,11 +22,24 @@ import asyncio
 import random
 from functools import wraps
 
+
+def _raise_nofile_soft_limit(target: int = 65536) -> None:
+    """Give concurrent sandbox subprocess pipes enough file descriptors."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+
+
+_raise_nofile_soft_limit()
+
 # Configuration for tool execution
 TOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 16,
-    "tool_concurrency": 1024,  # Aggressive: 32 concurrent processes
+    # Async subprocesses no longer serialize the rollout event loop. Keep a
+    # real process cap so bursts cannot exhaust the Ray worker's file handles.
+    "tool_concurrency": max(1, int(os.getenv("MIXED_TOOL_CONCURRENCY", "256"))),
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
     "python_memory_limit": "4GB",  # 4GB per Python process
@@ -42,6 +55,25 @@ TOOL_CONFIGS = {
 
 # Global semaphore for controlling concurrent tool executions
 SEMAPHORE = asyncio.Semaphore(TOOL_CONFIGS["tool_concurrency"])
+
+
+async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+    """Stop a sandbox child and consume its exit status and pipe transports."""
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            # The child exited between the returncode check and kill().
+            pass
+    try:
+        await process.communicate()
+    except (AssertionError, ProcessLookupError, RuntimeError):
+        # communicate() may already have been cancelled by wait_for(). The
+        # process still needs to be reaped even if its pipes cannot be reused.
+        try:
+            await process.wait()
+        except (ProcessLookupError, RuntimeError):
+            pass
 
 
 def truncate_tool_output(text: str) -> str:
@@ -320,32 +352,47 @@ except Exception as e:
             with open(script_path, "w") as f:
                 f.write(wrapped_code)
 
+            process = None
             try:
-                # Use subprocess to run code
-                process = subprocess.Popen(
-                    ["python3", script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                # This function runs on the rollout asyncio event loop. A synchronous
+                # Popen.communicate(timeout=...) blocks every other rollout while one
+                # code-interpreter process is running, so use asyncio subprocess I/O.
+                process = await asyncio.create_subprocess_exec(
+                    "python3",
+                    script_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     env=env,
                     cwd=temp_dir,
-                    text=True,
                 )
 
-                # Set timeout
                 try:
-                    stdout, stderr = process.communicate(timeout=self.timeout)
-
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=self.timeout,
+                    )
+                except asyncio.TimeoutError:
+                    await _kill_and_reap(process)
+                    result = f"Error: Code execution timed out after {self.timeout} seconds"
+                except asyncio.CancelledError:
+                    # Rollout shutdown or explicit task cancellation must not
+                    # leave sandbox subprocesses running or turn them into zombies.
+                    await _kill_and_reap(process)
+                    raise
+                else:
+                    stdout = stdout_bytes.decode("utf-8", errors="replace")
+                    stderr = stderr_bytes.decode("utf-8", errors="replace")
                     if process.returncode == 0:
                         result = stdout.strip()
                     else:
                         result = f"Error: Process exited with code {process.returncode}\n{stderr}"
 
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    result = f"Error: Code execution timed out after {self.timeout} seconds"
-
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                result = f"Error: Failed to execute code: {str(e)}"
+                if process is not None and process.returncode is None:
+                    await _kill_and_reap(process)
+                result = f"Error: Failed to execute code: {type(e).__name__}: {e!r}"
 
             result = truncate_tool_output(result)
 

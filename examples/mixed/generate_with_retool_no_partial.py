@@ -18,7 +18,7 @@ except ImportError as e:
     raise ImportError("MathDapo is not installed") from e
 
 # Import tool sandbox functionality
-from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
+from tool_sandbox import TOOL_CONFIGS, tool_registry
 
 # Jinja2 template for tool-enabled conversations
 TOOL_TEMPLATE = """<|im_start|>system
@@ -189,8 +189,7 @@ async def execute_predictions(prediction: str) -> str:
         # postprocess_predictions)
         code = content.strip()
         if code:
-            async with SEMAPHORE:
-                result = await tool_registry.execute_tool("code_interpreter", {"code": code})
+            result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
             done = False
         else:

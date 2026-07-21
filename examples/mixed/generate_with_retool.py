@@ -12,6 +12,7 @@ try:
 except ImportError as e:
     raise ImportError("Jinja2 is required. Please install it with: pip install jinja2") from e
 
+from attempt_tracking import AttemptTracker
 from slime.dashboard.api import span as dashboard_span
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
@@ -24,7 +25,7 @@ except ImportError as e:
     raise ImportError("MathDapo is not installed") from e
 
 # Import tool sandbox functionality
-from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
+from tool_sandbox import TOOL_CONFIGS, tool_registry
 
 TOOL_DELAY_REMAINING_KEY = "pending_tool_delay_remaining"
 
@@ -45,7 +46,13 @@ def _sample_tool_delay(args) -> float:
     return random.lognormvariate(mu, math.sqrt(sigma2))
 
 
-async def _sleep_after_tool_delay(args, state: GenerateState, sample: Sample) -> bool:
+async def _sleep_after_tool_delay(
+    args,
+    state: GenerateState,
+    sample: Sample,
+    *,
+    abort_epoch: int | None = None,
+) -> bool:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     if not getattr(args, "enable_tool_delay", False) and metadata.get(TOOL_DELAY_REMAINING_KEY) is None:
         return True
@@ -58,7 +65,9 @@ async def _sleep_after_tool_delay(args, state: GenerateState, sample: Sample) ->
     check_interval = max(0.01, float(getattr(args, "tool_delay_check_interval", 0.5)))
 
     while remaining > 0:
-        if state.aborted:
+        if state.aborted or (
+            abort_epoch is not None and int(getattr(state, "abort_epoch", 0)) != abort_epoch
+        ):
             metadata[TOOL_DELAY_REMAINING_KEY] = remaining
             return False
 
@@ -410,8 +419,7 @@ async def execute_predictions(prediction: str) -> str:
         # postprocess_predictions)
         code = content.strip()
         if code:
-            async with SEMAPHORE:
-                result = await tool_registry.execute_tool("code_interpreter", {"code": code})
+            result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
             done = False
         else:
@@ -435,6 +443,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls with partial rollout support"""
 
     state = GenerateState(args)
+    attempt_abort_epoch = int(getattr(state, "abort_epoch", 0))
+
+    def _crossed_weight_update_boundary() -> bool:
+        return int(getattr(state, "abort_epoch", 0)) != attempt_abort_epoch
+
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Initialize total_off_policy_tokens if it doesn't exist
@@ -449,7 +462,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.metadata = {}
 
     # Check if this is a partial rollout resume
-    if args.partial_rollout and sample.status == Sample.Status.ABORTED and sample.response:
+    is_partial_resume = bool(
+        args.partial_rollout and sample.status == Sample.Status.ABORTED and sample.response
+    )
+    if is_partial_resume:
         # Partial rollout: resume from existing response
         metadata = sample.metadata
 
@@ -518,6 +534,27 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         _tool_token_count = 0
 
     _start_time = time.monotonic()
+    attempt_tracker = AttemptTracker.begin(
+        args,
+        sample,
+        is_partial_resume=is_partial_resume,
+        start_response_length=len(response_token_ids),
+        start_tool_call_count=tool_call_count,
+        start_tool_time=_tool_time,
+    )
+
+    def _record_timing(reason: str) -> None:
+        attempt_time = time.monotonic() - _start_time
+        sample.sample_time = _accrued_sample_time + attempt_time
+        attempt_tracker.finish(
+            duration=attempt_time,
+            cumulative_sample_time=sample.sample_time,
+            status=sample.status,
+            reason=reason,
+            response_length=len(response_token_ids),
+            tool_call_count=tool_call_count,
+            tool_time=_tool_time,
+        )
 
     if args.rollout_max_context_len is not None:
         max_context_length = args.rollout_max_context_len
@@ -525,7 +562,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
     max_context_length = min(max_context_length, len(prompt_tokens_ids) + _int_env("MIXED_RETOOL_MAX_RESPONSE_LEN", 8192))
 
-    def _save_partial_for_resume(current_turn: int, status=Sample.Status.ABORTED) -> Sample:
+    def _save_partial_for_resume(
+        current_turn: int,
+        status=Sample.Status.ABORTED,
+        reason: str = "state_abort",
+    ) -> Sample:
         sample.status = status
         sample.tokens = prompt_tokens_ids + response_token_ids
         sample.response_length = len(response_token_ids)
@@ -548,7 +589,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             "search_call_count": 0,
             "formatted_prompt": prompt,
         })
-        sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+        _record_timing(reason)
         sample.tool_time = _tool_time
         return sample
 
@@ -566,10 +607,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         truncated_by_context = True
 
     if sample.metadata.get(TOOL_DELAY_REMAINING_KEY) is not None:
-        if not await _sleep_after_tool_delay(args, state, sample):
-            return _save_partial_for_resume(start_turn)
+        if not await _sleep_after_tool_delay(args, state, sample, abort_epoch=attempt_abort_epoch):
+            return _save_partial_for_resume(start_turn, reason="tool_delay_abort")
 
     for turn in range(start_turn, TOOL_CONFIGS["max_turns"]):
+        if _crossed_weight_update_boundary():
+            return _save_partial_for_resume(turn, reason="weight_update_boundary")
+
         # Check if total length exceeds max context length
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
         if total_length >= max_context_length:
@@ -641,9 +685,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # Handle abort
         if output["meta_info"]["finish_reason"]["type"] == "abort":
+            # The engine may return a partial assistant action when weights are
+            # being updated. Do not start a new tool from that uncommitted
+            # action; resume generation from the previous complete turn.
+            if args.partial_rollout and _crossed_weight_update_boundary():
+                return _save_partial_for_resume(turn, reason="sglang_abort")
             if not args.partial_rollout:
                 sample.status = Sample.Status.ABORTED
-                sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+                _record_timing("sglang_abort")
                 sample.tool_time = _tool_time
                 sample.tool_token_count = _tool_token_count
                 sample.code_call_count = tool_call_count
@@ -660,7 +709,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     sample.rollout_log_probs += cur_log_probs
                 else:
                     sample.status = Sample.Status.ABORTED
-                    sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+                    _record_timing("sglang_abort_missing_logprobs")
                     sample.tool_time = _tool_time
                     sample.tool_token_count = _tool_token_count
                     sample.code_call_count = tool_call_count
@@ -721,7 +770,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                         if obs_truncated:
                             truncated_by_context = True
                         else:
-                            await _sleep_after_tool_delay(args, state, sample)
+                            await _sleep_after_tool_delay(
+                                args,
+                                state,
+                                sample,
+                                abort_epoch=attempt_abort_epoch,
+                            )
 
                 # Save state for resumption
                 sample.status = Sample.Status.TRUNCATED if truncated_by_context else Sample.Status.ABORTED
@@ -748,7 +802,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     "search_call_count": 0,
                     "formatted_prompt": prompt,
                 })
-                sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+                _record_timing("context" if truncated_by_context else "sglang_abort")
                 sample.tool_time = _tool_time
                 return sample
 
@@ -768,7 +822,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             # fully_async rollout manager returns the whole group to the
             # buffer for retry instead of poisoning the trainer.
             sample.status = Sample.Status.ABORTED
-            sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+            _record_timing("missing_logprobs")
             sample.tool_time = _tool_time
             sample.tool_token_count = _tool_token_count
             sample.code_call_count = tool_call_count
@@ -838,8 +892,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             truncated_by_context = True
             break
 
-        if not await _sleep_after_tool_delay(args, state, sample):
-            return _save_partial_for_resume(turn)
+        # A tool that was already running at the update boundary is allowed to
+        # finish. Commit its observation, then return the partial trajectory so
+        # the next dispatch performs a fresh prefill under the new weights.
+        if _crossed_weight_update_boundary():
+            return _save_partial_for_resume(turn + 1, reason="tool_completed_after_weight_update")
+
+        if not await _sleep_after_tool_delay(args, state, sample, abort_epoch=attempt_abort_epoch):
+            return _save_partial_for_resume(turn, reason="tool_delay_abort")
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             break
@@ -877,7 +937,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     else:
         sample.status = Sample.Status.TRUNCATED
 
-    sample.sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+    if truncated_by_context:
+        attempt_reason = "context"
+    elif output is not None:
+        attempt_reason = output["meta_info"]["finish_reason"]["type"]
+    else:
+        attempt_reason = "no_output"
+    _record_timing(attempt_reason)
     sample.tool_time = _tool_time
     sample.metadata.update({
         "tool_call_count": tool_call_count,

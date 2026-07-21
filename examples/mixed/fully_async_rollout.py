@@ -19,6 +19,7 @@ import wandb
 _global_worker = None
 _worker_lock = threading.Lock()
 _wandb_metric_defined = False
+FULLY_ASYNC_ABORT_DRAIN_TIMEOUT = 2.0
 
 def _sample_text_preview(sample: Sample) -> str:
     return str(sample.prompt) + str(sample.response)
@@ -267,6 +268,14 @@ class CompletedSampleRecord:
     policy_version: int | None
 
 
+@dataclass
+class DeferredGroupRecord:
+    sample_id: int | None
+    group: list[Sample]
+    policy_version: int
+    abort_epoch: int
+
+
 class _CompletedStoreAdapter:
     def __init__(self, worker: "AsyncRolloutWorker"):
         self.worker = worker
@@ -315,6 +324,10 @@ class AsyncRolloutWorker:
         self.sample_id_counter = -1
         self.task_sample_ids: dict[asyncio.Task, int | None] = {}
         self.inflight_groups: dict[asyncio.Task, list[Sample]] = {}
+        # Tasks waiting in a CPU/network tool are allowed to outlive a weight
+        # update. They are detached from GenerateState.pendings so they cannot
+        # block the update, then recycled after the tool returns.
+        self.deferred_groups: dict[asyncio.Task, DeferredGroupRecord] = {}
         self.policy_version = getattr(args, "current_policy_version", 0)
         self.stale_samples_processed = 0
         self.stale_trajectory_processed = 0
@@ -341,6 +354,8 @@ class AsyncRolloutWorker:
         while self.running:
             try:
                 queue_size = self.get_queue_size()
+                active_groups = len(self.state.pendings)
+                deferred_groups = len(self.deferred_groups)
                 wandb.log({
                     "queue/output_queue_size": queue_size,
                     "queue/queue_utilization": queue_size / max(1, self.max_completed_samples)
@@ -349,9 +364,10 @@ class AsyncRolloutWorker:
                     self.args,
                     {
                         "fully_async/live/completed_store_size": queue_size,
-                        "fully_async/live/inflight_groups": len(self.state.pendings),
+                        "fully_async/live/inflight_groups": active_groups + deferred_groups,
+                        "fully_async/live/deferred_tool_groups": deferred_groups,
                         "fully_async/live/inflight_requests_upper_bound": (
-                            len(self.state.pendings) * self.args.n_samples_per_prompt
+                            (active_groups + deferred_groups) * self.args.n_samples_per_prompt
                         ),
                         "fully_async/live/stale_samples": self.get_stale_sample_count(),
                     },
@@ -621,6 +637,76 @@ class AsyncRolloutWorker:
             )
         return True
 
+    def _defer_pending_tasks(self) -> int:
+        """Detach old-epoch tasks so tools can finish without blocking sync."""
+        deferred = 0
+        abort_epoch = int(getattr(self.state, "abort_epoch", 0))
+        for task in list(self.state.pendings):
+            sample_id = self.task_sample_ids.pop(task, None)
+            group = self.inflight_groups.pop(task, None)
+            if group is None:
+                continue
+            self.deferred_groups[task] = DeferredGroupRecord(
+                sample_id=sample_id,
+                group=group,
+                policy_version=self.policy_version,
+                abort_epoch=abort_epoch,
+            )
+            self._add_recycled_sample_ids([sample_id])
+            dashboard_event(
+                self.args,
+                group,
+                "fully_async_deferred",
+                attrs={
+                    "reason": "tool_running_at_weight_update",
+                    "sample_id": sample_id,
+                    "policy_version": self.policy_version,
+                    "abort_epoch": abort_epoch,
+                },
+            )
+            deferred += 1
+        self.state.pendings.clear()
+        return deferred
+
+    def _collect_deferred_task_result(self, task: asyncio.Task) -> bool:
+        """Recycle a group after its old-epoch tool has produced an observation."""
+        record = self.deferred_groups.pop(task, None)
+        if record is None:
+            return False
+        try:
+            group = task.result()
+        except asyncio.CancelledError:
+            return False
+        except Exception as exc:
+            # Preserve the original group rather than silently losing a
+            # dataset item. A subsequent dispatch can restart incomplete
+            # members using the last committed partial state.
+            print(f"Deferred rollout task failed with exception: {exc}", flush=True)
+            group = record.group
+            for sample in group:
+                if sample.status == Sample.Status.PENDING:
+                    sample.status = Sample.Status.ABORTED
+
+        self.data_buffer.add_samples([group])
+        dashboard_event(
+            self.args,
+            group,
+            "fully_async_recycled",
+            attrs={
+                "reason": "deferred_tool_completed",
+                "sample_id": record.sample_id,
+                "generated_policy_version": record.policy_version,
+                "current_policy_version": self.policy_version,
+                "abort_epoch": record.abort_epoch,
+            },
+        )
+        return True
+
+    async def _push_finished_deferred_tasks_to_data_buffer(self):
+        done_tasks = [task for task in self.deferred_groups if task.done()]
+        for task in done_tasks:
+            self._collect_deferred_task_result(task)
+
     def _annotate_sample(self, sample_id: int | None, group: list[Sample]):
         current_rollout_id = getattr(self.args, "current_rollout_id", -1)
         for sample in group:
@@ -753,6 +839,7 @@ class AsyncRolloutWorker:
         assert self.task_lock is not None
         async with self.task_lock:
             await self._push_finished_samples_to_output_queue()
+            await self._push_finished_deferred_tasks_to_data_buffer()
             active_samples_before = len(self.state.pendings)
 
             if active_samples_before == 0:
@@ -761,24 +848,37 @@ class AsyncRolloutWorker:
                     "policy_version": policy_version,
                     "active_samples": 0,
                     "stale_samples": stale_samples,
+                    "deferred_groups": len(self.deferred_groups),
                 }
 
             if self.args.partial_rollout:
-                aborted_groups = await abort(self.args, getattr(self.args, "current_rollout_id", -1))
+                tasks_before_abort = set(self.state.pendings)
+                aborted_groups = await abort(
+                    self.args,
+                    getattr(self.args, "current_rollout_id", -1),
+                    drain_timeout=FULLY_ASYNC_ABORT_DRAIN_TIMEOUT,
+                )
+                # abort() removes promptly finished tasks from state.pendings.
+                # Their groups are returned below; only the still-running
+                # tool groups are detached.
+                for task in tasks_before_abort - set(self.state.pendings):
+                    self.task_sample_ids.pop(task, None)
+                    self.inflight_groups.pop(task, None)
                 if aborted_groups:
                     self.data_buffer.add_samples(aborted_groups)
                     self._add_recycled_sample_ids(_extract_sample_id(group) for group in aborted_groups)
-                self.task_sample_ids.clear()
-                self.inflight_groups.clear()
+                deferred_groups = self._defer_pending_tasks()
                 self.state.reset()
             else:
                 await self._wait_for_all_active_tasks()
+                deferred_groups = 0
 
             stale_samples = len(self._current_stale_sample_ids())
             return {
                 "policy_version": policy_version,
                 "active_samples": active_samples_before,
                 "stale_samples": stale_samples,
+                "deferred_groups": deferred_groups,
             }
 
     def _evict_completed_records_outside_window(self, current_policy_version: int | None = None) -> int:
@@ -789,6 +889,7 @@ class AsyncRolloutWorker:
         assert self.task_lock is not None
         async with self.task_lock:
             await self._push_finished_samples_to_output_queue()
+            await self._push_finished_deferred_tasks_to_data_buffer()
             with self.control_lock:
                 self.policy_version = policy_version
                 self.state.aborted = False
@@ -808,6 +909,7 @@ class AsyncRolloutWorker:
     async def run_eval(self, args, rollout_id):
         async with self.task_lock:
             await self._push_finished_samples_to_output_queue()
+            await self._push_finished_deferred_tasks_to_data_buffer()
             await self._wait_for_all_active_tasks()
         # Temporarily reduce semaphore to prevent OOM during eval.
         # eval_rollout creates per-sample tasks (prompt × n_samples_per_eval_prompt)
@@ -830,11 +932,21 @@ class AsyncRolloutWorker:
             await self._push_finished_samples_to_output_queue()
             if self.state.pendings:
                 try:
-                    await abort(self.args, getattr(self.args, "current_rollout_id", -1))
+                    await abort(
+                        self.args,
+                        getattr(self.args, "current_rollout_id", -1),
+                        drain_timeout=FULLY_ASYNC_ABORT_DRAIN_TIMEOUT,
+                    )
                 except Exception as exc:
                     print(f"Failed to abort pending rollout tasks during shutdown: {exc}")
+            tasks_to_cancel = list(self.state.pendings) + list(self.deferred_groups)
+            for task in tasks_to_cancel:
+                task.cancel()
+            if tasks_to_cancel:
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
             self.task_sample_ids.clear()
             self.inflight_groups.clear()
+            self.deferred_groups.clear()
             self.state.reset()
 
     async def continuous_worker_loop(self):
@@ -847,13 +959,14 @@ class AsyncRolloutWorker:
             try:
                 async with self.task_lock:
                     await self._push_finished_samples_to_output_queue()
+                    await self._push_finished_deferred_tasks_to_data_buffer()
 
                 if self._is_pause_requested() or self._should_pause_for_staleness():
                     await asyncio.sleep(0.05)
                     continue
 
                 while (
-                    len(self.state.pendings) < self.max_concurrent_tasks
+                    len(self.state.pendings) + len(self.deferred_groups) < self.max_concurrent_tasks
                     and self.running
                     and not self._is_pause_requested()
                     and not self._should_pause_for_staleness()
@@ -910,7 +1023,10 @@ class AsyncRolloutWorker:
         print("Continuous async rollout worker stopped")
 
     def worker_thread_func(self):
-        loop = asyncio.SelectorEventLoop()
+        # Respect Ray's event-loop policy (uvloop in production).  A manually
+        # constructed SelectorEventLoop cannot launch subprocesses under that
+        # policy because uvloop does not provide an asyncio child watcher.
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self.continuous_worker_loop())
@@ -1249,11 +1365,53 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutF
             math_sample_times = [s.sample_time for s in math_samples if hasattr(s, 'sample_time')]
             math_sample_time_max = max(math_sample_times) if math_sample_times else 0
             math_sample_time_avg = sum(math_sample_times) / len(math_sample_times) if math_sample_times else 0
+            math_attempt_times = [s.attempt_time for s in math_samples if hasattr(s, "attempt_time")]
+            math_attempt_counts = [s.attempt_count for s in math_samples if hasattr(s, "attempt_count")]
             
             # Calculate qa task sample_time stats
             qa_sample_times = [s.sample_time for s in qa_samples if hasattr(s, 'sample_time')]
             qa_sample_time_max = max(qa_sample_times) if qa_sample_times else 0
             qa_sample_time_avg = sum(qa_sample_times) / len(qa_sample_times) if qa_sample_times else 0
+            qa_attempt_times = [s.attempt_time for s in qa_samples if hasattr(s, "attempt_time")]
+            qa_attempt_counts = [s.attempt_count for s in qa_samples if hasattr(s, "attempt_count")]
+
+            def _scheduling_attempt_metrics(samples, domain):
+                partial_counts = [int(getattr(s, "partial_resume_count", 0) or 0) for s in samples]
+                restart_counts = [int(getattr(s, "restart_count", 0) or 0) for s in samples]
+                lifetime_times = [float(getattr(s, "lifetime_attempt_time", 0.0) or 0.0) for s in samples]
+                sample_times = [float(getattr(s, "sample_time", 0.0) or 0.0) for s in samples]
+                discarded_times = [
+                    max(0.0, lifetime - sample_time)
+                    for lifetime, sample_time in zip(lifetime_times, sample_times, strict=False)
+                ]
+                histories = [
+                    entry
+                    for sample in samples
+                    for entry in (
+                        sample.metadata.get("attempt_history", [])
+                        if isinstance(getattr(sample, "metadata", None), dict)
+                        else []
+                    )
+                    if isinstance(entry, dict)
+                ]
+                partial_attempt_times = [
+                    float(entry.get("duration", 0.0) or 0.0)
+                    for entry in histories
+                    if entry.get("status") == "aborted"
+                ]
+                sample_count = len(samples)
+                return {
+                    f"tool/{domain}_partial_resume_count_avg": sum(partial_counts) / sample_count if sample_count else 0,
+                    f"tool/{domain}_partial_resume_count_max": max(partial_counts) if partial_counts else 0,
+                    f"tool/{domain}_restart_count_avg": sum(restart_counts) / sample_count if sample_count else 0,
+                    f"tool/{domain}_partial_sample_ratio": sum(count > 0 for count in partial_counts) / sample_count if sample_count else 0,
+                    f"tool/{domain}_discarded_attempt_time_avg": sum(discarded_times) / sample_count if sample_count else 0,
+                    f"tool/{domain}_partial_attempt_time_avg": sum(partial_attempt_times) / len(partial_attempt_times) if partial_attempt_times else 0,
+                    f"tool/{domain}_partial_attempt_time_max": max(partial_attempt_times) if partial_attempt_times else 0,
+                }
+
+            math_scheduling_attempt_metrics = _scheduling_attempt_metrics(math_samples, "math")
+            qa_scheduling_attempt_metrics = _scheduling_attempt_metrics(qa_samples, "qa")
             
             # Calculate math task response_length stats
             math_response_lengths = [s.response_length for s in math_samples if hasattr(s, 'response_length')]
@@ -1280,11 +1438,19 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutF
                 "tool/math_sample_time_avg": math_sample_time_avg,
                 "tool/qa_sample_time_max": qa_sample_time_max,
                 "tool/qa_sample_time_avg": qa_sample_time_avg,
+                "tool/math_attempt_time_max": max(math_attempt_times) if math_attempt_times else 0,
+                "tool/math_attempt_time_avg": sum(math_attempt_times) / len(math_attempt_times) if math_attempt_times else 0,
+                "tool/qa_attempt_time_max": max(qa_attempt_times) if qa_attempt_times else 0,
+                "tool/qa_attempt_time_avg": sum(qa_attempt_times) / len(qa_attempt_times) if qa_attempt_times else 0,
+                "tool/math_attempt_count_avg": sum(math_attempt_counts) / len(math_attempt_counts) if math_attempt_counts else 0,
+                "tool/qa_attempt_count_avg": sum(qa_attempt_counts) / len(qa_attempt_counts) if qa_attempt_counts else 0,
                 "tool/math_response_length_max": math_response_length_max,
                 "tool/math_response_length_avg": math_response_length_avg,
                 "tool/qa_response_length_max": qa_response_length_max,
                 "tool/qa_response_length_avg": qa_response_length_avg,
             })
+            metrics_to_log.update(math_scheduling_attempt_metrics)
+            metrics_to_log.update(qa_scheduling_attempt_metrics)
 
         if tool_time_counts:
             avg_tool_times = sum(tool_time_counts) / len(tool_time_counts)

@@ -28,6 +28,7 @@ from typing import Any
 
 import httpx
 
+from attempt_tracking import AttemptTracker
 from browsecomp_env import BrowseCompEnv, SearchBackendError
 from slime.dashboard.api import span as dashboard_span
 from slime.rollout.sglang_rollout import GenerateState
@@ -231,6 +232,11 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
         max_seq_len = getattr(args, "sglang_context_length", None)
 
     state = GenerateState(args)
+    attempt_abort_epoch = int(getattr(state, "abort_epoch", 0))
+
+    def _crossed_weight_update_boundary() -> bool:
+        return int(getattr(state, "abort_epoch", 0)) != attempt_abort_epoch
+
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     per_turn_max_tokens = min(turn_max_new_tokens, sampling_params.get("max_new_tokens") or turn_max_new_tokens)
 
@@ -287,10 +293,29 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
         _env_state_from_metadata(env, metadata)
     stop_reason = "max_turns"
     _start_time = time.monotonic()
-    _accrued_sample_time = float(getattr(sample, "sample_time", 0.0) or metadata.get("browsecomp_sample_time", 0.0) or 0.0)
-    _tool_time = float(getattr(sample, "tool_time", 0.0) or metadata.get("browsecomp_tool_time", 0.0) or 0.0)
-    _tool_token_count = int(
-        getattr(sample, "tool_token_count", 0) or metadata.get("browsecomp_tool_token_count", 0) or 0
+    _accrued_sample_time = (
+        float(getattr(sample, "sample_time", 0.0) or metadata.get("browsecomp_sample_time", 0.0) or 0.0)
+        if is_partial_resume
+        else 0.0
+    )
+    _tool_time = (
+        float(getattr(sample, "tool_time", 0.0) or metadata.get("browsecomp_tool_time", 0.0) or 0.0)
+        if is_partial_resume
+        else 0.0
+    )
+    _tool_token_count = (
+        int(getattr(sample, "tool_token_count", 0) or metadata.get("browsecomp_tool_token_count", 0) or 0)
+        if is_partial_resume
+        else 0
+    )
+
+    attempt_tracker = AttemptTracker.begin(
+        args,
+        sample,
+        is_partial_resume=is_partial_resume,
+        start_response_length=len(response_tokens),
+        start_tool_call_count=int(env.stats.get("search", 0)) + int(env.stats.get("open_page", 0)),
+        start_tool_time=_tool_time,
     )
 
     def _finalize(status: Sample.Status, reason: str, current_turn: int) -> Sample:
@@ -300,7 +325,8 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
         open_page_calls = int(tool_stats.get("open_page", 0))
         finish_calls = int(tool_stats.get("finish", 0))
         external_tool_calls = search_calls + open_page_calls
-        sample_time = _accrued_sample_time + (time.monotonic() - _start_time)
+        attempt_time = time.monotonic() - _start_time
+        sample_time = _accrued_sample_time + attempt_time
 
         sample.status = status
         sample.response_length = len(response_tokens)
@@ -318,6 +344,15 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
         sample.code_call_count = 0
         _save_env_state(metadata, env)
         predicted_answer, explanation, confidence = env.predicted_answer or (None, None, None)
+        attempt_tracker.finish(
+            duration=attempt_time,
+            cumulative_sample_time=sample_time,
+            status=status,
+            reason=reason,
+            response_length=len(response_tokens),
+            tool_call_count=external_tool_calls,
+            tool_time=_tool_time,
+        )
         metadata.update(
             {
                 "predicted_answer": predicted_answer,
@@ -333,6 +368,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
                 "tool_call_count": external_tool_calls,
                 "tool_token_count": _tool_token_count,
                 "tool_time": _tool_time,
+                "cumulative_sample_time": sample_time,
                 "sample_time": sample_time,
                 "tool_time_ratio": _tool_time / sample_time if sample_time > 0 else 0.0,
                 "browsecomp_partial_rollout": status == Sample.Status.ABORTED,
@@ -349,6 +385,11 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
 
     try:
         for _turn in range(num_turns, max_turns):
+            if _crossed_weight_update_boundary():
+                stop_reason = "weight_update_boundary"
+                _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
+                break
+
             if not continuing_partial_assistant:
                 assistant_start_token_idx = len(response_tokens)
 
@@ -371,6 +412,14 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
                 generation_span.update(
                     {"finish_reason": finish_type, "completion_tokens": len(new_tokens)}
                 )
+
+            # Do not start a new tool from a generation that raced with a
+            # weight update. Resume that assistant turn with a fresh prefill
+            # after the update instead.
+            if _crossed_weight_update_boundary():
+                stop_reason = "sglang_abort"
+                _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
+                break
             _append_tokens(sample, response_tokens, new_tokens, new_logprobs, loss_mask_value=1)
 
             if finish_type == "abort":
@@ -433,6 +482,10 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             _append_tokens(sample, response_tokens, obs_tokens, [0.0] * len(obs_tokens), loss_mask_value=0)
             _tool_token_count += len(obs_tokens)
             continuing_partial_assistant = False
+            if _crossed_weight_update_boundary():
+                stop_reason = "tool_completed_after_weight_update"
+                _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
+                break
         else:
             _finalize(Sample.Status.COMPLETED, stop_reason, num_turns)
     except SearchBackendError:

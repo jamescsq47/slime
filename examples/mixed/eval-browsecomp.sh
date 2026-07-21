@@ -12,7 +12,7 @@ sleep 1
 rm -rf /tmp/ray_csq
 mkdir -p /tmp/ray_csq
 TEMP_DIR="/tmp/ray_csq"
-set -ex
+set -e
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
@@ -60,7 +60,7 @@ echo "=== Running hybrid async benchmark: mode=${MODE} ==="
 CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /workspace/Qwen3-8B_torch_dist
+   --ref-load "${REF_LOAD:-/workspace/Qwen3-8B_torch_dist}"
    # --load /root/Qwen3-4B_slime/
 #    --save /workspace/Qwen3-4B_sync_hybrid0.5/
 #    --save-interval 100s
@@ -70,9 +70,11 @@ CKPT_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project hybrid-qwen3-8b-eval
-   --wandb-group Qwen3-8B-browsecomp-sft
-   --wandb-key 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
+   --wandb-group "${WANDB_GROUP:-Qwen3-8B-browsecomp-downstream}"
 )
+if [ -n "${WANDB_KEY:-}" ]; then
+   WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
+fi
 
 PROMPT_SET=/workspace/data/dapo-math-17k/dapo-math-17k.jsonl
 
@@ -97,7 +99,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/model-name-browsecomp.pt
+   --save-debug-rollout-data "${DEBUG_ROLLOUT_PATH:-/workspace/slime/examples/mixed/debug/eval/model-name-browsecomp.pt}"
 )
 
 

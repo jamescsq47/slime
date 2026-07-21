@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import logging
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -86,6 +87,10 @@ class GenerateState(metaclass=SingletonMeta):
             sampling_seed_base = args.rollout_seed
             self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
 
+        # This epoch survives reset(). Custom multi-turn rollouts use it to
+        # detect a weight-update boundary after a long CPU/network tool
+        # returns, even though the boolean abort flag has already been reset.
+        self.abort_epoch = 0
         self.reset()
 
     def reset(self) -> None:
@@ -291,6 +296,7 @@ async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
     state = GenerateState(args)
+    group_abort_epoch = state.abort_epoch
 
     if state.aborted:
         return group
@@ -313,7 +319,7 @@ async def generate_and_rm_group(
     group = await asyncio.gather(*tasks)
 
     # for the rm that need the whole group, we will do the rm here
-    if not state.aborted and args.group_rm:
+    if not state.aborted and state.abort_epoch == group_abort_epoch and args.group_rm:
         with trace_span(group, "group_reward_model"):
             rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
@@ -322,12 +328,18 @@ async def generate_and_rm_group(
     return group
 
 
-async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
+async def abort(
+    args: Namespace,
+    rollout_id: int,
+    *,
+    drain_timeout: float | None = None,
+) -> list[list[Sample]]:
     aborted_samples = []
 
     state = GenerateState(args)
     assert not state.aborted
     state.aborted = True
+    state.abort_epoch += 1
 
     if parse(sglang_router.__version__) <= parse("0.2.1"):
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
@@ -343,10 +355,24 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         if isinstance(result, Exception):
             logger.warning(f"Failed to abort worker at {url}: {result}")
 
-    # make sure all the pending tasks are finished
+    # SGLang generation requests normally return promptly after /abort_request.
+    # A fully-async caller may bound this drain so a CPU/network tool can keep
+    # running outside the weight-update barrier.
     count = 0
+    drain_deadline = None if drain_timeout is None else time.monotonic() + max(0.0, drain_timeout)
     while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        wait_timeout = None
+        if drain_deadline is not None:
+            wait_timeout = max(0.0, drain_deadline - time.monotonic())
+            if wait_timeout == 0.0:
+                break
+        done, state.pendings = await asyncio.wait(
+            state.pendings,
+            timeout=wait_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            break
 
         if not args.partial_rollout:
             continue
@@ -361,7 +387,11 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
             count += len(group)
 
     if args.partial_rollout:
-        logger.info(f"Collected {count} partial samples into the data buffer")
+        logger.info(
+            "Collected %d partial samples; deferred %d groups still running outside the abort barrier",
+            count,
+            len(state.pendings),
+        )
 
     return aborted_samples
 
@@ -515,11 +545,53 @@ async def generate_rollout_async(
             math_sample_times = [s.sample_time for s in math_samples if hasattr(s, 'sample_time')]
             math_sample_time_max = max(math_sample_times) if math_sample_times else 0
             math_sample_time_avg = sum(math_sample_times) / len(math_sample_times) if math_sample_times else 0
+            math_attempt_times = [s.attempt_time for s in math_samples if hasattr(s, "attempt_time")]
+            math_attempt_counts = [s.attempt_count for s in math_samples if hasattr(s, "attempt_count")]
             
             # Calculate qa task sample_time stats
             qa_sample_times = [s.sample_time for s in qa_samples if hasattr(s, 'sample_time')]
             qa_sample_time_max = max(qa_sample_times) if qa_sample_times else 0
             qa_sample_time_avg = sum(qa_sample_times) / len(qa_sample_times) if qa_sample_times else 0
+            qa_attempt_times = [s.attempt_time for s in qa_samples if hasattr(s, "attempt_time")]
+            qa_attempt_counts = [s.attempt_count for s in qa_samples if hasattr(s, "attempt_count")]
+
+            def _scheduling_attempt_metrics(samples, domain):
+                partial_counts = [int(getattr(s, "partial_resume_count", 0) or 0) for s in samples]
+                restart_counts = [int(getattr(s, "restart_count", 0) or 0) for s in samples]
+                lifetime_times = [float(getattr(s, "lifetime_attempt_time", 0.0) or 0.0) for s in samples]
+                sample_times = [float(getattr(s, "sample_time", 0.0) or 0.0) for s in samples]
+                discarded_times = [
+                    max(0.0, lifetime - sample_time)
+                    for lifetime, sample_time in zip(lifetime_times, sample_times, strict=False)
+                ]
+                histories = [
+                    entry
+                    for sample in samples
+                    for entry in (
+                        sample.metadata.get("attempt_history", [])
+                        if isinstance(getattr(sample, "metadata", None), dict)
+                        else []
+                    )
+                    if isinstance(entry, dict)
+                ]
+                partial_attempt_times = [
+                    float(entry.get("duration", 0.0) or 0.0)
+                    for entry in histories
+                    if entry.get("status") == "aborted"
+                ]
+                sample_count = len(samples)
+                return {
+                    f"tool/{domain}_partial_resume_count_avg": sum(partial_counts) / sample_count if sample_count else 0,
+                    f"tool/{domain}_partial_resume_count_max": max(partial_counts) if partial_counts else 0,
+                    f"tool/{domain}_restart_count_avg": sum(restart_counts) / sample_count if sample_count else 0,
+                    f"tool/{domain}_partial_sample_ratio": sum(count > 0 for count in partial_counts) / sample_count if sample_count else 0,
+                    f"tool/{domain}_discarded_attempt_time_avg": sum(discarded_times) / sample_count if sample_count else 0,
+                    f"tool/{domain}_partial_attempt_time_avg": sum(partial_attempt_times) / len(partial_attempt_times) if partial_attempt_times else 0,
+                    f"tool/{domain}_partial_attempt_time_max": max(partial_attempt_times) if partial_attempt_times else 0,
+                }
+
+            math_scheduling_attempt_metrics = _scheduling_attempt_metrics(math_samples, "math")
+            qa_scheduling_attempt_metrics = _scheduling_attempt_metrics(qa_samples, "qa")
             
             # Calculate math task response_length stats
             math_response_lengths = [s.response_length for s in math_samples if hasattr(s, 'response_length')]
@@ -549,11 +621,19 @@ async def generate_rollout_async(
                 "tool/math_sample_time_avg": math_sample_time_avg,
                 "tool/qa_sample_time_max": qa_sample_time_max,
                 "tool/qa_sample_time_avg": qa_sample_time_avg,
+                "tool/math_attempt_time_max": max(math_attempt_times) if math_attempt_times else 0,
+                "tool/math_attempt_time_avg": sum(math_attempt_times) / len(math_attempt_times) if math_attempt_times else 0,
+                "tool/qa_attempt_time_max": max(qa_attempt_times) if qa_attempt_times else 0,
+                "tool/qa_attempt_time_avg": sum(qa_attempt_times) / len(qa_attempt_times) if qa_attempt_times else 0,
+                "tool/math_attempt_count_avg": sum(math_attempt_counts) / len(math_attempt_counts) if math_attempt_counts else 0,
+                "tool/qa_attempt_count_avg": sum(qa_attempt_counts) / len(qa_attempt_counts) if qa_attempt_counts else 0,
                 "tool/math_response_length_max": math_response_length_max,
                 "tool/math_response_length_avg": math_response_length_avg,
                 "tool/qa_response_length_max": qa_response_length_max,
                 "tool/qa_response_length_avg": qa_response_length_avg,
             })
+            metrics_to_log.update(math_scheduling_attempt_metrics)
+            metrics_to_log.update(qa_scheduling_attempt_metrics)
 
         if tool_time_counts:
             avg_tool_times = sum(tool_time_counts) / len(tool_time_counts)

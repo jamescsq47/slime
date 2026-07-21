@@ -846,7 +846,10 @@ class AsyncRolloutWorker:
         print("Continuous async rollout worker stopped")
 
     def worker_thread_func(self):
-        loop = asyncio.SelectorEventLoop()
+        # Respect Ray's event-loop policy (uvloop in production).  A manually
+        # constructed SelectorEventLoop cannot launch subprocesses under that
+        # policy because uvloop does not provide an asyncio child watcher.
+        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self.continuous_worker_loop())
