@@ -184,6 +184,7 @@ local/
 **/buffer_stats/
 *.out
 *.pkl
+*.json
 *.code-workspace
 
 .idea
