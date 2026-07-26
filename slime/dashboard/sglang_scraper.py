@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from slime.dashboard.logging_utils import RateLimitedWarner
 
@@ -54,6 +56,7 @@ class SglangScraper:
         self.timeout = timeout
         self.whitelist = frozenset(whitelist)
         self.http_get = http_get
+        self._worker_gpus: dict[str, int | None] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._warner = RateLimitedWarner(logger)
@@ -73,9 +76,37 @@ class SglangScraper:
         timestamp = time.time() if timestamp is None else timestamp
         text = self.http_get(f"{self.router_addr}/engine_metrics", self.timeout)
         records = self.parse_metrics(text, timestamp)
+        self._attach_worker_gpus(records)
         if records:
             self.sink(records)
         return records
+
+    def _attach_worker_gpus(self, records: list[dict]) -> None:
+        workers = {
+            record["worker_addr"]
+            for record in records
+            if record.get("worker_addr") not in (None, "router")
+            and record["worker_addr"] not in self._worker_gpus
+        }
+
+        def resolve(worker: str) -> tuple[str, int]:
+            url = worker if "://" in worker else f"http://{worker}"
+            payload = json.loads(self.http_get(f"{url.rstrip('/')}/get_server_info", min(self.timeout, 1.0)))
+            return worker, int(payload["base_gpu_id"])
+
+        if workers:
+            with ThreadPoolExecutor(max_workers=min(8, len(workers))) as pool:
+                futures = {pool.submit(resolve, worker): worker for worker in workers}
+                for future in as_completed(futures):
+                    try:
+                        worker, gpu = future.result()
+                        self._worker_gpus[worker] = gpu
+                    except Exception:
+                        self._worker_gpus[futures[future]] = None
+        for record in records:
+            gpu = self._worker_gpus.get(record.get("worker_addr"))
+            if gpu is not None:
+                record.setdefault("labels", {})["gpu"] = str(gpu)
 
     def parse_metrics(self, text: str, timestamp: float) -> list[dict]:
         from prometheus_client.parser import text_string_to_metric_families

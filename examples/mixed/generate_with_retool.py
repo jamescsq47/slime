@@ -14,7 +14,11 @@ except ImportError as e:
 
 from attempt_tracking import AttemptTracker
 from slime.dashboard.api import span as dashboard_span
-from slime.rollout.sglang_rollout import GenerateState
+from slime.rollout.sglang_rollout import (
+    GenerateState,
+    PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY,
+    track_sglang_generation,
+)
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
@@ -474,43 +478,58 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         else:
             prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
 
-        prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-
-        # Restore state from saved metadata if available
-        response = sample.response
-        response_token_ids = state.tokenizer(response, add_special_tokens=False)["input_ids"]
+        # Reuse the exact token IDs saved by the previous attempt. Text
+        # decode->encode is not guaranteed to be idempotent, and replacing
+        # valid old logprobs with zeroes corrupts TIS.
+        saved_prompt_token_count = metadata.get("formatted_prompt_token_count")
+        if (
+            sample.tokens
+            and saved_prompt_token_count is not None
+            and 0 <= int(saved_prompt_token_count) <= len(sample.tokens)
+        ):
+            saved_prompt_token_count = int(saved_prompt_token_count)
+            prompt_tokens_ids = list(sample.tokens[:saved_prompt_token_count])
+            response_token_ids = list(sample.tokens[saved_prompt_token_count:])
+            response = state.tokenizer.decode(response_token_ids)
+        else:
+            prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+            response = sample.response
+            response_token_ids = state.tokenizer(response, add_special_tokens=False)["input_ids"]
 
         if _should_mask_offpolicy(args, sample):
             # Off-policy masking: all existing tokens are off-policy,
             # only newly generated tokens (added after this point) will be marked as on-policy (1).
             loss_masks = [0] * len(response_token_ids)
             sample.metadata["offpolicy_masked"] = True
-            # Still need tool_call_count and start_turn to resume the multi-turn loop correctly
-            if metadata.get("tool_call_count"):
-                tool_call_count = metadata["tool_call_count"]
-                start_turn = metadata.get("current_turn", tool_call_count)
-            else:
-                tool_call_count = count_tool_turns(response)
-                start_turn = tool_call_count
-        elif metadata.get("partial_rollout") and metadata.get("loss_masks") and metadata.get("tool_call_count"):
-            loss_masks = metadata["loss_masks"]
+        elif metadata.get("partial_rollout") and "loss_masks" in metadata:
+            # Keep masks aligned to the exact saved token IDs. In particular,
+            # tool_call_count == 0 is valid for an aborted first assistant turn
+            # and must not force a decode -> re-tokenize reconstruction.
+            loss_masks = list(metadata.get("loss_masks") or [])
             if len(loss_masks) != len(response_token_ids):
                 print(f"[WARNING] Saved loss_masks length ({len(loss_masks)}) != response tokens ({len(response_token_ids)})")
-                loss_masks = reconstruct_loss_masks(response, state.tokenizer)
-            tool_call_count = metadata["tool_call_count"]
-            start_turn = metadata.get("current_turn", tool_call_count)
+                loss_masks = (loss_masks + [1] * len(response_token_ids))[: len(response_token_ids)]
         else:
             loss_masks = reconstruct_loss_masks(response, state.tokenizer)
-            tool_call_count = count_tool_turns(response)
-            start_turn = tool_call_count
 
-        # Re-sync rollout_log_probs if tokenizer round-trip changed token count
+        saved_tool_call_count = metadata.get("tool_call_count")
+        tool_call_count = (
+            int(saved_tool_call_count) if saved_tool_call_count is not None else count_tool_turns(response)
+        )
+        start_turn = int(metadata.get("current_turn", tool_call_count))
+
+        # Legacy partial samples may lack exact saved token boundaries.
         if sample.rollout_log_probs is not None and len(sample.rollout_log_probs) != len(response_token_ids):
             print(f"[WARNING] rollout_log_probs length ({len(sample.rollout_log_probs)}) != response tokens ({len(response_token_ids)}), resetting to zeros")
             sample.rollout_log_probs = [0.0] * len(response_token_ids)
 
         # Update off-policy token count
         sample.total_off_policy_tokens += len(response_token_ids)
+        assistant_start_token_idx = int(
+            metadata.get("retool_assistant_start_token_idx", len(response_token_ids))
+        )
+        assistant_start_token_idx = min(max(assistant_start_token_idx, 0), len(response_token_ids))
+        continuing_partial_assistant = bool(metadata.get("retool_continue_partial_assistant", False))
         # Carry over timing from previous attempt(s)
         _accrued_sample_time = getattr(sample, 'sample_time', 0.0) or 0.0
         _tool_time = getattr(sample, 'tool_time', 0.0) or 0.0
@@ -529,6 +548,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         loss_masks = []
         tool_call_count = 0  # Track actual tool call rounds
         start_turn = 0
+        assistant_start_token_idx = 0
+        continuing_partial_assistant = False
         _accrued_sample_time = 0.0
         _tool_time = 0.0
         _tool_token_count = 0
@@ -567,6 +588,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         status=Sample.Status.ABORTED,
         reason: str = "state_abort",
     ) -> Sample:
+        sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
         sample.status = status
         sample.tokens = prompt_tokens_ids + response_token_ids
         sample.response_length = len(response_token_ids)
@@ -581,6 +603,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.payload_has_tools = "# Tools" in prompt + response
         sample.metadata.update({
             "partial_rollout": True,
+            "partial_rollout_prefix_length": len(response_token_ids),
             "current_turn": current_turn,
             "loss_masks": loss_masks,
             "tool_call_count": tool_call_count,
@@ -588,6 +611,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             "code_call_count": tool_call_count,
             "search_call_count": 0,
             "formatted_prompt": prompt,
+            "formatted_prompt_token_count": len(prompt_tokens_ids),
+            "retool_assistant_start_token_idx": assistant_start_token_idx,
+            "retool_continue_partial_assistant": continuing_partial_assistant,
         })
         _record_timing(reason)
         sample.tool_time = _tool_time
@@ -604,6 +630,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if sample.rollout_log_probs is not None:
             sample.rollout_log_probs = sample.rollout_log_probs[:keep_response_tokens]
         response = state.tokenizer.decode(response_token_ids)
+        assistant_start_token_idx = min(assistant_start_token_idx, len(response_token_ids))
         truncated_by_context = True
 
     if sample.metadata.get(TOOL_DELAY_REMAINING_KEY) is not None:
@@ -613,6 +640,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     for turn in range(start_turn, TOOL_CONFIGS["max_turns"]):
         if _crossed_weight_update_boundary():
             return _save_partial_for_resume(turn, reason="weight_update_boundary")
+
+        if not continuing_partial_assistant:
+            assistant_start_token_idx = len(response_token_ids)
 
         # Check if total length exceeds max context length
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
@@ -642,27 +672,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             "return_logprob": True,  # Request log probabilities for training
         }
 
-        # Log payload to wandb for debugging
-        try:
-            import wandb
-
-            if wandb.run is not None:
-                # Count available tools (from tool_specs)
-                available_tools = len(tool_specs)
-                # Count tools used in the current response
-                tools_used = response.count("<interpreter>")
-
-                wandb.log(
-                    {
-                        "debug/payload_length": len(prompt + response),
-                        "debug/available_tools": available_tools,
-                        "debug/tools_used": tools_used,
-                        "debug/turn": turn,
-                    }
-                )
-        except ImportError:
-            pass  # wandb not available
-
         with dashboard_span(
             args,
             sample,
@@ -673,7 +682,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 "max_new_tokens": per_turn_sampling_params["max_new_tokens"],
             },
         ) as generation_span:
-            output = await post(url, payload)
+            with track_sglang_generation(sample):
+                output = await post(url, payload)
             meta_info = output.get("meta_info", {})
             finish_reason = meta_info.get("finish_reason", {})
             generation_span.update(
@@ -685,11 +695,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # Handle abort
         if output["meta_info"]["finish_reason"]["type"] == "abort":
-            # The engine may return a partial assistant action when weights are
-            # being updated. Do not start a new tool from that uncommitted
-            # action; resume generation from the previous complete turn.
-            if args.partial_rollout and _crossed_weight_update_boundary():
-                return _save_partial_for_resume(turn, reason="sglang_abort")
             if not args.partial_rollout:
                 sample.status = Sample.Status.ABORTED
                 _record_timing("sglang_abort")
@@ -698,113 +703,29 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 sample.code_call_count = tool_call_count
                 sample.search_call_count = 0
                 return sample
+
+            # Preserve the exact unfinished assistant turn. It may end in the
+            # middle of a JSON/tool call, so never execute it here. The next
+            # attempt prefills prompt + this prefix, generates the suffix, and
+            # parses the complete assistant turn exactly once.
+            if "output_token_logprobs" not in output["meta_info"]:
+                return _save_partial_for_resume(turn, reason="sglang_abort_missing_logprobs")
+
+            cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            if sample.rollout_log_probs is None:
+                sample.rollout_log_probs = []
+            sample.rollout_log_probs += cur_log_probs
+            response_token_ids += cur_response_token_ids
+            response = state.tokenizer.decode(response_token_ids)
+            if _should_mask_offpolicy(args, sample):
+                loss_masks += [0] * len(cur_response_token_ids)
+                sample.metadata["offpolicy_masked"] = True
             else:
-                # Partial rollout enabled: process partial response and save state
-                if "output_token_logprobs" in output["meta_info"]:
-                    cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-                    cur_response = state.tokenizer.decode(cur_response_token_ids)
-                    cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-                    if sample.rollout_log_probs is None:
-                        sample.rollout_log_probs = []
-                    sample.rollout_log_probs += cur_log_probs
-                else:
-                    sample.status = Sample.Status.ABORTED
-                    _record_timing("sglang_abort_missing_logprobs")
-                    sample.tool_time = _tool_time
-                    sample.tool_token_count = _tool_token_count
-                    sample.code_call_count = tool_call_count
-                    sample.search_call_count = 0
-                    return sample
-
-                if cur_response:
-                    response += cur_response
-                    response_token_ids += cur_response_token_ids
-                    if _should_mask_offpolicy(args, sample):
-                        # All existing + new tokens are off-policy; only tokens
-                        # generated on the next complete resume will be on-policy.
-                        loss_masks += [0] * len(cur_response_token_ids)
-                        sample.metadata["offpolicy_masked"] = True
-                    else:
-                        loss_masks += [1] * len(cur_response_token_ids)
-
-                    _tool_start = time.monotonic()
-                    with dashboard_span(
-                        args,
-                        sample,
-                        "tool_call",
-                        attrs={"task_type": "math", "turn": turn + 1},
-                    ) as tool_span:
-                        next_obs, done = await execute_predictions(cur_response)
-                        is_tool_call = "<interpreter>" in (next_obs or "")
-                        tool_span.update(
-                            {
-                                "done": done,
-                                "observation_chars": len(next_obs or ""),
-                                "tool_calls": int(is_tool_call),
-                                "is_tool_call": is_tool_call,
-                            }
-                        )
-                    if next_obs:
-                        if "<interpreter>" in next_obs:
-                            tool_call_count += 1
-                        _tool_time += time.monotonic() - _tool_start
-
-                        (
-                            response,
-                            response_token_ids,
-                            loss_masks,
-                            sample.rollout_log_probs,
-                            obs_truncated,
-                            obs_token_count,
-                        ) = append_observation_with_budget(
-                            state,
-                            prompt_tokens_ids,
-                            response,
-                            response_token_ids,
-                            loss_masks,
-                            sample.rollout_log_probs,
-                            next_obs,
-                            max_context_length,
-                        )
-                        _tool_token_count += obs_token_count
-                        if obs_truncated:
-                            truncated_by_context = True
-                        else:
-                            await _sleep_after_tool_delay(
-                                args,
-                                state,
-                                sample,
-                                abort_epoch=attempt_abort_epoch,
-                            )
-
-                # Save state for resumption
-                sample.status = Sample.Status.TRUNCATED if truncated_by_context else Sample.Status.ABORTED
-                sample.tokens = prompt_tokens_ids + response_token_ids
-                sample.response_length = len(response_token_ids)
-                sample.response = response
-                sample.loss_mask = loss_masks
-                sample.tool_call_count = tool_call_count
-                sample.tool_token_count = _tool_token_count
-                sample.code_call_count = tool_call_count
-                sample.search_call_count = 0
-
-                sample.payload_text = prompt + response
-                sample.payload_has_system = "<|im_start|>system" in prompt + response
-                sample.payload_has_tools = "# Tools" in prompt + response
-
-                sample.metadata.update({
-                    "partial_rollout": True,
-                    "current_turn": turn,
-                    "loss_masks": loss_masks,
-                    "tool_call_count": tool_call_count,
-                    "tool_token_count": _tool_token_count,
-                    "code_call_count": tool_call_count,
-                    "search_call_count": 0,
-                    "formatted_prompt": prompt,
-                })
-                _record_timing("context" if truncated_by_context else "sglang_abort")
-                sample.tool_time = _tool_time
-                return sample
+                loss_masks += [1] * len(cur_response_token_ids)
+            if cur_response_token_ids:
+                continuing_partial_assistant = True
+            return _save_partial_for_resume(turn, reason="sglang_abort")
 
         if "output_token_logprobs" in output["meta_info"]:
             cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -829,22 +750,24 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.search_call_count = 0
             return sample
 
-        response += cur_response
         response_token_ids += cur_response_token_ids
+        response = state.tokenizer.decode(response_token_ids)
         loss_masks += [1] * len(cur_response_token_ids)
 
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
+        assistant_text = state.tokenizer.decode(response_token_ids[assistant_start_token_idx:])
         _tool_start = time.monotonic()
+        sample.metadata[PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY] = True
         with dashboard_span(
             args,
             sample,
             "tool_call",
             attrs={"task_type": "math", "turn": turn + 1},
         ) as tool_span:
-            next_obs, done = await execute_predictions(cur_response)
+            next_obs, done = await execute_predictions(assistant_text)
             is_tool_call = "<interpreter>" in (next_obs or "")
             tool_span.update(
                 {
@@ -855,6 +778,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 }
             )
         if done:
+            continuing_partial_assistant = False
+            sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
             break
 
         # Count tool calls (when we get interpreter output, it means a tool
@@ -889,8 +814,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
 
         if obs_truncated:
+            continuing_partial_assistant = False
+            sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
             truncated_by_context = True
             break
+
+        continuing_partial_assistant = False
+        assistant_start_token_idx = len(response_token_ids)
 
         # A tool that was already running at the update boundary is allowed to
         # finish. Commit its observation, then return the partial trajectory so
@@ -898,8 +828,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if _crossed_weight_update_boundary():
             return _save_partial_for_resume(turn + 1, reason="tool_completed_after_weight_update")
 
+        sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
         if not await _sleep_after_tool_delay(args, state, sample, abort_epoch=attempt_abort_epoch):
-            return _save_partial_for_resume(turn, reason="tool_delay_abort")
+            return _save_partial_for_resume(turn + 1, reason="tool_delay_abort")
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             break
@@ -920,6 +851,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.tool_token_count = _tool_token_count
     sample.code_call_count = tool_call_count
     sample.search_call_count = 0
+    sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
 
     # Set status based on finish reason. Context-budget truncation wins over
     # the last model finish reason, since tool observations can be the part
@@ -953,6 +885,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         "tool_time": _tool_time,
         "sample_time": sample.sample_time,
         "tool_time_ratio": _tool_time / sample.sample_time if sample.sample_time > 0 else 0.0,
+        "retool_assistant_start_token_idx": assistant_start_token_idx,
+        "retool_continue_partial_assistant": False,
     })
     return sample
 

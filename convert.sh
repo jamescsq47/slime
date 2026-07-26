@@ -12,8 +12,10 @@ SLIME_ROOT="/workspace/slime"           # slime repo root (where tools/ lives)
 
 # ── Model paths to convert (edit this list) ──────────────────────────────────
 MODEL_DIRS=(
-    "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-trial2"
-    # "/workspace/Qwen3-8B_hybrid_mask256_512_dynamic"
+    "/workspace/Qwen3-8B-retool-mask51200-collocate-partial"
+    "/workspace/Qwen3-8B-browsecomp-mask51200-collocate-partial"
+    # "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-collocate-partial"
+    # "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-qafirst"
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -57,25 +59,11 @@ for MODEL_DIR in "${MODEL_DIRS[@]}"; do
             --origin-hf-dir "$ORIGIN_HF_DIR"
 
         echo "[DONE]  $OUTPUT_DIR"
-    done
-
-    # ── Cleanup: delete megatron checkpoints and rollout after conversion ──
-    echo "----------------------------------------"
-    echo "Cleaning up intermediate data in: $MODEL_DIR"
-
-    for ITER_DIR in "${MODEL_DIR}"/iter_*; do
-        [ -d "$ITER_DIR" ] || continue
         echo "[DELETE] $ITER_DIR"
         rm -rf "$ITER_DIR"
     done
 
-    # if [ -d "${MODEL_DIR}/rollout" ]; then
-    #     echo "[DELETE] ${MODEL_DIR}/rollout"
-    #     rm -rf "${MODEL_DIR}/rollout"
-    # fi
-
-    echo "Cleanup done for: $MODEL_DIR"
-    echo "----------------------------------------"
+    echo "Finished processing: $MODEL_DIR"
 done
 
 echo "All conversions finished."

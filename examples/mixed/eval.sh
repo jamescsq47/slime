@@ -60,7 +60,7 @@ echo "=== Running hybrid async benchmark: mode=${MODE} ==="
 CKPT_ARGS=(
    --hf-checkpoint /workspace/Qwen3-8B
    #--hf-checkpoint /root/Qwen3-4B-FP8
-   --ref-load /workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-trial2/iter199_torch_dist
+   --ref-load /workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-collocate-partial/iter199_torch_dist
    # --load /root/Qwen3-4B_slime/
 #    --save /workspace/Qwen3-4B_sync_hybrid0.5/
 #    --save-interval 100s
@@ -97,7 +97,7 @@ ROLLOUT_ARGS=(
    --balance-data
    --rollout-health-check-interval 600
    --rollout-health-check-timeout 600
-   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-trial2-iter199.pt
+   --save-debug-rollout-data /workspace/slime/examples/mixed/debug/eval/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-collocate-partial-iter199.pt
 )
 
 

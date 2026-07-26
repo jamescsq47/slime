@@ -31,6 +31,19 @@ section { padding: 18px 0 22px; border-bottom: 1px solid #d9dde3; }
 .stat span { color: #68707c; font-size: 11px; }
 .section-title { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
 canvas { display: block; width: 100%; background: #ffffff; border: 1px solid #d9dde3; }
+.overlay-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 10px; font-size: 12px; }
+.overlay-controls button.active { color: #b45309; border-color: #d97706; background: #fff7ed; }
+.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.gpu-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 8px; }
+.gpu-card { padding: 10px 12px; background: white; border: 1px solid #d9dde3; font-variant-numeric: tabular-nums; }
+.gpu-card-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+.gpu-card-head b { font-size: 13px; }
+.gpu-card-head span { color: #68707c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-card-values { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.gpu-card-values b { display: block; font-size: 17px; }
+.gpu-card-values span { color: #68707c; font-size: 10px; }
+.bar { height: 3px; background: #edf0f4; margin-top: 7px; }
+.bar i { display: block; height: 100%; background: #3b82f6; }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; font-size: 11px; }
 .legend i { display: inline-block; width: 10px; height: 10px; margin-right: 5px; }
 .trace-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; background: #d9dde3; margin-bottom: 12px; }
@@ -43,6 +56,6 @@ td:last-child { white-space: normal; max-width: 460px; }
   header { align-items: flex-start; flex-direction: column; }
   .summary { grid-template-columns: repeat(2, 1fr); }
   .trace-grid { grid-template-columns: repeat(2, 1fr); }
+  .chart-grid { grid-template-columns: 1fr; }
   main { padding-inline: 12px; }
 }
-

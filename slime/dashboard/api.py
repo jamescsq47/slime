@@ -33,3 +33,16 @@ def metrics(args, values: dict, step: int | None = None, step_key: str | None = 
     from slime.dashboard.backend import log_metrics
 
     log_metrics(values, step=step, step_key=step_key)
+
+
+def phase(args, name: str, rollout_id: int | None = None) -> None:
+    """Record a low-frequency global phase transition for colocated GPU lanes."""
+    metrics(
+        args,
+        {
+            "dashboard/phase": name,
+            "dashboard/rollout_id": rollout_id if rollout_id is not None else -1,
+        },
+        step=rollout_id,
+        step_key="rollout/step",
+    )

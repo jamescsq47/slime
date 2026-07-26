@@ -1,0 +1,83 @@
+{
+  "checkpoint": "/workspace/Qwen3-8B",
+  "normalization": "each score and domain gradient is mean assistant-token log likelihood; domain gradient is mean over traces",
+  "samples_per_domain": 8,
+  "seed": 20260724,
+  "max_length": 512,
+  "math_gradient_norm": 12.562381256233467,
+  "qa_gradient_norm": 50.13697019970566,
+  "gradient_dot": 184.19399597820907,
+  "gradient_cosine": 0.292445817302182,
+  "math_source_token_counts": [
+    274,
+    396,
+    306,
+    384,
+    252,
+    281,
+    372,
+    358
+  ],
+  "qa_source_token_counts": [
+    189,
+    171,
+    154,
+    186,
+    209,
+    201,
+    197,
+    156
+  ],
+  "qa_to_math": {
+    "value": 38696.94246418479,
+    "projection_mean": -184.26517636603688,
+    "projection_std": 68.87152708469665,
+    "projections": [
+      -207.07836881191258,
+      -120.9464430129636,
+      -268.4004691419506,
+      -62.12630052861894,
+      -204.64851581524925,
+      -259.5127401866049,
+      -124.73523891073643,
+      -226.67333452025883
+    ],
+    "target_token_counts": [
+      274,
+      396,
+      306,
+      384,
+      252,
+      281,
+      372,
+      358
+    ],
+    "normalized_by_direction_norm2": 15.394318943955668
+  },
+  "math_to_qa": {
+    "value": 34668.66963899869,
+    "projection_mean": -184.24736606949196,
+    "projection_std": 26.8621990062859,
+    "projections": [
+      -146.9474010034187,
+      -192.12854388819218,
+      -181.23890225772595,
+      -165.24600197711052,
+      -169.25331515237346,
+      -178.13864918109306,
+      -243.49761858634983,
+      -197.52849650967195
+    ],
+    "target_token_counts": [
+      189,
+      171,
+      154,
+      186,
+      209,
+      201,
+      197,
+      156
+    ],
+    "normalized_by_direction_norm2": 219.68137448619342
+  }
+}

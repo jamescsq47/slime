@@ -18,11 +18,16 @@ MODELS=(
   "block4-iter199|/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/iter199_torch_dist"
   "block4-iter299|/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/iter299_torch_dist"
   "block4-iter399|/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4/iter399_torch_dist"
+  "sft-iter1699|/workspace/Qwen3-8B-browsecomp-sft/iter1699_torch_dist"
+  "sft-iter3331|/workspace/Qwen3-8B-browsecomp-sft/iter3331_torch_dist"
 )
 
 for entry in "${MODELS[@]}"; do
   name=${entry%%|*}
   ref_load=${entry#*|}
+  if [ -n "${ONLY_MODEL:-}" ] && [ "${name}" != "${ONLY_MODEL}" ]; then
+    continue
+  fi
   output_path="${OUTPUT_DIR}/${name}-browsecomp.pt"
   if [ ! -d "${ref_load}" ]; then
     echo "Missing checkpoint: ${ref_load}" >&2

@@ -358,6 +358,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--train-batch-math-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Optional exact number of completed math groups admitted to each training batch. "
+                    "Must be used together with --train-batch-qa-groups, and their sum must equal "
+                    "rollout_batch_size. Completed groups above either quota are recycled to the rollout buffer."
+                ),
+            )
+            parser.add_argument(
+                "--train-batch-qa-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Optional exact number of completed QA groups admitted to each training batch. "
+                    "Must be used together with --train-batch-math-groups."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -368,6 +387,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to use partial rollout. "
                     "If set, the unfinished samples during dynamic sampling will be recycled back to data buffer. "
                     "This is useful for long responses."
+                ),
+            )
+            parser.add_argument(
+                "--partial-rollout-tool-handoff",
+                action="store_true",
+                default=False,
+                help=(
+                    "Allow unfinished custom rollout tasks that are waiting in external tools to finish outside "
+                    "the rollout abort barrier. Their partial groups are recycled after the tool returns. "
+                    "Custom generate functions must observe GenerateState.abort_epoch before issuing another "
+                    "generation request. Requires --partial-rollout."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-replenish-completed-groups",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep the over-sampling group window full by submitting one replacement whenever a group "
+                    "finishes, until rollout_batch_size groups have been collected."
                 ),
             )
             parser.add_argument(
@@ -1973,6 +2012,19 @@ def slime_validate_args(args):
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+    train_batch_quotas = (args.train_batch_math_groups, args.train_batch_qa_groups)
+    if any(quota is not None for quota in train_batch_quotas):
+        if any(quota is None for quota in train_batch_quotas):
+            raise ValueError("--train-batch-math-groups and --train-batch-qa-groups must be set together")
+        if any(quota < 0 for quota in train_batch_quotas):
+            raise ValueError("train-batch task group quotas must be non-negative")
+        if sum(train_batch_quotas) != args.rollout_batch_size:
+            raise ValueError(
+                "--train-batch-math-groups + --train-batch-qa-groups must equal "
+                f"--rollout-batch-size ({args.rollout_batch_size})"
+            )
+    if args.partial_rollout_tool_handoff and not args.partial_rollout:
+        raise ValueError("--partial-rollout-tool-handoff requires --partial-rollout")
 
     if args.num_epoch is not None:
         if args.num_rollout is not None:

@@ -199,6 +199,8 @@ def _init_wandb_common():
     wandb.define_metric("rollout/*", step_metric="rollout/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")
     wandb.define_metric("passrate/*", step_metric="rollout/step")
+    wandb.define_metric("tool/*", step_metric="rollout/step")
+    wandb.define_metric("debug/*", step_metric="rollout/step")
     wandb.define_metric("fully_async/step")
     wandb.define_metric("fully_async/*", step_metric="fully_async/step")
     wandb.define_metric("fully_async/count/*", step_metric="fully_async/step")

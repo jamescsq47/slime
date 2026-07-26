@@ -152,12 +152,16 @@ def _args_snapshot(args) -> dict[str, Any]:
         "rollout_num_gpus",
         "rollout_num_gpus_per_engine",
         "rollout_batch_size",
+        "over_sampling_batch_size",
         "n_samples_per_prompt",
         "global_batch_size",
         "update_weights_interval",
         "fully_async_buffer_policy",
         "fully_async_version_window",
         "hf_checkpoint",
+        "colocate",
+        "partial_rollout",
+        "partial_rollout_tool_handoff",
     )
     return {key: getattr(args, key) for key in keys if hasattr(args, key)}
 

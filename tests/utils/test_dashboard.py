@@ -45,7 +45,9 @@ def test_store_reader_and_server_smoke(tmp_path):
 
     client = TestClient(make_app(tmp_path))
     assert client.get("/api/health").json()["ok"] is True
-    assert client.get("/").status_code == 200
+    index = client.get("/")
+    assert index.status_code == 200
+    assert index.headers["cache-control"] == "no-cache"
 
 
 @pytest.mark.unit
@@ -97,6 +99,65 @@ def test_server_aggregates_engine_workers_by_default(tmp_path):
 
 
 @pytest.mark.unit
+def test_snapshot_compacts_trace_into_tool_summary(tmp_path):
+    store = JsonlStore(tmp_path)
+    timestamp = time.time() - 2
+    common = {
+        "name": "tool_call",
+        "span_id": "tool-1",
+        "sample_id": 7,
+        "group_id": "group-1",
+    }
+    store.append(
+        "trace",
+        {
+            **common,
+            "type": "span_start",
+            "ts": timestamp,
+            "attrs": {"task_type": "math"},
+        },
+    )
+    store.append(
+        "trace",
+        {
+            **common,
+            "type": "span_end",
+            "ts": timestamp + 1,
+            "attrs": {"is_tool_call": True, "tool_calls": 1},
+        },
+    )
+    store.flush()
+
+    snapshot = DashboardReader(tmp_path).snapshot(minutes=1)
+
+    assert snapshot["trace"] == []
+    assert snapshot["trace_summary"]["totals"]["tool_calls"] == 1
+    assert snapshot["trace_summary"]["spans"][0]["duration"] == pytest.approx(1.0)
+    assert snapshot["trace_summary"]["tool_series"]["math"] == [
+        [timestamp, 0],
+        [timestamp, 1],
+        [timestamp + 1, 1],
+        [timestamp + 1, 0],
+    ]
+
+
+@pytest.mark.unit
+def test_dashboard_downsample_preserves_latest_point_per_series():
+    records = [
+        {"ts": float(index), "node": "node-a", "gpu": gpu, "util": index}
+        for gpu in (0, 1)
+        for index in range(10)
+    ]
+
+    sampled = DashboardReader.downsample(records, ("node", "gpu"), max_points=3)
+
+    for gpu in (0, 1):
+        gpu_rows = [record for record in sampled if record["gpu"] == gpu]
+        assert len(gpu_rows) <= 4
+        assert gpu_rows[-1]["ts"] == 9.0
+
+
+@pytest.mark.unit
 def test_sglang_scraper_parses_current_colon_metric_names():
     payload = """
 # HELP sglang:num_running_reqs Number of running requests
@@ -124,6 +185,22 @@ unrelated_metric 9
     ]
     assert records[0]["worker_addr"] == "10.0.0.1:30000"
     assert batches == [records]
+
+
+@pytest.mark.unit
+def test_sglang_scraper_attaches_explicit_worker_gpu():
+    metrics = "sglang:num_running_reqs{worker_addr=\"http://10.0.0.1:30000\"} 3\n"
+
+    def http_get(url, timeout):
+        if url.endswith("/get_server_info"):
+            return '{"base_gpu_id": 5}'
+        return metrics
+
+    scraper = SglangScraper(lambda records: None, router_addr="http://router:30000", http_get=http_get)
+
+    records = scraper.scrape_once(timestamp=123.0)
+
+    assert records[0]["labels"]["gpu"] == "5"
 
 
 class _FakeNvml:

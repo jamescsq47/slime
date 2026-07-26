@@ -6,8 +6,8 @@ import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
-import wandb
 
 import numpy as np
 import pybase64
@@ -36,7 +36,11 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout", "get_model_url"]
 
 logger = logging.getLogger(__name__)
-_wandb_metric_defined = False
+PARTIAL_ROLLOUT_TOOL_HANDOFF_DRAIN_TIMEOUT = 0.5
+PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY = "partial_rollout_tool_inflight"
+PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY = "partial_rollout_sglang_inflight"
+PARTIAL_ROLLOUT_SGLANG_DRAIN_TIMEOUT = 30.0
+
 
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
@@ -91,27 +95,296 @@ class GenerateState(metaclass=SingletonMeta):
         # detect a weight-update boundary after a long CPU/network tool
         # returns, even though the boolean abort flag has already been reset.
         self.abort_epoch = 0
+        # Opt-in partial-rollout handoff state. These tasks stay on the
+        # persistent rollout asyncio loop while collocated training owns the
+        # GPUs. The custom generators return an ABORTED partial group after
+        # their external tool finishes and observes the changed abort_epoch.
+        self.deferred_tool_tasks: dict[asyncio.Task, list[Sample] | None] = {}
+        # Parent group task -> child sample tasks. This must survive reset()
+        # while a tool child is intentionally deferred across training.
+        self.group_child_tasks: dict[asyncio.Task, list[tuple[asyncio.Task, Sample]]] = {}
+        self.handoff_completed_since_log = 0
+        self.handoff_failed_since_log = 0
         self.reset()
 
     def reset(self) -> None:
         self.remaining_batch_size = 0
         self.pendings = set()
+        self.pending_groups: dict[asyncio.Task, list[Sample]] = {}
         self.aborted = False
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
-            self.pendings.add(
-                asyncio.create_task(
-                    # submit a group of samples as a single task.
-                    generate_and_rm_group(
-                        self.args,
-                        group,
-                        sampling_params=self.sampling_params.copy(),
-                        evaluation=False,
-                    )
+            task = asyncio.create_task(
+                # submit a group of samples as a single task.
+                generate_and_rm_group(
+                    self.args,
+                    group,
+                    sampling_params=self.sampling_params.copy(),
+                    evaluation=False,
                 )
             )
+            self.pendings.add(task)
+            self.pending_groups[task] = group
         self.remaining_batch_size += len(samples)
+
+
+def _prepare_group_for_recycle(group: list[Sample] | None) -> list[Sample] | None:
+    if group is None:
+        return None
+    for item in group:
+        samples = item if isinstance(item, list) else [item]
+        for sample in samples:
+            if isinstance(sample.metadata, dict):
+                sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
+                sample.metadata.pop(PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY, None)
+            if sample.status == Sample.Status.PENDING:
+                sample.status = Sample.Status.ABORTED
+    return group
+
+
+@contextmanager
+def track_sglang_generation(sample: Sample):
+    """Mark a request until its SGLang /generate call has actually returned."""
+    if not isinstance(sample.metadata, dict):
+        sample.metadata = {}
+    sample.metadata[PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY] = True
+    try:
+        yield
+    finally:
+        sample.metadata.pop(PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY, None)
+
+
+def _count_inflight_sglang_requests(state: GenerateState) -> int:
+    count = 0
+    for group in state.pending_groups.values():
+        for item in group:
+            samples = item if isinstance(item, list) else [item]
+            count += sum(
+                bool(
+                    isinstance(sample.metadata, dict)
+                    and sample.metadata.get(PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY)
+                )
+                for sample in samples
+            )
+    return count
+
+
+async def _abort_workers(urls: list[str]) -> None:
+    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+    for url, result in zip(urls, abort_results, strict=False):
+        if isinstance(result, Exception):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
+
+
+async def _drain_inflight_sglang_requests(state: GenerateState, urls: list[str]) -> None:
+    """Keep aborting late-arriving queued requests until no /generate call remains."""
+    deadline = time.monotonic() + PARTIAL_ROLLOUT_SGLANG_DRAIN_TIMEOUT
+    while (inflight := _count_inflight_sglang_requests(state)) > 0:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out draining {inflight} SGLang generation requests before training")
+        await asyncio.sleep(0.25)
+        if _count_inflight_sglang_requests(state) > 0:
+            await _abort_workers(urls)
+
+
+def _group_needs_recycle(group: list[Sample]) -> bool:
+    for item in group:
+        samples = item if isinstance(item, list) else [item]
+        if any(sample.status in {Sample.Status.PENDING, Sample.Status.ABORTED} for sample in samples):
+            return True
+    return False
+
+
+async def _handoff_pending_tool_tasks(
+    state: GenerateState, rollout_id: int | None = None
+) -> tuple[int, list[list[Sample]]]:
+    """Let post-abort cleanup finish without allowing another generation request."""
+    deferred = 0
+    recycled_groups = []
+    for task in list(state.pendings):
+        group = state.pending_groups.pop(task, None)
+        if group is not None and rollout_id is not None:
+            for item in group:
+                samples = item if isinstance(item, list) else [item]
+                for sample in samples:
+                    if isinstance(sample.metadata, dict):
+                        sample.metadata.setdefault("start_rollout_id", rollout_id)
+        if task.done():
+            try:
+                completed_group = task.result()
+            except asyncio.CancelledError:
+                completed_group = group
+            except Exception:
+                logger.exception("Partial-rollout task failed while leaving the abort barrier")
+                completed_group = group
+                state.handoff_failed_since_log += 1
+            completed_group = _prepare_group_for_recycle(completed_group)
+            if completed_group is not None:
+                recycled_groups.append(completed_group)
+            continue
+
+        # /abort_request has already stopped SGLang work. Keep the group task
+        # alive long enough for custom generators to commit a consistent
+        # partial state (and for external tools/rewards to finish). The
+        # monotonic abort_epoch prevents every child from issuing another
+        # generation request while the collocated GPUs are training.
+        state.deferred_tool_tasks[task] = group
+        deferred += 1
+
+    state.pendings.clear()
+    return deferred, recycled_groups
+
+
+async def _drain_deferred_tool_tasks(state: GenerateState, add_samples: Callable | None) -> tuple[int, int]:
+    """Recycle finished tool handoffs exactly once on the rollout event loop."""
+    if add_samples is None:
+        return 0, 0
+
+    completed = 0
+    failed = 0
+    done_tasks = [task for task in state.deferred_tool_tasks if task.done()]
+    for task in done_tasks:
+        fallback_group = state.deferred_tool_tasks[task]
+        task_failed = False
+        try:
+            group = task.result()
+        except asyncio.CancelledError:
+            state.deferred_tool_tasks.pop(task, None)
+            continue
+        except Exception:
+            logger.exception("Deferred partial-rollout tool group failed; recycling its last committed state")
+            group = fallback_group
+            task_failed = True
+            failed += 1
+
+        state.deferred_tool_tasks.pop(task, None)
+        group = _prepare_group_for_recycle(group)
+        if group is None:
+            continue
+        add_samples([group])
+        if not task_failed:
+            completed += 1
+
+    state.handoff_completed_since_log += completed
+    state.handoff_failed_since_log += failed
+    return completed, failed
+
+
+def _submission_batch_size(
+    target_data_size: int,
+    over_sampling_batch_size: int,
+    remaining_batch_size: int,
+    deferred_group_count: int,
+) -> int:
+    """Fill the current rollout while charging deferred groups to oversampling capacity."""
+    needed = max(0, target_data_size - remaining_batch_size)
+    spare_capacity = max(0, over_sampling_batch_size - deferred_group_count - remaining_batch_size)
+    return max(needed, spare_capacity)
+
+
+def _submission_target(
+    target_data_size: int,
+    over_sampling_batch_size: int,
+    deferred_group_count: int,
+    replenish_completed_groups: bool,
+) -> int:
+    """Return the number of live generation slots to keep filled."""
+    if not replenish_completed_groups:
+        return target_data_size
+    return max(target_data_size, over_sampling_batch_size - deferred_group_count)
+
+
+def _get_group_task_type(group: list[Sample]) -> str:
+    """Return the single task type represented by a rollout group."""
+    task_types = set()
+    for item in group:
+        samples = item if isinstance(item, list) else [item]
+        for sample in samples:
+            metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+            task_type = metadata.get("task_type")
+            if task_type is not None:
+                task_types.add(task_type)
+
+    if len(task_types) != 1:
+        raise ValueError(f"Balanced training requires one task_type per group, got {sorted(task_types)}")
+    return task_types.pop()
+
+
+def _get_train_batch_task_quotas(args: Namespace) -> dict[str, int] | None:
+    math_groups = getattr(args, "train_batch_math_groups", None)
+    qa_groups = getattr(args, "train_batch_qa_groups", None)
+    if math_groups is None and qa_groups is None:
+        return None
+    if math_groups is None or qa_groups is None:
+        raise ValueError("Both train batch task quotas must be configured")
+    return {"math": math_groups, "qa": qa_groups}
+
+
+def _admit_group_to_train_batch(
+    group: list[Sample],
+    task_quotas: dict[str, int] | None,
+    selected_task_counts: dict[str, int],
+) -> bool:
+    """Admit a completed group if its task quota still has room."""
+    if task_quotas is None:
+        return True
+
+    task_type = _get_group_task_type(group)
+    if task_type not in task_quotas:
+        raise ValueError(f"Balanced training only supports task_type=math or qa, got {task_type!r}")
+    if selected_task_counts[task_type] >= task_quotas[task_type]:
+        return False
+
+    selected_task_counts[task_type] += 1
+    return True
+
+
+def _consume_finished_rollout_task(
+    state: GenerateState,
+    task: asyncio.Task,
+    add_samples: Callable[[list[list[Sample]]], None] | None,
+    release_slot_on_completion: bool = False,
+) -> list[Sample] | None:
+    """Return a successful group, or recycle a failed group without killing the rollout."""
+    fallback_group = state.pending_groups.pop(task, None)
+    try:
+        group = task.result()
+    except asyncio.CancelledError:
+        group = None
+    except Exception:
+        logger.exception("Rollout group failed during collection; recycling its last committed state")
+        state.handoff_failed_since_log += 1
+        group = None
+
+    if release_slot_on_completion:
+        state.remaining_batch_size -= 1
+
+    if group is not None and not _group_needs_recycle(group):
+        return group
+
+    group = _prepare_group_for_recycle(group if group is not None else fallback_group)
+    if not release_slot_on_completion:
+        state.remaining_batch_size -= 1
+    if group is not None:
+        if add_samples is not None:
+            add_samples([group])
+        else:
+            state.submit_generate_tasks([group])
+    return None
+
+
+def _collect_tool_handoff_metrics(state: GenerateState, deferred_groups: int) -> dict[str, int]:
+    metrics = {
+        "tool/partial_deferred_groups": deferred_groups,
+        "tool/partial_deferred_inflight_groups": len(state.deferred_tool_tasks),
+        "tool/partial_deferred_completed_groups": state.handoff_completed_since_log,
+        "tool/partial_deferred_failed_groups": state.handoff_failed_since_log,
+    }
+    state.handoff_completed_since_log = 0
+    state.handoff_failed_since_log = 0
+    return metrics
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -182,7 +455,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             headers = {"X-SMG-Routing-Key": sample.session_id}
 
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
-        output = await post(url, payload, headers=headers)
+        with track_sglang_generation(sample):
+            output = await post(url, payload, headers=headers)
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
 
     if "output_token_logprobs" in output["meta_info"]:
@@ -226,6 +500,7 @@ async def generate_and_rm(
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
+    expected_abort_epoch: int | None = None,
 ) -> Sample | list[Sample]:
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
@@ -234,15 +509,20 @@ async def generate_and_rm(
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
-        if not args.group_rm:
-            assert sample.reward is not None
+        if not args.group_rm and sample.reward is None:
+            # A rollout boundary can cancel a task after generation finishes
+            # but while its async reward request is still pending. Retrying the
+            # reward here preserves the completed response without generating
+            # another token or tripping the old reward-is-not-None assertion.
+            with trace_span(sample, "reward_model"):
+                sample.reward = await async_rm(args, sample)
         return sample
 
     state = GenerateState(args)
 
     # generate
     async with state.semaphore:
-        if state.aborted:
+        if state.aborted or (expected_abort_epoch is not None and state.abort_epoch != expected_abort_epoch):
             sample.status = Sample.Status.ABORTED
             return sample
 
@@ -306,17 +586,60 @@ async def generate_and_rm_group(
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
-    tasks = []
+    task_entries = []
     for idx, sample in enumerate(group):
+        # A recycled group can contain terminal siblings alongside members
+        # that still need generation. Keep terminal trajectories exactly as
+        # they are. For non-group reward models, the one exception is a
+        # terminal response whose reward request was interrupted; running it
+        # through generate_and_rm retries only the reward (see the early
+        # return there) and never regenerates tokens.
+        if sample.status in {Sample.Status.COMPLETED, Sample.Status.TRUNCATED} and (
+            args.group_rm or sample.reward is not None
+        ):
+            continue
+
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        task = asyncio.create_task(
+            generate_and_rm(
+                args,
+                sample,
+                current_sampling_params,
+                evaluation=evaluation,
+                expected_abort_epoch=group_abort_epoch,
+            )
         )
+        task_entries.append((idx, sample, task))
 
-    group = await asyncio.gather(*tasks)
+    parent_task = asyncio.current_task()
+    if parent_task is not None:
+        state.group_child_tasks[parent_task] = [(task, sample) for _, sample, task in task_entries]
+    try:
+        results = await asyncio.gather(*(task for _, _, task in task_entries), return_exceptions=True)
+        first_error = None
+        completed_group = list(group)
+        for (idx, original_sample, _), result in zip(task_entries, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                if original_sample.status == Sample.Status.PENDING:
+                    original_sample.status = Sample.Status.ABORTED
+                completed_group[idx] = original_sample
+            elif isinstance(result, BaseException):
+                if first_error is None:
+                    first_error = result
+                if original_sample.status == Sample.Status.PENDING:
+                    original_sample.status = Sample.Status.ABORTED
+                completed_group[idx] = original_sample
+            else:
+                completed_group[idx] = result
+        group = completed_group
+        if first_error is not None:
+            raise first_error
+    finally:
+        if parent_task is not None:
+            state.group_child_tasks.pop(parent_task, None)
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and state.abort_epoch == group_abort_epoch and args.group_rm:
@@ -349,11 +672,14 @@ async def abort(
         urls = [worker["url"] for worker in response["workers"]]
 
     logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    await _abort_workers(urls)
+
+    # Some /generate calls may still be queued in the distributed HTTP
+    # actors when the first abort_all reaches SGLang. They can arrive after
+    # that abort and keep an engine busy while colocated training tries to
+    # flush/offload it. Tool and reward work may cross the boundary, but every
+    # actual SGLang request must return before training takes the GPUs.
+    await _drain_inflight_sglang_requests(state, urls)
 
     # SGLang generation requests normally return promptly after /abort_request.
     # A fully-async caller may bound this drain so a CPU/network tool can keep
@@ -379,7 +705,18 @@ async def abort(
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
-            group = task.result()
+            fallback_group = getattr(state, "pending_groups", {}).pop(task, None)
+            try:
+                group = task.result()
+            except asyncio.CancelledError:
+                group = None
+            except Exception:
+                logger.exception("Partial-rollout task failed during abort drain; recycling its last committed state")
+                group = fallback_group
+                state.handoff_failed_since_log += 1
+            group = _prepare_group_for_recycle(group)
+            if group is None:
+                continue
             for sample in group:
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
@@ -397,7 +734,10 @@ async def abort(
 
 
 async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
+    args: Namespace,
+    rollout_id: int,
+    data_source: Callable[[int], list[list[Sample]]],
+    add_samples: Callable[[list[list[Sample]]], None] | None = None,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
@@ -421,24 +761,55 @@ async def generate_rollout_async(
     )
 
     metric_gatherer = MetricGatherer()
+    if getattr(args, "partial_rollout_tool_handoff", False):
+        await _drain_deferred_tool_tasks(state, add_samples)
 
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
+    train_batch_task_quotas = _get_train_batch_task_quotas(args)
+    selected_task_counts = {task_type: 0 for task_type in train_batch_task_quotas or {}}
 
     data = []
     all_data = []
+    surplus_completed_groups = []
+    rollout_tool_metrics = {}
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
+        if getattr(args, "partial_rollout_tool_handoff", False):
+            await _drain_deferred_tool_tasks(state, add_samples)
+        deferred_group_count = (
+            len(state.deferred_tool_tasks) if getattr(args, "partial_rollout_tool_handoff", False) else 0
+        )
+        replenish_completed_groups = getattr(args, "rollout_replenish_completed_groups", False)
+        submission_target = _submission_target(
+            target_data_size,
+            args.over_sampling_batch_size,
+            deferred_group_count,
+            replenish_completed_groups,
+        )
+        while state.remaining_batch_size < submission_target:
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            submit_count = _submission_batch_size(
+                target_data_size,
+                args.over_sampling_batch_size,
+                state.remaining_batch_size,
+                deferred_group_count,
+            )
+            samples = data_source(submit_count)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            group: list[Sample] = task.result()
+            group = _consume_finished_rollout_task(
+                state,
+                task,
+                add_samples,
+                release_slot_on_completion=replenish_completed_groups,
+            )
+            if group is None:
+                continue
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
@@ -452,7 +823,17 @@ async def generate_rollout_async(
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
-                state.remaining_batch_size -= 1
+                if not replenish_completed_groups:
+                    state.remaining_batch_size -= 1
+                continue
+
+            if not _admit_group_to_train_batch(group, train_batch_task_quotas, selected_task_counts):
+                # Keep this fully completed group for a later training batch.
+                # It is returned to the data-source buffer after the current
+                # rollout closes, and terminal samples are not regenerated.
+                surplus_completed_groups.append(group)
+                if not replenish_completed_groups:
+                    state.remaining_batch_size -= 1
                 continue
 
             # add the samples to the data
@@ -460,6 +841,8 @@ async def generate_rollout_async(
             if len(data) < target_data_size:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
+            else:
+                surplus_completed_groups.append(group)
     try:
         print("record tool call counts for analysis")
         tool_time_counts = []
@@ -701,17 +1084,7 @@ async def generate_rollout_async(
                 "debug/samples_with_mismatches": samples_with_mismatches,
             })
 
-        # Use a dedicated rollout step axis to avoid conflicts with other threads logging wandb step.
-        if metrics_to_log:
-            global _wandb_metric_defined
-            if not _wandb_metric_defined:
-                wandb.define_metric("rollout/step")
-                wandb.define_metric("tool/*", step_metric="rollout/step")
-                wandb.define_metric("debug/*", step_metric="rollout/step")
-                _wandb_metric_defined = True
-
-            metrics_to_log["rollout/step"] = rollout_id
-            wandb.log(metrics_to_log)
+        rollout_tool_metrics = metrics_to_log
     except Exception:
         logger.warning("Failed to compute/record tool metrics", exc_info=True)
 
@@ -721,8 +1094,21 @@ async def generate_rollout_async(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
     )
 
-    # there are still some unfinished requests, abort them
-    aborted_samples = await abort(args, rollout_id)
+    # There can still be unfinished over-sampled requests. In opt-in tool
+    # handoff mode, bound the abort drain: SGLang requests return promptly,
+    # while groups currently inside CPU/network tools remain on this event
+    # loop and are recycled after the tool observation has been committed.
+    tool_handoff_enabled = getattr(args, "partial_rollout_tool_handoff", False)
+    aborted_samples = await abort(
+        args,
+        rollout_id,
+        drain_timeout=PARTIAL_ROLLOUT_TOOL_HANDOFF_DRAIN_TIMEOUT if tool_handoff_enabled else None,
+    )
+    if tool_handoff_enabled:
+        deferred_groups, promptly_recycled_groups = await _handoff_pending_tool_tasks(state, rollout_id)
+        aborted_samples.extend(promptly_recycled_groups)
+    else:
+        deferred_groups = 0
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
@@ -731,6 +1117,18 @@ async def generate_rollout_async(
     )
 
     # reset the global state to prevent effects on the next rollout or eval.
+    aborted_samples.extend(surplus_completed_groups)
+    if train_batch_task_quotas is not None:
+        logger.info(
+            "Balanced training batch collected: %s; deferred %d completed groups to the buffer",
+            selected_task_counts,
+            len(surplus_completed_groups),
+        )
+    rollout_metrics = metric_gatherer.collect()
+    rollout_metrics.update(rollout_tool_metrics)
+    if tool_handoff_enabled:
+        rollout_metrics.update(_collect_tool_handoff_metrics(state, deferred_groups))
+
     state.reset()
     if args.rollout_sample_filter_path is not None:
         filter_func = load_function(args.rollout_sample_filter_path)
@@ -741,7 +1139,7 @@ async def generate_rollout_async(
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    return RolloutFnTrainOutput(samples=data, metrics=rollout_metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
@@ -897,6 +1295,27 @@ def generate_rollout(
         output, _ = run(eval_rollout(args, rollout_id))
         return output
 
-    output, aborted_samples = run(generate_rollout_async(args, rollout_id, data_source.get_samples))
+    output, aborted_samples = run(
+        generate_rollout_async(args, rollout_id, data_source.get_samples, data_source.add_samples)
+    )
     data_source.add_samples(aborted_samples)
     return output
+
+
+async def _shutdown_deferred_tool_tasks(args: Namespace) -> None:
+    state = GenerateState(args)
+    tasks = list(state.deferred_tool_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    state.deferred_tool_tasks.clear()
+
+
+def shutdown_worker(args: Namespace, data_source: Any) -> None:
+    """Cancel deferred external tools and reap their resources on shutdown."""
+    if not getattr(args, "partial_rollout_tool_handoff", False):
+        return
+    if GenerateState not in SingletonMeta._instances:
+        return
+    run(_shutdown_deferred_tool_tasks(args))

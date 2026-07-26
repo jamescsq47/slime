@@ -22,12 +22,16 @@ python -m slime.dashboard.serve \
   --port 7788
 ```
 
-The browser polls the file-backed API every five seconds. Training processes
-never wait for dashboard writes or HTTP scraping. Collector, NVML, scraper,
-and disk failures only leave telemetry gaps.
+The browser polls the file-backed API every five seconds. The main view shows
+one lane per physical GPU with colocated rollout/train/update phase bands,
+NVML utilization, and a selectable per-engine SGLang overlay (running/queued
+requests, KV-cache token usage, cache hit rate, or generation throughput).
+Per-GPU cards and Math/QA tool-call concurrency are shown below the timeline.
+
+Training processes never wait for dashboard writes or HTTP scraping.
+Collector, NVML, scraper, and disk failures only leave telemetry gaps.
 
 This implementation is adapted from
 [`radixark/miles#1654`](https://github.com/radixark/miles/pull/1654), pinned at
 `d9189010bc3ba407cf0189389015032096a7c725`, with Slime-specific trace and
 fully-async lifecycle integration.
-

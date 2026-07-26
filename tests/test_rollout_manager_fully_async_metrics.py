@@ -244,7 +244,7 @@ def test_after_weight_update_logs_hook_metrics():
     result = module.RolloutManager.after_weight_update(fake_manager, policy_version=3)
 
     assert result is hook_result
-    assert runtime_updates == [{"current_policy_version": 3}]
+    assert runtime_updates == [{"current_policy_version": 3, "current_policy_phase": "post_update"}]
     assert hook_calls == [("after_weight_update", {"policy_version": 3})]
     assert len(log_calls) == 1
     _, metrics, step_key = log_calls[0]

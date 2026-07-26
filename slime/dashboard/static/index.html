@@ -30,19 +30,37 @@
       <section class="summary" id="summary"></section>
       <section>
         <div class="section-title">
-          <h2>GPU utilization</h2>
-          <span>NVML physical-device samples by node and GPU</span>
+          <h2>Per-GPU colocate timeline</h2>
+          <span>phase band + GPU utilization + one SGLang engine overlay per physical GPU</span>
         </div>
-        <canvas id="gpuChart" height="280" data-height="280"></canvas>
-        <div class="legend" id="gpuLegend"></div>
+        <div class="overlay-controls" id="overlayControls"></div>
+        <canvas id="fleetChart" height="600" data-height="600"></canvas>
+        <div class="legend" id="fleetLegend"></div>
       </section>
       <section>
         <div class="section-title">
-          <h2>SGLang requests</h2>
-          <span>sum across router workers for each scrape</span>
+          <h2>GPU and engine state</h2>
+          <span>latest value for every card; KV cache is SGLang token usage</span>
         </div>
-        <canvas id="requestChart" height="240" data-height="240"></canvas>
-        <div class="legend" id="requestLegend"></div>
+        <div class="gpu-cards" id="gpuCards"></div>
+      </section>
+      <section class="chart-grid">
+        <div>
+          <div class="section-title">
+            <h2>SGLang requests</h2>
+            <span>sum across all engines</span>
+          </div>
+          <canvas id="requestChart" height="240" data-height="240"></canvas>
+          <div class="legend" id="requestLegend"></div>
+        </div>
+        <div>
+          <div class="section-title">
+            <h2>Tool-call concurrency</h2>
+            <span>running Math and QA external tools</span>
+          </div>
+          <canvas id="toolChart" height="240" data-height="240"></canvas>
+          <div class="legend" id="toolLegend"></div>
+        </div>
       </section>
       <section>
         <div class="section-title">

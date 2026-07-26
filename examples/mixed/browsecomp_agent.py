@@ -31,7 +31,11 @@ import httpx
 from attempt_tracking import AttemptTracker
 from browsecomp_env import BrowseCompEnv, SearchBackendError
 from slime.dashboard.api import span as dashboard_span
-from slime.rollout.sglang_rollout import GenerateState
+from slime.rollout.sglang_rollout import (
+    GenerateState,
+    PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY,
+    track_sglang_generation,
+)
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
@@ -274,7 +278,13 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             saved_assistant_start = len(response_tokens)
         assistant_start_token_idx = int(saved_assistant_start)
         assistant_start_token_idx = min(max(assistant_start_token_idx, 0), len(response_tokens))
-        continuing_partial_assistant = True
+        continuing_partial_assistant = bool(
+            metadata.get(
+                "browsecomp_continue_partial_assistant",
+                metadata.get("stop_reason") in {"abort", "sglang_abort"},
+            )
+        )
+        resume_prefix_length = len(response_tokens)
     else:
         prompt_tokens = _encode_initial_prompt(state.tokenizer, sample.prompt)
         response_tokens: list[int] = []
@@ -287,6 +297,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
         num_turns = 0
         assistant_start_token_idx = 0
         continuing_partial_assistant = False
+        resume_prefix_length = 0
 
     env = BrowseCompEnv(question=question, label_answer=label_answer, must_search=must_search)
     if is_partial_resume:
@@ -320,6 +331,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
 
     def _finalize(status: Sample.Status, reason: str, current_turn: int) -> Sample:
         nonlocal _tool_time, _tool_token_count
+        metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
         tool_stats = dict(env.stats)
         search_calls = int(tool_stats.get("search", 0))
         open_page_calls = int(tool_stats.get("open_page", 0))
@@ -353,6 +365,10 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             tool_call_count=external_tool_calls,
             tool_time=_tool_time,
         )
+        was_partial = is_partial_resume or status == Sample.Status.ABORTED or bool(metadata.get("partial_rollout"))
+        partial_prefix_length = (
+            len(response_tokens) if status == Sample.Status.ABORTED else resume_prefix_length
+        )
         metadata.update(
             {
                 "predicted_answer": predicted_answer,
@@ -372,6 +388,11 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
                 "sample_time": sample_time,
                 "tool_time_ratio": _tool_time / sample_time if sample_time > 0 else 0.0,
                 "browsecomp_partial_rollout": status == Sample.Status.ABORTED,
+                "browsecomp_continue_partial_assistant": (
+                    status == Sample.Status.ABORTED and continuing_partial_assistant
+                ),
+                "partial_rollout": was_partial,
+                "partial_rollout_prefix_length": partial_prefix_length,
                 "browsecomp_current_turn": current_turn,
                 "browsecomp_prompt_token_count": prompt_token_count,
                 "browsecomp_loss_mask": list(sample.loss_mask),
@@ -385,6 +406,15 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
 
     try:
         for _turn in range(num_turns, max_turns):
+            committed_response_length = len(response_tokens)
+            committed_token_length = len(sample.tokens)
+            committed_loss_mask_length = len(sample.loss_mask or [])
+            committed_logprob_length = len(sample.rollout_log_probs or [])
+            committed_num_turns = num_turns
+            committed_assistant_start = assistant_start_token_idx
+            committed_continuing_partial = continuing_partial_assistant
+            committed_env_state = {}
+            _save_env_state(committed_env_state, env)
             if _crossed_weight_update_boundary():
                 stop_reason = "weight_update_boundary"
                 _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
@@ -406,23 +436,29 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
                 "generation_turn",
                 attrs={"task_type": "qa", "turn": num_turns + 1, "max_new_tokens": per_turn_max_tokens},
             ) as generation_span:
-                response_text, new_tokens, new_logprobs, finish_type = await _generate_step(
-                    url, sample.tokens, cur_sampling_params
-                )
+                with track_sglang_generation(sample):
+                    response_text, new_tokens, new_logprobs, finish_type = await _generate_step(
+                        url, sample.tokens, cur_sampling_params
+                    )
                 generation_span.update(
                     {"finish_reason": finish_type, "completion_tokens": len(new_tokens)}
                 )
 
-            # Do not start a new tool from a generation that raced with a
-            # weight update. Resume that assistant turn with a fresh prefill
-            # after the update instead.
+            # An aborted request can still return a useful assistant prefix.
+            # Preserve it before the update boundary is handled so the next
+            # attempt prefills and continues it instead of regenerating it.
             if _crossed_weight_update_boundary():
+                if finish_type == "abort":
+                    _append_tokens(sample, response_tokens, new_tokens, new_logprobs, loss_mask_value=1)
+                    if new_tokens:
+                        continuing_partial_assistant = True
                 stop_reason = "sglang_abort"
                 _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
                 break
             _append_tokens(sample, response_tokens, new_tokens, new_logprobs, loss_mask_value=1)
 
             if finish_type == "abort":
+                continuing_partial_assistant = True
                 stop_reason = "abort"
                 _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
                 break
@@ -439,25 +475,44 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             )
             _tool_start = time.monotonic()
             tool_stats_before = dict(env.stats)
-            with dashboard_span(
-                args,
-                sample,
-                "tool_call",
-                attrs={"task_type": "qa", "turn": num_turns},
-            ) as tool_span:
-                result = await env.run_action(assistant_text)
-                tool_actions = {
-                    name: int(env.stats.get(name, 0)) - int(tool_stats_before.get(name, 0))
-                    for name in ("search", "open_page")
-                }
-                tool_actions = {name: count for name, count in tool_actions.items() if count > 0}
-                tool_span.update(
-                    {
-                        "action": result.get("action", ",".join(tool_actions) or "invalid"),
-                        "tool_calls": sum(tool_actions.values()),
-                        "is_tool_call": bool(tool_actions),
+            metadata[PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY] = True
+            try:
+                with dashboard_span(
+                    args,
+                    sample,
+                    "tool_call",
+                    attrs={"task_type": "qa", "turn": num_turns},
+                ) as tool_span:
+                    result = await env.run_action(assistant_text)
+                    tool_actions = {
+                        name: int(env.stats.get(name, 0)) - int(tool_stats_before.get(name, 0))
+                        for name in ("search", "open_page")
                     }
-                )
+                    tool_actions = {name: count for name, count in tool_actions.items() if count > 0}
+                    tool_span.update(
+                        {
+                            "action": result.get("action", ",".join(tool_actions) or "invalid"),
+                            "tool_calls": sum(tool_actions.values()),
+                            "is_tool_call": bool(tool_actions),
+                        }
+                    )
+            except SearchBackendError:
+                # The assistant action was appended before the backend call.
+                # Roll it back so the recycled sample is the last fully
+                # committed conversation, not a token/text mismatch that can
+                # execute the same tool twice on resume.
+                del response_tokens[committed_response_length:]
+                del sample.tokens[committed_token_length:]
+                del sample.loss_mask[committed_loss_mask_length:]
+                del sample.rollout_log_probs[committed_logprob_length:]
+                _env_state_from_metadata(env, committed_env_state)
+                num_turns = committed_num_turns
+                assistant_start_token_idx = committed_assistant_start
+                continuing_partial_assistant = committed_continuing_partial
+                _tool_time += time.monotonic() - _tool_start
+                stop_reason = "search_backend_error"
+                _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
+                break
             _tool_time += time.monotonic() - _tool_start
             if result.get("action") == "finish":
                 stop_reason = "finish"
@@ -482,10 +537,12 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any], e
             _append_tokens(sample, response_tokens, obs_tokens, [0.0] * len(obs_tokens), loss_mask_value=0)
             _tool_token_count += len(obs_tokens)
             continuing_partial_assistant = False
+            assistant_start_token_idx = len(response_tokens)
             if _crossed_weight_update_boundary():
                 stop_reason = "tool_completed_after_weight_update"
                 _finalize(Sample.Status.ABORTED, stop_reason, num_turns)
                 break
+            metadata.pop(PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
         else:
             _finalize(Sample.Status.COMPLETED, stop_reason, num_turns)
     except SearchBackendError:

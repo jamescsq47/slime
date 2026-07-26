@@ -69,10 +69,12 @@ def test_qa_tool_crossing_weight_update_commits_observation_then_refills(monkeyp
 
         async def run_action(self, assistant_text):
             if self.stats["search"] == 0:
+                assert sample.metadata[browsecomp_agent.PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY]
                 self.stats["search"] += 1
                 state.abort_epoch += 1
                 state.aborted = True
                 return {"action": "search", "observation": "search result"}
+            assert "search action" not in assistant_text
             self.stats["finish"] += 1
             self.is_finish = True
             self.predicted_answer = ("answer", "reason", "certain")
@@ -117,6 +119,7 @@ def test_qa_tool_crossing_weight_update_commits_observation_then_refills(monkeyp
     assert partial.metadata["stop_reason"] == "tool_completed_after_weight_update"
     assert "search result" in partial.response
     assert partial.metadata["search_call_count"] == 1
+    assert browsecomp_agent.PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY not in partial.metadata
     tokens_before_resume = list(partial.tokens)
 
     state.aborted = False
@@ -126,3 +129,91 @@ def test_qa_tool_crossing_weight_update_commits_observation_then_refills(monkeyp
     assert completed.status == Sample.Status.COMPLETED
     assert completed.metadata["finish_call_count"] == 1
     assert generation_inputs[1] == tokens_before_resume
+
+
+def test_qa_aborted_assistant_prefix_is_preserved_across_weight_update(monkeypatch):
+    state = SimpleNamespace(tokenizer=CharTokenizer(), aborted=False, abort_epoch=0)
+    generation_inputs = []
+    action_inputs = []
+    prefix = '{"search_query": [{"q": "partial'
+    suffix = ' query"}]}'
+
+    class FakeEnv:
+        def __init__(self, question, label_answer, must_search):
+            self.question = question
+            self.label_answer = label_answer
+            self.must_search = must_search
+            self.donotgiveup = False
+            self.visited_pages = set()
+            self.is_finish = False
+            self.predicted_answer = None
+            self.stats = Counter()
+
+        async def run_action(self, assistant_text):
+            action_inputs.append(assistant_text)
+            self.stats["finish"] += 1
+            self.is_finish = True
+            self.predicted_answer = ("answer", "reason", "certain")
+            return {"action": "finish", "observation": ""}
+
+        async def close(self):
+            pass
+
+    async def fake_generate_step(url, tokens, sampling_params):
+        generation_inputs.append(list(tokens))
+        if len(generation_inputs) == 1:
+            state.abort_epoch += 1
+            state.aborted = True
+            text, finish_type = prefix, "abort"
+        else:
+            text, finish_type = suffix, "stop"
+        new_tokens = state.tokenizer.encode(text)
+        return text, new_tokens, [-0.5] * len(new_tokens), finish_type
+
+    monkeypatch.setattr(browsecomp_agent, "GenerateState", lambda args: state)
+    monkeypatch.setattr(browsecomp_agent, "BrowseCompEnv", FakeEnv)
+    monkeypatch.setattr(browsecomp_agent, "_generate_step", fake_generate_step)
+    monkeypatch.setattr(browsecomp_agent, "dashboard_span", fake_dashboard_span)
+
+    args = SimpleNamespace(
+        partial_rollout=True,
+        mask_offpolicy_in_partial_rollout=False,
+        mask_offpolicy_math=None,
+        mask_offpolicy_qa=None,
+        max_seq_len=4096,
+        sglang_context_length=4096,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        current_policy_version=0,
+        current_rollout_id=0,
+        use_slime_dashboard=True,
+    )
+    sample = Sample(
+        prompt="question",
+        label="answer",
+        metadata={"question": "question", "answer": "answer", "task_type": "qa", "policy_version": 0},
+    )
+
+    partial = asyncio.run(browsecomp_agent.generate(args, sample, {"max_new_tokens": 128}))
+
+    assert partial.status == Sample.Status.ABORTED
+    assert partial.response.endswith(prefix)
+    assert partial.metadata["browsecomp_continue_partial_assistant"] is True
+    assert action_inputs == []
+    saved_tokens = list(partial.tokens)
+    saved_logprobs = list(partial.rollout_log_probs)
+
+    state.aborted = False
+    args.current_policy_version = 1
+    completed = asyncio.run(browsecomp_agent.generate(args, partial, {"max_new_tokens": 128}))
+
+    assert completed.status == Sample.Status.COMPLETED
+    assert generation_inputs[1] == saved_tokens
+    assert completed.rollout_log_probs[: len(saved_logprobs)] == saved_logprobs
+    assert action_inputs == [prefix + suffix]
+    assert completed.partial_resume_count == 1
+    assert completed.restart_count == 0
+    prompt_token_count = completed.metadata["browsecomp_prompt_token_count"]
+    assert completed.tokens[prompt_token_count:] == state.tokenizer.encode(completed.response)
+    assert len(completed.loss_mask) == completed.response_length
+    assert len(completed.rollout_log_probs) == completed.response_length

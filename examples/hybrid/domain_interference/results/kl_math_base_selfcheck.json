@@ -1,0 +1,68 @@
+{
+  "reference": "/workspace/Qwen3-8B",
+  "candidate": "/workspace/Qwen3-8B",
+  "data": "/workspace/data/dapo-math-17k/qwen3_8b_correct_rollouts/qwen3_8b_dapo_math_correct_sft.jsonl",
+  "domain": "math",
+  "seed": 20260724,
+  "max_length": 512,
+  "summary": {
+    "samples": 4,
+    "tokens": 1364,
+    "forward_kl": 0.0,
+    "reverse_kl": 0.0,
+    "ref_nll": 0.8999106474766982,
+    "cand_nll": 0.8999106474766982,
+    "sample_forward_kl_p50": 0.0,
+    "sample_forward_kl_p90": 0.0
+  },
+  "samples": [
+    {
+      "tokens": 294,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "ref_nll": 1.1108104209510647,
+      "cand_nll": 1.1108104209510647,
+      "forward_kl_p50": 0.0,
+      "forward_kl_p90": 0.0,
+      "forward_kl_p99": 0.0,
+      "index": 0,
+      "sequence_tokens": 512
+    },
+    {
+      "tokens": 368,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "ref_nll": 0.674132288798042,
+      "cand_nll": 0.674132288798042,
+      "forward_kl_p50": 0.0,
+      "forward_kl_p90": 0.0,
+      "forward_kl_p99": 0.0,
+      "index": 1,
+      "sequence_tokens": 512
+    },
+    {
+      "tokens": 334,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "ref_nll": 1.1702068722890522,
+      "cand_nll": 1.1702068722890522,
+      "forward_kl_p50": 0.0,
+      "forward_kl_p90": 0.0,
+      "forward_kl_p99": 0.0,
+      "index": 2,
+      "sequence_tokens": 512
+    },
+    {
+      "tokens": 368,
+      "forward_kl": 0.0,
+      "reverse_kl": 0.0,
+      "ref_nll": 0.7118752222184254,
+      "cand_nll": 0.7118752222184254,
+      "forward_kl_p50": 0.0,
+      "forward_kl_p90": 0.0,
+      "forward_kl_p99": 0.0,
+      "index": 3,
+      "sequence_tokens": 512
+    }
+  ]
+}

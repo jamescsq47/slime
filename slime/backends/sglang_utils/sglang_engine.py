@@ -292,6 +292,10 @@ class SGLangEngine(RayActor):
                 response = requests.get(f"http://{self.server_host}:{self.server_port}/flush_cache")
                 if response.status_code == 200:
                     break
+                # A 400 response means SGLang still has a running or queued
+                # request. Do not burn all 60 retries in a tight loop; give
+                # the just-aborted request time to leave the scheduler.
+                time.sleep(1)
             except NewConnectionError as e:
                 raise e
             except Exception as e:
