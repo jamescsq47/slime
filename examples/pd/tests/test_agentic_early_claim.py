@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+import time
+
+from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
+from sglang.srt.disaggregation.agentic_kv_lifecycle import (
+    RequestGeneration,
+    SnapshotManifest,
+    SnapshotState,
+)
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
+
+from late_binding_router import LateBindingMiniLoadBalancer
+
+
+def _directory():
+    return tempfile.mkdtemp(prefix="sglang-agentic-early-claim-", dir="/dev/shm")
+
+
+def test_router_publishes_parent_arrival_before_scheduler_dispatch():
+    directory = _directory()
+    try:
+        router = LateBindingMiniLoadBalancer.__new__(LateBindingMiniLoadBalancer)
+        router.early_claim_store = AgenticEarlyClaimStore(directory)
+        request = {
+            "sampling_params": {
+                "custom_params": {
+                    "agentic_request_id": "trajectory-a",
+                    "agentic_generation": 2,
+                    "agentic_parent_generation": 1,
+                }
+            }
+        }
+        router._publish_parent_arrival(request)
+        parent = RequestGeneration("trajectory-a", 1)
+        marker = router.early_claim_store.read_arrival(
+            parent, not_before=0.0, max_age_seconds=5.0
+        )
+        assert marker is not None
+        assert marker["snapshot_id"] == "trajectory-a:1"
+        assert marker["request_id"] == "trajectory-a"
+        assert marker["generation"] == 1
+        arrivals = router.early_claim_store.iter_arrivals(max_age_seconds=5.0)
+        assert [(item.snapshot_id, payload["kind"]) for item, payload in arrivals] == [
+            ("trajectory-a:1", "arrival")
+        ]
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_decode_observes_arrival_then_removes_marker_without_credit_ledger():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        request = RequestGeneration("trajectory-b", 0)
+        manifest = SnapshotManifest(
+            request=request,
+            page_keys=(),
+            token_count=8192,
+            byte_size=0,
+            state=SnapshotState.DIRECT_READY,
+            token_digest="digest",
+            direct_bootstrap_addr="127.0.0.1:1",
+            direct_room=7,
+        )
+        store.publish_arrival(request)
+        manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+        manager.agentic_early_claim_store = store
+        manager.agentic_early_claim_post_timeout = 1.0
+        manager.agentic_early_claim_poll_interval = 0.01
+        manager.agentic_fast_threshold = 1.0
+        candidate = {
+            "manifest": manifest,
+            "created_at": time.monotonic(),
+            "early_claim_next_poll_at": 0.0,
+            "fast_arrival_seen": False,
+            "fast_arrival_seen_at": None,
+        }
+        assert manager._agentic_try_early_claim(candidate, time.monotonic()) == "arrived"
+        assert candidate["fast_arrival_seen"]
+        assert not (store.directory / "credits.json").exists()
+        manager._agentic_release_early_claim(candidate, "test")
+        assert not store.marker_path(request).exists()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_decode_rejects_arrival_outside_fast_tool_window():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        request = RequestGeneration("trajectory-late", 0)
+        manifest = SnapshotManifest(
+            request=request,
+            page_keys=(),
+            token_count=4096,
+            byte_size=0,
+            state=SnapshotState.DIRECT_READY,
+            token_digest="digest",
+            direct_bootstrap_addr="127.0.0.1:1",
+            direct_room=8,
+            created_at=time.time() - 3.0,
+        )
+        store.publish_arrival(request)
+        manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+        manager.agentic_early_claim_store = store
+        manager.agentic_early_claim_post_timeout = 2.0
+        manager.agentic_early_claim_poll_interval = 0.01
+        manager.agentic_fast_threshold = 2.0
+        candidate = {
+            "manifest": manifest,
+            "created_at": time.monotonic() - 3.0,
+            "early_claim_next_poll_at": 0.0,
+            "fast_arrival_seen": False,
+            "fast_arrival_seen_at": None,
+        }
+        assert manager._agentic_try_early_claim(candidate, time.monotonic()) == "absent"
+        assert not candidate["fast_arrival_seen"]
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_application_final_confirmation_is_generation_scoped():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        current = RequestGeneration("trajectory-final", 2)
+        previous = RequestGeneration("trajectory-final", 1)
+        published = store.publish_final(current)
+        assert published["kind"] == "final"
+        assert store.read_final(
+            current, not_before=0.0, max_age_seconds=5.0
+        ) is not None
+        assert store.read_final(
+            previous, not_before=0.0, max_age_seconds=5.0
+        ) is None
+        store.remove_final(current)
+        assert not store.final_path(current).exists()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_valid_tool_confirmation_is_generation_scoped():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        current = RequestGeneration("trajectory-tool", 2)
+        previous = RequestGeneration("trajectory-tool", 1)
+        published = store.publish_tool(current)
+        assert published["kind"] == "tool"
+        assert store.read_tool(
+            current, not_before=0.0, max_age_seconds=5.0
+        ) is not None
+        assert store.read_tool(
+            previous, not_before=0.0, max_age_seconds=5.0
+        ) is None
+        store.remove_tool(current)
+        assert not store.tool_path(current).exists()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)

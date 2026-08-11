@@ -1,0 +1,231 @@
+--- a/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -461,11 +461,13 @@
+ 
+             req.check_finished(new_accepted_len)
+ 
+-            if (
+-                self.server_args.disaggregation_decode_enable_offload_kvcache
+-                and not req.finished()
+-            ):
+-                self.decode_offload_manager.offload_kv_cache(req)
++            # Keep the complete KV history resident while full-attention decode
++            # is still running. DecodeKVCacheOffloadManager frees page-aligned
++            # device slots after an asynchronous backup; calling it here for an
++            # unfinished request makes the next decode step consume freed (and
++            # potentially reused) KV slots. Persist the generated KV only from
++            # the finished-request branch below, where releasing device slots is
++            # safe and the stored prefix can be reused by the next agent turn.
+ 
+             if req.finished():
+                 # delete feature to save memory
+@@ -473,16 +475,23 @@
+                     req.multimodal_inputs.release_features()
+                 self.maybe_collect_routed_experts(req)
+ 
++                response_ready = True
+                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+-                    if not self.decode_offload_manager.offload_kv_cache(req):
++                    if self.decode_offload_manager.offload_kv_cache(req):
++                        # Do not block the scheduler on Device->Host->storage.
++                        # stream_output_generation gates this request until the
++                        # manager observes the durable-storage ACK.
++                        response_ready = False
++                    else:
+                         self.decode_offload_manager.finalize_release_on_finish(req)
+                 else:
+                     if self.enable_hisparse:
+                         self.hisparse_coordinator.request_finished(req)
+                     release_kv_cache(req, self.tree_cache)
+ 
+-                req.time_stats.set_completion_time()
++                if response_ready:
++                    req.time_stats.set_completion_time()
+ 
+             self.maybe_collect_customized_info(i, req, logits_output)
+ 
+@@ -984,6 +993,12 @@
+             if req is skip_req:
+                 continue
+ 
++            if (
++                self.decode_offload_manager is not None
++                and self.decode_offload_manager.is_response_pending(req.rid)
++            ):
++                continue
++
+             if req.finished():
+                 if req.finished_output:
+                     # With the overlap schedule, a request will try to output twice and hit this line twice
+--- a/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
++++ b/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
+@@ -104,6 +104,13 @@
+         self.ongoing_offload = {}
+         self.ongoing_backup = {}
+         self.offloaded_state = {}
++        # Finished requests whose final response must not be exposed until the
++        # generated KV is durable in external storage.  Keeping this gate in
++        # the manager lets the scheduler continue submitting decode batches
++        # while Device->Host->storage progresses asynchronously.
++        self.pending_responses = {}
++        self.ready_responses = []
++        self.response_backup_timeout = 120.0
+         logger.info("Enable offload kv cache for decode side")
+ 
+     def offload_kv_cache(self, req) -> bool:
+@@ -176,6 +183,8 @@
+             start,
+             end,
+         )
++        if req.finished():
++            self.pending_responses[req.rid] = (req, time.monotonic())
+         state.inc_len += incremental_aligned_len
+         return True
+ 
+@@ -199,6 +208,26 @@
+         self._check_offload_progress(n_write)
+         self._check_backup_progress(n_backup)
+ 
++        now = time.monotonic()
++        timed_out = [
++            req_id
++            for req_id, (_, started_at) in self.pending_responses.items()
++            if now - started_at >= self.response_backup_timeout
++        ]
++        if timed_out:
++            raise TimeoutError(
++                "Timed out waiting for Decode KV backup for requests "
++                + ", ".join(timed_out[:8])
++            )
++
++    def is_response_pending(self, req_id: str) -> bool:
++        return req_id in self.pending_responses
++
++    def pop_ready_responses(self):
++        ready = self.ready_responses
++        self.ready_responses = []
++        return ready
++
+     def _check_offload_progress(self, finish_count):
+         """Check the progress of offload from device to host."""
+         while finish_count > 0:
+@@ -214,6 +243,11 @@
+                     end,
+                 ) = self.ongoing_offload.pop(ack_id)
+ 
++                prior_hash = (
++                    self.offloaded_state[req.rid].last_hash
++                    if req.rid in self.offloaded_state
++                    else None
++                )
+                 if req.finished():
+                     self._release_finished_req(req, start)
+                 else:
+@@ -222,11 +256,6 @@
+                     ]
+                     self.token_to_kv_pool_allocator.free(kv_indices)
+ 
+-                prior_hash = (
+-                    self.offloaded_state[req.rid].last_hash
+-                    if req.rid in self.offloaded_state
+-                    else None
+-                )
+                 last_hash = self._trigger_backup(
+                     req, host_indices, incremental_tokens, start_time, prior_hash
+                 )
+@@ -272,6 +301,10 @@
+                 f"Finished backup request {req_id}, free host memory, len:{len(host_indices)}, cost time:{time.time() - start_time:.2f} seconds."
+             )
+ 
++            pending = self.pending_responses.pop(req_id, None)
++            if pending is not None:
++                self.ready_responses.append(pending[0])
++
+     def _trigger_backup(
+         self, req, host_indices, incremental_tokens, start_time, prior_hash
+     ):
+--- a/sglang/srt/disaggregation/decode.py
++++ b/sglang/srt/disaggregation/decode.py
+@@ -21,6 +21,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import time
+ from collections import deque
+ from dataclasses import dataclass
+@@ -284,6 +285,14 @@
+         self.pp_rank = pp_rank
+         self.num_reserved_decode_tokens = num_reserved_decode_tokens
+         self.transfer_backend = transfer_backend
++        # Keep D-side KV reservation closely coupled to work that P can
++        # finish soon. Zero preserves the upstream unbounded behavior.
++        self.max_transfer_inflight = int(
++            os.environ.get("SGLANG_PD_MAX_TRANSFER_INFLIGHT", "0")
++        )
++        self.p_ready_dir = os.environ.get("SGLANG_PD_P_READY_DIR", "")
++        if self.p_ready_dir:
++            os.makedirs(self.p_ready_dir, exist_ok=True)
+         # Queue for requests pending pre-allocation
+         self.queue: List[DecodeRequest] = []
+         self.retracted_queue: List[Req] = []
+@@ -670,6 +679,12 @@
+ 
+         # Then, preallocate the remaining requests if possible
+         for i, decode_req in enumerate(self.queue):
++            if (
++                self.max_transfer_inflight > 0
++                and len(self.transfer_queue.queue) + len(preallocated_reqs)
++                >= self.max_transfer_inflight
++            ):
++                break
+             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                 continue
+ 
+@@ -679,6 +694,18 @@
+             if not decode_req.waiting_for_input:
+                 continue
+ 
++            require_p_ready = bool(
++                self.p_ready_dir
++                and decode_req.req.bootstrap_host != FAKE_BOOTSTRAP_HOST
++            )
++            if require_p_ready:
++                ready_path = os.path.join(
++                    self.p_ready_dir,
++                    f"{decode_req.req.bootstrap_room}.ready",
++                )
++                if not os.path.exists(ready_path):
++                    continue
++
+             if self.req_to_token_pool.available_size() <= 0:
+                 break
+ 
+@@ -774,6 +801,11 @@
+             decode_req.kv_receiver.send_metadata(
+                 page_indices, decode_req.metadata_buffer_index, state_indices
+             )
++            if require_p_ready:
++                try:
++                    os.unlink(ready_path)
++                except FileNotFoundError:
++                    pass
+             if (
+                 self.transfer_queue.enable_staging
+                 and decode_req.kv_receiver.require_staging
+@@ -1296,6 +1328,14 @@
+     def process_decode_queue(self: Scheduler):
+         if self.server_args.disaggregation_decode_enable_offload_kvcache:
+             self.decode_offload_manager.check_offload_progress()
++            ready_responses = self.decode_offload_manager.pop_ready_responses()
++            if ready_responses:
++                for req in ready_responses:
++                    req.time_stats.set_completion_time()
++                self.stream_output(
++                    ready_responses,
++                    any(req.return_logprob for req in ready_responses),
++                )
+ 
+         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
