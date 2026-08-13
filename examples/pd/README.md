@@ -12,6 +12,7 @@ examples/pd/
 ├── configs/                 environment and fixed workload schedules
 ├── docs/                    design and validation notes
 ├── patches/                 SGLang patch kept for reproducibility
+├── requirement.txt          PD runtime, transport and analysis dependencies
 ├── scripts/
 │   ├── baseline/            unmodified pd_baseline experiments
 │   ├── new_method/          modified pd request-generation KV experiments
@@ -121,24 +122,69 @@ The maintained formal launchers already pass their workload through
 `inference.py`; override its defaults through launcher environment variables
 or edit a copied experiment launcher when using non-default dataset paths.
 
-## Baseline environment
+## SGLang source checkouts
 
-Create the clean `pd_baseline` environment from the maintained package list:
+SGLang is maintained in a separate repository.  Keep two independent source
+checkouts so that changing the development branch cannot silently change the
+baseline environment:
+
+```bash
+export SGLANG_GIT_URL=git@github.com:jamescsq47/sglang.git
+export SGLANG_SRC_ROOT=/path/to/sglang-src
+mkdir -p "${SGLANG_SRC_ROOT}"
+
+git clone --filter=blob:none --single-branch --branch pd_baseline \
+  "${SGLANG_GIT_URL}" "${SGLANG_SRC_ROOT}/pd_baseline"
+git clone --filter=blob:none --single-branch --branch pd \
+  "${SGLANG_GIT_URL}" "${SGLANG_SRC_ROOT}/pd"
+```
+
+The branch-to-environment mapping is intentional:
+
+| Conda environment | SGLang branch | Purpose | Installation mode |
+|---|---|---|---|
+| `pd_baseline` | `pd_baseline` | Frozen clean baseline | regular, non-editable |
+| `pd` | `pd` | Stable agentic PD implementation | editable |
+| `pd` during node-local development | `pd_node_a`, `pd_node_b`, ... | Changes owned by one node | editable |
+
+To develop on another node without colliding with `pd_node_a`, create and
+publish a node-specific branch from the stable `pd` branch:
+
+```bash
+cd "${SGLANG_SRC_ROOT}/pd"
+git switch -c pd_node_b
+git push -u origin pd_node_b
+```
+
+If a node branch already exists, clone that branch instead of `pd`, or fetch
+it and run `git switch --track origin/pd_node_b` before installing.  Do not
+reuse one working tree for `pd_baseline` and `pd`: an editable installation
+would follow whichever branch that working tree currently has checked out.
+
+## Baseline environment (`pd_baseline`)
+
+Create the environment, install the frozen SGLang baseline as a normal wheel,
+then install the dependencies used by this directory:
+
+```bash
+conda create -n pd_baseline -y python=3.12 gxx_linux-64 pip
+conda activate pd_baseline
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install "${SGLANG_SRC_ROOT}/pd_baseline/python"
+python -m pip install -r "${SLIME_ROOT}/examples/pd/requirement.txt"
+```
+
+A non-editable baseline install copies SGLang into the Conda environment, so
+later edits or branch switches in a source checkout cannot contaminate a
+running baseline experiment.  The validated package versions are SGLang
+`0.5.10.post1`, SGLang Router `0.3.2`, Mooncake Transfer Engine
+`0.3.12.post1`, NIXL `1.3.2`, PyTorch `2.9.1`, and Python 3.12.
+
+Verify that the installed package contains no custom agentic modules:
 
 ```bash
 cd "${SLIME_ROOT}"
-conda env create -n pd_baseline -f examples/pd/configs/environment-pd.yml
-conda run -n pd_baseline python -m pip install -r requirements.txt gdown pyarrow
-```
-
-The validated baseline package versions are Python 3.12, SGLang
-`0.5.10.post1`, SGLang Router `0.3.2`, Mooncake Transfer Engine
-`0.3.12.post1`, NIXL `1.3.2`, and PyTorch `2.9.1`.  Verify that no custom
-agentic modules leaked into it:
-
-```bash
-conda run -n pd_baseline python \
-  examples/pd/scripts/tools/check_environments.py --expect baseline
+python examples/pd/scripts/tools/check_environments.py --expect baseline
 ```
 
 The scripts default to `/homes/siqic/anaconda3/envs/pd_baseline/bin` and
@@ -152,18 +198,46 @@ QA_DATA="${PD_DATA_ROOT}/browsecomp/bc_train.jsonl" \
 bash examples/pd/scripts/baseline/run_four_gpu_comparison_suite.sh
 ```
 
-## Modified environment
+## Modified environment (`pd`)
 
-- `pd_baseline`: clean SGLang 0.5.10.post1 baseline.
-- `pd`: modified SGLang environment containing the agentic KV lifecycle.
-- `configs/environment-pd.yml`: reproducible modified-environment package list.
+Create `pd` with the same common dependencies, but install the modified SGLang
+checkout in editable mode.  Source changes in that checkout then take effect
+without copying files into `site-packages`:
 
-The YAML recreates the common binary/package layer for both environments.  The
-new method also requires the modified SGLang sources currently installed in
-the original `pd` Conda environment.  The patch under `patches/` records only
-an earlier subset and is not yet a complete standalone installer; copying this
-directory alone is therefore sufficient for baseline experiments, but not yet
-for reproducing the complete request-generation KV pipeline on a new node.
+```bash
+conda create -n pd -y python=3.12 gxx_linux-64 pip
+conda activate pd
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e "${SGLANG_SRC_ROOT}/pd/python"
+python -m pip install -r "${SLIME_ROOT}/examples/pd/requirement.txt"
+```
+
+`requirement.txt` deliberately excludes `sglang`: the two environments need
+different source branches even though their Python package version is both
+`0.5.10.post1`.  `configs/environment-pd.yml` remains a Conda convenience
+file for the common package layer, but installing SGLang from the Git checkout
+is the authoritative way to select baseline versus modified code.
+
+To update the modified environment later:
+
+```bash
+cd "${SGLANG_SRC_ROOT}/pd"
+git pull --ff-only
+conda activate pd
+python -m pip install -e ./python
+python -m pip install -r "${SLIME_ROOT}/examples/pd/requirement.txt"
+```
+
+For the frozen baseline, do not pull a moving branch during an experiment.  If
+an intentional baseline update is required, record the commit, reinstall it,
+and rerun the environment check:
+
+```bash
+cd "${SGLANG_SRC_ROOT}/pd_baseline"
+git pull --ff-only origin pd_baseline
+conda activate pd_baseline
+python -m pip install --upgrade --force-reinstall --no-deps ./python
+```
 
 Validate without allocating GPUs:
 
@@ -173,6 +247,18 @@ conda run -n pd python \
   examples/pd/scripts/tools/check_environments.py --expect modified
 conda run -n pd_baseline python \
   examples/pd/scripts/tools/check_environments.py --expect baseline
+```
+
+Also record the source/commit before a formal run:
+
+```bash
+conda run -n pd python -c \
+  'import importlib.metadata as m, pathlib, sglang; print(m.version("sglang"), pathlib.Path(sglang.__file__).resolve())'
+git -C "${SGLANG_SRC_ROOT}/pd" rev-parse HEAD
+
+conda run -n pd_baseline python -c \
+  'import importlib.metadata as m, pathlib, sglang; print(m.version("sglang"), pathlib.Path(sglang.__file__).resolve())'
+git -C "${SGLANG_SRC_ROOT}/pd_baseline" rev-parse HEAD
 ```
 
 ## Formal experiments
