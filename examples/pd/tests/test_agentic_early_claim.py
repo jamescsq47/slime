@@ -53,6 +53,50 @@ def test_router_publishes_parent_arrival_before_scheduler_dispatch():
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def test_targeted_arrival_and_route_are_generation_scoped():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        current = RequestGeneration("trajectory-route", 2)
+        previous = RequestGeneration("trajectory-route", 1)
+
+        original_arrival = time.time() - 0.25
+        arrival = store.publish_arrival(
+            current,
+            target_prefill_domain=1,
+            arrived_at=original_arrival,
+        )
+        assert arrival["target_prefill_domain"] == 1
+        assert arrival["arrived_at"] == original_arrival
+        assert store.read_arrival(
+            current, not_before=0.0, max_age_seconds=5.0
+        )["target_prefill_domain"] == 1
+
+        published = store.publish_route(
+            current,
+            route="direct_ready",
+            prefill_domain=1,
+            snapshot_tokens=8192,
+        )
+        assert published["prefill_domain"] == 1
+        assert published["route"] == "direct_ready"
+        assert published["snapshot_tokens"] == 8192
+        assert store.read_route(current, max_age_seconds=5.0) == published
+        assert store.read_route(previous, max_age_seconds=5.0) is None
+
+        host_writing = store.publish_route(
+            current,
+            route="host_writing",
+            prefill_domain=0,
+            arena_numa_node=0,
+            snapshot_tokens=8192,
+        )
+        assert host_writing["route"] == "host_writing"
+        assert host_writing["arena_numa_node"] == 0
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def test_decode_observes_arrival_then_removes_marker_without_credit_ledger():
     directory = _directory()
     try:
@@ -161,5 +205,22 @@ def test_valid_tool_confirmation_is_generation_scoped():
         ) is None
         store.remove_tool(current)
         assert not store.tool_path(current).exists()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_generation_producer_is_single_winner_and_generation_scoped():
+    directory = _directory()
+    try:
+        first_process = AgenticEarlyClaimStore(directory)
+        second_process = AgenticEarlyClaimStore(directory)
+        generation_zero = RequestGeneration("trajectory-producer", 0)
+        generation_one = RequestGeneration("trajectory-producer", 1)
+
+        assert first_process.claim_generation_producer(generation_zero)
+        assert not second_process.claim_generation_producer(generation_zero)
+        assert second_process.claim_generation_producer(generation_one)
+        assert first_process.producer_path(generation_zero).exists()
+        assert second_process.producer_path(generation_one).exists()
     finally:
         shutil.rmtree(directory, ignore_errors=True)

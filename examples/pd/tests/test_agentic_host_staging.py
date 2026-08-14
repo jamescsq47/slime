@@ -580,6 +580,7 @@ class _TraceEvent:
         self.trace.append("h2d_complete")
 
 
+
 class _TraceHostPool:
     def __init__(self, trace):
         self.trace = trace
@@ -685,6 +686,70 @@ def test_p_host_h2d_admission_is_serialized():
     assert manager.gate_request(req, RequestGeneration("next", 0)) is True
 
 
+def test_host_ready_defers_cuda_materialization_until_request_selection():
+    class LazySnapshot:
+        def materialize(self):
+            raise AssertionError("HOST_READY must not eagerly register P Host memory")
+
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.host_ready = {}
+    manager.aborting = {}
+    manager.active = {
+        "req:0": {
+            "offer": _offer(),
+            "snapshot": LazySnapshot(),
+        }
+    }
+    manager.ledger = types.SimpleNamespace()
+
+    manager._poll_active(
+        {"req:0": {"state": HostStageState.HOST_READY.value}}
+    )
+
+    assert manager.active == {}
+    assert manager.host_ready["req:0"]["snapshot"].__class__ is LazySnapshot
+    assert manager.host_ready["req:0"]["ready_at"] > 0
+
+
+def test_selected_slow_recovery_maps_pageable_extent_once_before_h2d_admission():
+    trace = []
+
+    class LazySnapshot:
+        _materialized = None
+
+        def materialize(self):
+            trace.append("materialize")
+            self._materialized = object()
+            return self
+
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.host_ready = {
+        "next:0": {
+            "offer": _offer("next:0"),
+            "snapshot": LazySnapshot(),
+            "loading": False,
+        }
+    }
+    manager.loads = {}
+    manager.max_h2d_inflight = 1
+    manager._ledger_entries_cache = {
+        "next:0": {"state": HostStageState.HOST_READY.value}
+    }
+    req = types.SimpleNamespace(rid="next")
+
+    assert manager.gate_request(req, RequestGeneration("next", 0)) is True
+    assert trace == ["materialize"]
+    assert manager.host_ready["next:0"]["loading"] is False
+
+    # An occupied H2D slot leaves the request queued without mapping again.
+    manager.loads = {"busy": {"event": object()}}
+    assert manager.gate_request(req, RequestGeneration("next", 0)) is True
+    assert trace == ["materialize"]
+    assert manager.host_ready["next:0"]["loading"] is False
+
+
 def test_spill_does_not_free_host_before_mooncake_commit_result():
     ledger, path = _ledger()
     try:
@@ -746,6 +811,13 @@ def _spill_manager(trace, *, put_succeeds=True):
             trace.append(f"manifest:{manifest.state.value}")
             self.current = manifest
 
+        def continue_slow_publish(self, manifest):
+            self.update(manifest)
+
+        def rollback_slow_publish(self, offloading, fallback_manifest):
+            assert self.current is offloading
+            self.update(fallback_manifest)
+
         def commit_publish(self, request):
             trace.append("publish")
             self.current = self.current.transition(SnapshotState.MOONCAKE_READY)
@@ -788,6 +860,7 @@ def _spill_manager(trace, *, put_succeeds=True):
     record = {
         "offer": _offer(),
         "snapshot": types.SimpleNamespace(
+            materialize=lambda: None,
             copy_into_hicache=lambda pool, indices, page_size: trace.append("host_copy")
         ),
     }

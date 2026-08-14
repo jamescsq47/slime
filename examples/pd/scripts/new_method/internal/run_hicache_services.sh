@@ -23,10 +23,13 @@ MOONCAKE_LOCAL_HOSTNAME="${MOONCAKE_LOCAL_HOSTNAME:-$(hostname -I | awk '{print 
 PD_HICACHE_PREFETCH_THRESHOLD="${PD_HICACHE_PREFETCH_THRESHOLD:-64}"
 PD_HICACHE_PREFETCH_TIMEOUT_BASE="${PD_HICACHE_PREFETCH_TIMEOUT_BASE:-5}"
 PD_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN="${PD_HICACHE_PREFETCH_TIMEOUT_PER_KI_TOKEN:-0.5}"
-SGLANG_SCHEDULER_OUTPUT="${PD_ENV_BIN%/bin}/lib/python3.12/site-packages/sglang/srt/managers/scheduler_output_processor_mixin.py"
-
-SGLANG_DECODE_OFFLOAD="${PD_ENV_BIN%/bin}/lib/python3.12/site-packages/sglang/srt/disaggregation/decode_kvcache_offload_manager.py"
-SGLANG_DECODE_MIXIN="${PD_ENV_BIN%/bin}/lib/python3.12/site-packages/sglang/srt/disaggregation/decode.py"
+# Resolve the imported package instead of assuming a site-packages layout.
+# The pd environment may intentionally use an editable sglang-agentic checkout.
+SGLANG_PACKAGE_ROOT="$("${PD_ENV_BIN}/python" -c \
+  'from pathlib import Path; import sglang; print(Path(sglang.__file__).resolve().parent)')"
+SGLANG_SCHEDULER_OUTPUT="${SGLANG_PACKAGE_ROOT}/srt/managers/scheduler_output_processor_mixin.py"
+SGLANG_DECODE_OFFLOAD="${SGLANG_PACKAGE_ROOT}/srt/disaggregation/decode_kvcache_offload_manager.py"
+SGLANG_DECODE_MIXIN="${SGLANG_PACKAGE_ROOT}/srt/disaggregation/decode.py"
 if ! grep -q "Keep the complete KV history resident" "${SGLANG_SCHEDULER_OUTPUT}" \
   || ! grep -q "pending_responses" "${SGLANG_DECODE_OFFLOAD}" \
   || ! grep -q "pop_ready_responses" "${SGLANG_DECODE_MIXIN}"; then

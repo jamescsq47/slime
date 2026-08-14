@@ -216,6 +216,10 @@ cleanup() {
   for ((index=${#pids[@]} - 1; index >= 0; index--)); do
     pid="${pids[index]}"
     kill -TERM -- "-${pid}" 2>/dev/null || true
+    # Some Python entrypoints call setsid/daemonize internally after the shell
+    # records their launcher PID.  Signal the exact leader as well as the
+    # original process group so a reparented Router cannot survive cleanup.
+    kill -TERM "${pid}" 2>/dev/null || true
   done
   while (( SECONDS < deadline )); do
     alive=0
@@ -235,6 +239,7 @@ cleanup() {
       ps -eo pid=,ppid=,pgid=,stat=,wchan:32=,cmd= \
         | awk -v target="${pid}" '$3 == target { print }' >&2 || true
       kill -KILL -- "-${pid}" 2>/dev/null || true
+      kill -KILL "${pid}" 2>/dev/null || true
     fi
   done
   deadline=$((SECONDS + kill_wait_seconds))
@@ -259,6 +264,7 @@ cleanup() {
       if process_group_has_live_members "${pid}"; then
         alive=1
         kill -KILL -- "-${pid}" 2>/dev/null || true
+        kill -KILL "${pid}" 2>/dev/null || true
         # `pid=` is the thread-group ID even under `ps -L`.  Use `lwp=` so a
         # scheduler whose leader is already a zombie but whose CUDA worker
         # thread is still alive is explicitly signalled as well.  This exact
@@ -444,6 +450,7 @@ for index in "${!prefill_gpus[@]}"; do
     prefill_launch+=(numactl --cpunodebind="${prefill_numa}" --membind="${prefill_numa}")
   fi
   "${prefill_launch[@]}" env CUDA_VISIBLE_DEVICES="${prefill_gpus[$index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+    SGLANG_AGENTIC_KV_PREFILL_DOMAIN="${index}" \
     SGLANG_AGENTIC_KV_ARENA_NUMA_NODE="${prefill_numa}" \
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}/p-${index}-numa-${prefill_numa}" \
     SGLANG_PD_P_READY_DIR="${PD_P_READY_DIR}" \
@@ -476,6 +483,7 @@ for index in "${!decode_gpus[@]}"; do
   domain="$((index / (${#decode_gpus[@]} / ${#prefill_gpus[@]})))"
   arena_numa="${prefill_numas[$domain]}"
   "${decode_launch[@]}" env CUDA_VISIBLE_DEVICES="${decode_gpus[$index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+    SGLANG_AGENTIC_KV_PREFILL_DOMAIN="${domain}" \
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT="${agentic_direct_ports[$index]}" \
     SGLANG_AGENTIC_KV_RELAY_ID="decode-${index}-gpu-${decode_gpus[$index]}" \
     SGLANG_AGENTIC_KV_GPU_NUMA_NODE="${decode_numa}" \
@@ -621,6 +629,7 @@ for rate in "${rates[@]}"; do
     --math-data "${MATH_DATA}" \
     --qa-data "${QA_DATA}" \
     --router-port "${ROUTER_PORT}" \
+    --router-request-timeout-seconds "${ROUTER_REQUEST_TIMEOUT_SECONDS:-3600}" \
     --prefill-port "${prefill_ports[0]}" \
     --prefill-ports "${prefill_ports_csv}" \
     --decode-port "${DECODE_PORT}" \
