@@ -35,6 +35,15 @@ DUMMY_MESSAGES = [
 ]
 
 
+def _return_logprob() -> bool:
+    return os.getenv("PD_INFERENCE_RETURN_LOGPROB", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+
+
 def _render(tokenizer, messages: list[dict[str, Any]], *, generation: bool) -> str:
     kwargs: dict[str, Any] = {}
     value = os.getenv("BROWSECOMP_ENABLE_THINKING")
@@ -98,15 +107,19 @@ async def _generate_turn(
     payload: dict[str, Any] = {
         "input_ids": input_ids,
         "sampling_params": params,
-        "return_logprob": True,
+        "return_logprob": _return_logprob(),
     }
     if request_id is not None:
         payload["extra_key"] = build_agentic_extra_key(request_id, params)
     output = await post(url, payload)
     meta = output["meta_info"]
-    token_logprobs = meta.get("output_token_logprobs") or []
-    tokens = [int(item[1]) for item in token_logprobs]
-    logprobs = [float(item[0]) for item in token_logprobs]
+    if _return_logprob():
+        token_logprobs = meta.get("output_token_logprobs") or []
+        tokens = [int(item[1]) for item in token_logprobs]
+        logprobs = [float(item[0]) for item in token_logprobs]
+    else:
+        tokens = [int(item) for item in output.get("output_ids") or []]
+        logprobs = []
     return (
         output.get("text", ""),
         tokens,

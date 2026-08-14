@@ -31,7 +31,10 @@ fi
 
 cleanup_ready_dir() {
   if (( created_ready_dir == 1 )) && [[ -d "${PD_P_READY_DIR}" ]]; then
-    find "${PD_P_READY_DIR}" -mindepth 1 -maxdepth 1 -type f -delete
+    # Early-claim markers live in nested arrivals/routes/finals directories.
+    # Remove the complete per-run mktemp tree after every owned service group
+    # has exited; a maxdepth=1 cleanup leaves thousands of stale markers.
+    find "${PD_P_READY_DIR}" -mindepth 1 -depth -delete
     rmdir "${PD_P_READY_DIR}" 2>/dev/null || true
   fi
   if (( created_ledger == 1 )); then
@@ -106,15 +109,17 @@ export SGLANG_AGENTIC_KV_EARLY_CLAIM_POST_TIMEOUT="${SGLANG_AGENTIC_KV_EARLY_CLA
 export SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK="${SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK:-0.85}"
 export SGLANG_AGENTIC_KV_DIRECT_MANIFEST_POLL_INTERVAL="${SGLANG_AGENTIC_KV_DIRECT_MANIFEST_POLL_INTERVAL:-0.10}"
 export SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT="${SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT:-8}"
-# Keep ordinary P compute-ahead shallow: four completed requests per D and at
-# most one quarter of the P KV pool.  These are soft limits for *new* work;
-# Direct/slow parent turns remain eligible so accepting D->P KV can drain D.
-export SGLANG_PD_P_READY_REQUEST_CAP="${SGLANG_PD_P_READY_REQUEST_CAP:-$((decode_writers * 4))}"
-export SGLANG_PD_P_READY_TOKEN_CAP_FRACTION="${SGLANG_PD_P_READY_TOKEN_CAP_FRACTION:-0.25}"
+# Do not impose an artificial request/token credit on Prefill.  Native SGLang
+# admission remains the final HBM-safety boundary, while the waiting queue
+# still preserves Direct > slow recovery > new priority.  Experiments can
+# explicitly restore continuous/hysteresis backpressure through the env var.
+export SGLANG_PD_P_READY_BACKPRESSURE_MODE="${SGLANG_PD_P_READY_BACKPRESSURE_MODE:-disabled}"
+export SGLANG_PD_P_READY_REQUEST_CAP="${SGLANG_PD_P_READY_REQUEST_CAP:-0}"
 # Direct receives use independent, exact-size page allocations.  They outrank
 # slow recovery and new Prefill; eight concurrent rooms absorb short bursts
 # without reserving a permanent HBM buffer.
 export SGLANG_AGENTIC_KV_DIRECT_IO_CAP="${SGLANG_AGENTIC_KV_DIRECT_IO_CAP:-8}"
+export SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS="${SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS:-40000}"
 export SGLANG_PD_DECODE_ENABLE_RADIX_CACHE="${SGLANG_PD_DECODE_ENABLE_RADIX_CACHE:-true}"
 # Bound slow-path pressure on Decode.  Only one gather+D2H chunk is submitted
 # at a time on each D; the background worker returns to Decode before issuing

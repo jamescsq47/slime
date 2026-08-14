@@ -9,13 +9,18 @@ import torch
 
 import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     RequestGeneration,
     SnapshotManifest,
     SnapshotState,
     token_ids_digest,
 )
-from sglang.srt.managers.scheduler import AgenticEarlyDirectReceive, Scheduler
+from sglang.srt.managers.scheduler import (
+    AgenticDirectPageCreditPool,
+    AgenticEarlyDirectReceive,
+    Scheduler,
+)
 
 
 class _Req:
@@ -23,6 +28,70 @@ class _Req:
         self.rid = rid
         if queue_class is not None:
             self._agentic_kv_queue_class = queue_class
+
+
+def test_direct_page_credit_reserves_and_recycles_by_tokens():
+    class Allocator:
+        def __init__(self):
+            self.freed = []
+
+        def alloc(self, count):
+            return torch.arange(64, 64 + count, dtype=torch.int64)
+
+        def free(self, indices):
+            self.freed.append(indices.clone())
+
+    allocator = Allocator()
+    pool = AgenticDirectPageCreditPool(
+        allocator, capacity_tokens=256, page_size=64
+    )
+    first = pool.allocate(128)
+    second = pool.allocate(64)
+    assert first is not None and second is not None
+    assert pool.free_tokens == 64
+    assert first.page_indices.tolist() == [1, 2]
+    assert pool.device_view(first).tolist() == list(range(64, 192))
+
+    pool.release(first)
+    replacement = pool.allocate(128)
+    assert replacement is not None
+    assert replacement.page_indices.tolist() == [1, 2]
+    assert allocator.freed == []
+
+    pool.mark_bound(replacement)
+    assert pool.unaccounted_tokens == 128
+    reclaimed = pool.reclaim_node_indices(pool.device_view(replacement), allocator)
+    assert reclaimed == 128
+    assert pool.free_tokens == 192
+    assert pool.unaccounted_tokens == 256
+
+
+def test_direct_page_credit_promotes_received_pages_without_copying_kv():
+    class Allocator:
+        def alloc(self, count):
+            return torch.arange(64, 64 + count, dtype=torch.int64)
+
+        def free(self, indices):
+            raise AssertionError("promotion must not free received KV")
+
+    pool = AgenticDirectPageCreditPool(
+        Allocator(), capacity_tokens=256, page_size=64
+    )
+    allocation = pool.allocate(128)
+    assert allocation is not None
+    received_pages = pool.device_view(allocation).clone()
+    ordinary_empty_pages = torch.arange(1024, 1152, dtype=torch.int64)
+
+    pool.promote_to_ordinary(allocation, ordinary_empty_pages)
+
+    # The Radix-owned received pages keep their original ids while the same
+    # two transit slots are immediately reusable with fresh backing pages.
+    assert received_pages.tolist() == list(range(64, 192))
+    assert pool.free_tokens == 256
+    reused = pool.allocate(128)
+    assert reused is not None
+    assert reused.page_indices.tolist() == [16, 17]
+    assert pool.device_view(reused).tolist() == list(range(1024, 1152))
 
 
 def test_early_direct_transport_progresses_off_scheduler_thread(monkeypatch):
@@ -105,6 +174,41 @@ def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
     assert inserted[0].value is entry.device_indices
     assert req._agentic_kv_direct_hit_tokens == len(tokens)
     assert request.snapshot_id not in scheduler.agentic_early_direct_receives
+
+
+def test_completed_direct_waiters_bind_outside_prefill_admission_batch(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    now = time.monotonic()
+    reqs = [_Req(f"ready-{index}", "fast") for index in range(20)]
+    parents = {
+        req.rid: RequestGeneration(f"trajectory-{index}", 0)
+        for index, req in enumerate(reqs)
+    }
+    scheduler.agentic_kv_waiting_queue = [(req, now) for req in reqs]
+    scheduler.agentic_early_direct_receives = {
+        parent.snapshot_id: types.SimpleNamespace(completed_at=now)
+        for parent in parents.values()
+    }
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    monkeypatch.setattr(
+        scheduler_module.AgenticRequestMetadata,
+        "from_req",
+        lambda req: types.SimpleNamespace(parent=parents[req.rid]),
+    )
+    bound = []
+
+    def bind(self, req, parent):
+        bound.append(parent.snapshot_id)
+        req._agentic_kv_gate_complete = True
+        return False
+
+    scheduler._agentic_bind_early_direct_receive = types.MethodType(
+        bind, scheduler
+    )
+    scheduler._agentic_bind_completed_waiters()
+
+    assert len(bound) == 20
+    assert all(req._agentic_kv_gate_complete for req in reqs)
 
 
 def test_early_direct_pages_are_counted_as_transport_reservation():
@@ -625,6 +729,25 @@ def test_p_ready_soft_caps_count_completed_requests_and_tokens(monkeypatch):
     ready.origin_input_ids = list(range(256))
     scheduler.disagg_prefill_inflight_queue = [ready]
     assert scheduler._should_throttle_p_ready_compute_ahead() is True
+
+
+def test_disabled_p_ready_backpressure_uses_native_scheduler_capacity(monkeypatch):
+    monkeypatch.setenv("SGLANG_PD_P_READY_BACKPRESSURE_MODE", "disabled")
+    monkeypatch.setenv("SGLANG_PD_P_READY_REQUEST_CAP", "12")
+    monkeypatch.setenv("SGLANG_PD_P_READY_TOKEN_CAP_FRACTION", "0.25")
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
+        p_ready_dir="/dev/shm/test"
+    )
+    scheduler.chunked_req = None
+    scheduler._p_ready_compute_ahead_throttled = True
+    scheduler._p_ready_compute_credit_tokens = 1
+
+    # Disabled means no synthetic request/token/HBM watermark throttle.  The
+    # ordinary SGLang batch builder and KV allocator remain the safety limit.
+    assert scheduler._should_throttle_p_ready_compute_ahead() is False
+    assert scheduler._p_ready_compute_credit_tokens is None
+    assert scheduler._p_ready_compute_ahead_throttled is False
 
 
 def test_p_ready_hysteresis_does_not_resume_above_token_cap(monkeypatch):

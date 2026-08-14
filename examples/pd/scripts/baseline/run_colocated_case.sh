@@ -24,11 +24,25 @@ SEED="${SEED:-2026}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-300}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-1200}"
 SCHEDULE_FILE="${SCHEDULE_FILE:-${PD_DIR}/configs/workloads/fixed_random_s2026_n4096.json}"
+MATH_RATIO="${MATH_RATIO:-0.5}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+MODEL_MEM_FRACTION_STATICS="${MODEL_MEM_FRACTION_STATICS:-}"
 
 read -r -a model_gpus <<<"${MODEL_GPUS}"
 read -r -a model_ports <<<"${MODEL_PORTS}"
+if [[ -n "${MODEL_MEM_FRACTION_STATICS}" ]]; then
+  read -r -a model_mem_fraction_statics <<<"${MODEL_MEM_FRACTION_STATICS}"
+else
+  model_mem_fraction_statics=()
+  for _ in "${model_gpus[@]}"; do
+    model_mem_fraction_statics+=("${MEM_FRACTION_STATIC}")
+  done
+fi
 (( ${#model_gpus[@]} == ${#model_ports[@]} )) || {
   echo "MODEL_GPUS/MODEL_PORTS length mismatch" >&2; exit 2;
+}
+(( ${#model_gpus[@]} == ${#model_mem_fraction_statics[@]} )) || {
+  echo "MODEL_MEM_FRACTION_STATICS must be empty or match MODEL_GPUS" >&2; exit 2;
 }
 mkdir -p "${RUN_DIR}/logs"
 export PATH="${PD_ENV_BIN}:${PATH}"
@@ -56,7 +70,7 @@ for index in "${!model_gpus[@]}"; do
   setsid env CUDA_VISIBLE_DEVICES="${model_gpus[index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
     "${PD_ENV_BIN}/python" -m sglang.launch_server --model-path "${MODEL_PATH}" \
     --host 0.0.0.0 --port "${model_ports[index]}" --context-length 40960 \
-    --page-size 64 --mem-fraction-static 0.85 --enable-metrics \
+    --page-size 64 --mem-fraction-static "${model_mem_fraction_statics[index]}" --enable-metrics \
     --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
     >"${RUN_DIR}/logs/model-${index}.log" 2>&1 &
   model_pid=$!; pd_track_group "${model_pid}"
@@ -77,7 +91,7 @@ SLIME_HTTP_READ_TIMEOUT_SECONDS="${SLIME_HTTP_READ_TIMEOUT_SECONDS:-3600}" \
   --math-data "${MATH_DATA}" --qa-data "${QA_DATA}" --router-port "${ROUTER_PORT}" \
   --prefill-port "${model_ports[0]}" --prefill-ports "${ports_csv}" \
   --decode-port "${model_ports[0]}" --decode-ports "${ports_csv}" \
-  --math-ratio 0.5 --requests "${REQUESTS}" --warmup-requests 0 \
+  --math-ratio "${MATH_RATIO}" --requests "${REQUESTS}" --warmup-requests 0 \
   --dispatch-policy fixed --schedule-file "${SCHEDULE_FILE}" \
   --request-rate 100 --arrival-distribution fixed --max-inflight "${MAX_INFLIGHT}" \
   --metrics-interval 2 --seed "${SEED}" --temperature 0 --top-p 1 --top-k -1 \

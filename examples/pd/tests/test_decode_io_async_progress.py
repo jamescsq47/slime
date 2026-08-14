@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import types
@@ -159,41 +160,212 @@ def test_blocked_agentic_control_does_not_stop_transfer_progress():
             thread.join(timeout=1.0)
 
 
+def test_blocked_isolated_relay_does_not_stop_p_to_d_progress():
+    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager._decode_io_async_enabled = True
+    manager._decode_io_threads = {}
+    manager._decode_io_wakeups = {
+        name: threading.Event()
+        for name in ("transfer", "prealloc", "agentic", "relay")
+    }
+    manager._decode_io_stop = threading.Event()
+    manager._decode_io_intervals = {
+        "transfer": 0.001,
+        "prealloc": 0.005,
+        "agentic": 0.005,
+        "relay": 0.001,
+    }
+    manager._decode_io_cuda_device = None
+    manager._decode_io_error_count = 0
+    manager._decode_io_last_error = None
+    manager._decode_io_events = None
+    manager.agentic_direct_candidates = {}
+    manager._agentic_relay_progress_isolated = True
+
+    relay_release = threading.Event()
+    relay_entered = threading.Event()
+
+    def blocked_relay():
+        relay_entered.set()
+        relay_release.wait(0.25)
+
+    manager.agentic_relay_worker = types.SimpleNamespace(
+        poll=blocked_relay,
+        active=None,
+    )
+    manager._check_agentic_direct_progress = lambda *, progress_relay: None
+    prealloc = _ProgressQueue()
+    transfer = _ProgressQueue()
+
+    manager.start_decode_io_progress_worker(prealloc, transfer)
+    try:
+        assert relay_entered.wait(0.1)
+        time.sleep(0.05)
+        assert transfer.calls >= 10
+        assert prealloc.calls >= 3
+    finally:
+        manager._decode_io_stop.set()
+        relay_release.set()
+        for wakeup in manager._decode_io_wakeups.values():
+            wakeup.set()
+        for thread in manager._decode_io_threads.values():
+            thread.join(timeout=1.0)
+
+
 class _PrefillHarness(SchedulerDisaggregationPrefillMixin):
     pass
 
 
-def test_blocked_prefill_sender_poll_does_not_block_scheduler():
+def test_prefill_producer_enqueues_fifo_without_touching_sender():
+    class Sender:
+        def poll(self):
+            raise AssertionError("producer must not poll transport")
+
+    scheduler = _PrefillHarness()
+    scheduler._prefill_ready_condition = threading.Condition()
+    scheduler._prefill_ready_queue = __import__("collections").deque()
+    scheduler._prefill_ready_queued_rids = set()
+    first = types.SimpleNamespace(
+        rid="first", disagg_kv_sender=Sender(),
+        disagg_p_ready_deferred=True,
+        _async_prefill_transfer_payload=(1, [1], None),
+    )
+    second = types.SimpleNamespace(
+        rid="second", disagg_kv_sender=Sender(),
+        disagg_p_ready_deferred=True,
+        _async_prefill_transfer_payload=(1, [2], None),
+    )
+
+    assert scheduler._enqueue_deferred_prefill_transfer(first)
+    assert scheduler._enqueue_deferred_prefill_transfer(second)
+    assert list(scheduler._prefill_ready_queue) == [first, second]
+    assert (first._p_ready_sequence, second._p_ready_sequence) == (0, 1)
+
+
+def test_legacy_prefill_send_is_consumed_without_ready_marker():
+    scheduler = _PrefillHarness()
+    scheduler._prefill_ready_condition = threading.Condition()
+    scheduler._prefill_ready_queue = __import__("collections").deque()
+    scheduler._prefill_ready_queued_rids = set()
+    req = types.SimpleNamespace(
+        rid="warmup",
+        disagg_p_ready_deferred=False,
+        disagg_p_ready_transfer_started=True,
+    )
+
+    assert scheduler._enqueue_deferred_prefill_transfer(req)
+    assert list(scheduler._prefill_ready_queue) == [req]
+    assert not hasattr(req, "_p_ready_sequence")
+
+
+def test_parallel_consumers_publish_ready_in_producer_fifo(tmp_path):
+    scheduler = _PrefillHarness()
+    scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
+        p_ready_dir=str(tmp_path)
+    )
+    scheduler._prefill_ready_publish_condition = threading.Condition()
+    scheduler._prefill_ready_next_publish_sequence = 0
+    scheduler._prefill_transfer_stop = threading.Event()
+    first = types.SimpleNamespace(
+        rid="first", bootstrap_room=1, origin_input_ids=[1], _p_ready_sequence=0
+    )
+    second = types.SimpleNamespace(
+        rid="second", bootstrap_room=2, origin_input_ids=[1, 2], _p_ready_sequence=1
+    )
+
+    later = threading.Thread(
+        target=scheduler._publish_deferred_prefill_ready,
+        args=(second,),
+        daemon=True,
+    )
+    later.start()
+    time.sleep(0.01)
+    assert not (tmp_path / "2.ready").exists()
+
+    scheduler._publish_deferred_prefill_ready(first)
+    later.join(timeout=1.0)
+    assert json.loads((tmp_path / "1.ready").read_text())["ready_sequence"] == 0
+    assert json.loads((tmp_path / "2.ready").read_text())["ready_sequence"] == 1
+
+
+def test_blocked_prefill_sender_does_not_block_another_consumer():
     entered = threading.Event()
     release = threading.Event()
 
-    class Sender:
+    class BlockedSender:
         def poll(self):
             entered.set()
             release.wait(0.25)
             return KVPoll.Success
 
-    req = types.SimpleNamespace(rid="prefill-0", disagg_kv_sender=Sender())
+    class FastSender:
+        def poll(self):
+            return KVPoll.Success
+
+    blocked = types.SimpleNamespace(
+        rid="prefill-blocked", disagg_kv_sender=BlockedSender()
+    )
+    fast = types.SimpleNamespace(rid="prefill-fast", disagg_kv_sender=FastSender())
+    scheduler = _PrefillHarness()
+    scheduler.disagg_prefill_inflight_queue = [blocked, fast]
+    scheduler._prefill_transfer_poll_lock = threading.Lock()
+    scheduler._prefill_transfer_stop = threading.Event()
+    scheduler._prefill_transfer_interval = 0.001
+    scheduler._prefill_ready_condition = threading.Condition()
+    scheduler._prefill_ready_queue = __import__("collections").deque([blocked, fast])
+    scheduler._prefill_ready_queued_rids = {blocked.rid, fast.rid}
+    scheduler._publish_deferred_prefill_ready = lambda _req: None
+
+    workers = [
+        threading.Thread(
+            target=scheduler._prefill_transfer_consumer_worker,
+            args=(index,),
+            daemon=True,
+        )
+        for index in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    assert entered.wait(0.1)
+    deadline = time.monotonic() + 0.1
+    while not hasattr(fast, "_async_prefill_transfer_poll"):
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    assert fast._async_prefill_transfer_poll == int(KVPoll.Success)
+
+    release.set()
+    deadline = time.monotonic() + 0.2
+    while not hasattr(blocked, "_async_prefill_transfer_poll"):
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    scheduler._prefill_transfer_stop.set()
+    with scheduler._prefill_ready_condition:
+        scheduler._prefill_ready_condition.notify_all()
+    for worker in workers:
+        worker.join(timeout=1.0)
+
+
+def test_prefill_terminal_poll_survives_scheduler_snapshot_race():
+    """A Success written after an old snapshot must remain level-triggered."""
+
+    req = types.SimpleNamespace(rid="prefill-racy-terminal")
     scheduler = _PrefillHarness()
     scheduler.disagg_prefill_inflight_queue = [req]
     scheduler._prefill_transfer_poll_lock = threading.Lock()
 
-    worker = threading.Thread(
-        target=scheduler._prefill_transfer_background_progress, daemon=True
-    )
-    worker.start()
-    assert entered.wait(0.1)
+    # Scheduler observes the default transient state because the consumer has
+    # not published its terminal result yet.
+    assert scheduler._prefill_transfer_cached_polls() == [int(KVPoll.Transferring)]
 
-    started = time.perf_counter()
-    polls = scheduler._prefill_transfer_cached_polls()
-    assert time.perf_counter() - started < 0.05
-    assert polls == [int(KVPoll.Transferring)]
+    # The consumer wins the race before scheduler cleanup.
+    with scheduler._prefill_transfer_poll_lock:
+        req._async_prefill_transfer_poll = int(KVPoll.Success)
+        req._async_prefill_transfer_consumer_active = False
 
-    release.set()
-    worker.join(timeout=1.0)
-    assert scheduler._prefill_transfer_cached_polls() == [int(KVPoll.Success)]
     scheduler._release_prefill_transfer_poll_claims([req])
-    assert not hasattr(req, "_async_prefill_transfer_poll")
+
+    # The next scheduler pass must still observe Success and release P KV.
+    assert scheduler._prefill_transfer_cached_polls() == [int(KVPoll.Success)]
 
 
 def test_prefill_progress_worker_starts_deferred_p_to_d_transfer():
@@ -223,10 +395,7 @@ def test_prefill_progress_worker_starts_deferred_p_to_d_transfer():
         time_stats=TimeStats(),
     )
     scheduler = _PrefillHarness()
-    scheduler.disagg_prefill_inflight_queue = [req]
-    scheduler._prefill_transfer_poll_lock = threading.Lock()
-
-    scheduler._prefill_transfer_background_progress()
+    poll = scheduler._prefill_transfer_progress_req_once(req)
 
     assert calls == [
         ("init", 3, 7),
@@ -234,7 +403,24 @@ def test_prefill_progress_worker_starts_deferred_p_to_d_transfer():
         ("timestamp",),
     ]
     assert req.disagg_p_ready_transfer_started
-    assert scheduler._prefill_transfer_cached_polls() == [int(KVPoll.Transferring)]
+    assert poll == int(KVPoll.Transferring)
+
+
+def test_deferred_prefill_metadata_waits_for_matching_logprob_token_id():
+    req = types.SimpleNamespace(
+        return_logprob=True,
+        output_ids=[42],
+        output_token_logprobs_idx=[],
+    )
+    scheduler = _PrefillHarness()
+
+    # Preparing here would snapshot output_ids=42 while the client-facing
+    # logprob token id is still absent/stale.  The request must remain on the
+    # scheduler retry path until add_logprob_return_values has populated it.
+    assert not scheduler._prepare_deferred_prefill_transfer(req)
+
+    req.output_token_logprobs_idx = [41]
+    assert not scheduler._prepare_deferred_prefill_transfer(req)
 
 
 def test_paged_allocator_frees_ordered_request_pages_without_global_sort():
@@ -354,7 +540,9 @@ def test_unconfirmed_tool_candidate_fails_without_becoming_final():
     )
     failed = []
     manager.agentic_snapshot_store = types.SimpleNamespace(
-        mark_failed=lambda item, reason: failed.append((item, reason))
+        fail_direct_offer=lambda item, owner_id, reason: (
+            failed.append((item, reason)) or item
+        )
     )
     released = []
     manager._enqueue_agentic_release = lambda req, delay: released.append((req, delay))
@@ -370,6 +558,9 @@ def test_unconfirmed_tool_candidate_fails_without_becoming_final():
         "created_at": 10.0,
         "staging": False,
         "sent": False,
+        "metadata": types.SimpleNamespace(
+            current=types.SimpleNamespace(storage_id="repair-parent:0")
+        ),
     }
 
     assert manager._agentic_fail_unconfirmed_tool_candidate(

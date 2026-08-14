@@ -85,7 +85,12 @@ def make_runtime_args(cli: argparse.Namespace) -> Namespace:
         sglang_router_port=cli.router_port,
         retool_local_router_port=cli.retool_local_router_port,
         sglang_server_concurrency=cli.max_inflight,
-        sglang_router_request_timeout_secs=600,
+        # One model call can legitimately remain queued/decoding for more
+        # than ten minutes in the c256 mixed workload.  A 600-second client
+        # timeout caused GenerateState to retry the same request-generation;
+        # the router then sent the duplicate to another D, so both producers
+        # raced on one lifecycle manifest and duplicated Decode work.
+        sglang_router_request_timeout_secs=cli.router_request_timeout_seconds,
         use_distributed_post=False,
         rollout_num_gpus=2,
         rollout_num_gpus_per_engine=1,
@@ -1265,6 +1270,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--router-host", default="127.0.0.1")
     parser.add_argument("--router-port", type=int, default=30002)
     parser.add_argument(
+        "--router-request-timeout-seconds",
+        type=float,
+        default=3600.0,
+        help=(
+            "timeout for one /generate call; must exceed the longest valid "
+            "queued+decode turn so a request-generation is never retried "
+            "while its original execution is still active"
+        ),
+    )
+    parser.add_argument(
         "--retool-local-router-port",
         type=int,
         default=None,
@@ -1376,6 +1391,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--math-ratio must be in [0, 1]")
     if args.requests <= 0 or args.request_rate <= 0 or args.max_inflight <= 0:
         parser.error("--requests, --request-rate and --max-inflight must be positive")
+    if args.router_request_timeout_seconds <= 0:
+        parser.error("--router-request-timeout-seconds must be positive")
     if args.measurement_duration_seconds is not None and args.measurement_duration_seconds <= 0:
         parser.error("--measurement-duration-seconds must be positive")
     if (

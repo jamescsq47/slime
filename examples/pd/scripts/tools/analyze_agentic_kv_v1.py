@@ -26,8 +26,11 @@ def parse_logs(log_dir: Path) -> dict:
 
     counts = Counter(event for event, _ in events)
     offers = counts["direct_offer"]
-    direct_hits = counts["direct_load_complete"]
+    # Current D-side success is recorded when the reverse NIXL send completes.
+    # Older logs used ``direct_load_complete``, so retain that as a fallback.
+    direct_hits = counts["direct_send_complete"] or counts["direct_load_complete"]
     fallbacks = counts["direct_fallback"]
+    direct_pending = max(0, offers - direct_hits - fallbacks)
 
     def values(event_name: str, field: str) -> list[float]:
         result = []
@@ -49,6 +52,7 @@ def parse_logs(log_dir: Path) -> dict:
             "offers": offers,
             "hits": direct_hits,
             "fallbacks": fallbacks,
+            "pending_at_log_end": direct_pending,
             "hit_rate_per_offer": direct_hits / offers if offers else None,
             "mean_send_complete_seconds": mean(
                 values("direct_send_complete", "elapsed_s")

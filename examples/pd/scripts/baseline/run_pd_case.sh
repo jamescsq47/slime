@@ -19,6 +19,8 @@ DECODE_GPUS="${DECODE_GPUS:-1 2 3 4 5}"
 PREFILL_PORTS="${PREFILL_PORTS:-27100}"
 PREFILL_BOOTSTRAP_PORTS="${PREFILL_BOOTSTRAP_PORTS:-28100}"
 DECODE_PORTS="${DECODE_PORTS:-27101 27102 27103 27104 27105}"
+PREFILL_MEM_FRACTION_STATICS="${PREFILL_MEM_FRACTION_STATICS:-}"
+DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-}"
 ROUTER_PORT="${ROUTER_PORT:-27110}"
 ROUTER_PROMETHEUS_PORT="${ROUTER_PROMETHEUS_PORT:-27120}"
 SEARCH_GPU="${SEARCH_GPU:-6}"
@@ -35,6 +37,7 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-300}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-1200}"
 SCHEDULE_FILE="${SCHEDULE_FILE:-${PD_DIR}/configs/workloads/fixed_random_s2026_n4096.json}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
+MATH_RATIO="${MATH_RATIO:-0.5}"
 
 case "${CASE_MODE}" in
   no_reverse|native_mooncake) ;;
@@ -46,11 +49,29 @@ read -r -a p_ports <<<"${PREFILL_PORTS}"
 read -r -a p_bootstrap_ports <<<"${PREFILL_BOOTSTRAP_PORTS}"
 read -r -a d_gpus <<<"${DECODE_GPUS}"
 read -r -a d_ports <<<"${DECODE_PORTS}"
+if [[ -n "${PREFILL_MEM_FRACTION_STATICS}" ]]; then
+  read -r -a p_mem_fraction_statics <<<"${PREFILL_MEM_FRACTION_STATICS}"
+else
+  p_mem_fraction_statics=()
+  for _ in "${p_gpus[@]}"; do p_mem_fraction_statics+=(0.85); done
+fi
+if [[ -n "${DECODE_MEM_FRACTION_STATICS}" ]]; then
+  read -r -a d_mem_fraction_statics <<<"${DECODE_MEM_FRACTION_STATICS}"
+else
+  d_mem_fraction_statics=()
+  for _ in "${d_gpus[@]}"; do d_mem_fraction_statics+=(0.85); done
+fi
 (( ${#p_gpus[@]} == ${#p_ports[@]} && ${#p_gpus[@]} == ${#p_bootstrap_ports[@]} )) || {
   echo "PREFILL_GPUS/PREFILL_PORTS/PREFILL_BOOTSTRAP_PORTS length mismatch" >&2; exit 2;
 }
 (( ${#d_gpus[@]} == ${#d_ports[@]} )) || {
   echo "DECODE_GPUS/DECODE_PORTS length mismatch" >&2; exit 2;
+}
+(( ${#p_gpus[@]} == ${#p_mem_fraction_statics[@]} )) || {
+  echo "PREFILL_GPUS/PREFILL_MEM_FRACTION_STATICS length mismatch" >&2; exit 2;
+}
+(( ${#d_gpus[@]} == ${#d_mem_fraction_statics[@]} )) || {
+  echo "DECODE_GPUS/DECODE_MEM_FRACTION_STATICS length mismatch" >&2; exit 2;
 }
 if (( ${#p_gpus[@]} < 1 || ${#d_gpus[@]} < 1 )); then
   echo "At least one Prefill GPU and one Decode GPU are required" >&2
@@ -111,7 +132,8 @@ pd_wait_http search "http://127.0.0.1:${SEARCH_PORT}/health" "${search_pid}" 120
 for index in "${!p_gpus[@]}"; do
   p_args=(
     --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${p_ports[index]}"
-    --context-length 40960 --page-size "${PAGE_SIZE}" --mem-fraction-static 0.85
+    --context-length 40960 --page-size "${PAGE_SIZE}"
+    --mem-fraction-static "${p_mem_fraction_statics[index]}"
     --enable-metrics --uvicorn-access-log-exclude-prefixes /get_load /metrics /health
     --disaggregation-mode prefill --disaggregation-transfer-backend nixl
     --disaggregation-bootstrap-port "${p_bootstrap_ports[index]}"
@@ -134,7 +156,8 @@ done
 for index in "${!d_gpus[@]}"; do
   d_args=(
     --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${d_ports[index]}"
-    --context-length 40960 --page-size "${PAGE_SIZE}" --mem-fraction-static 0.85
+    --context-length 40960 --page-size "${PAGE_SIZE}"
+    --mem-fraction-static "${d_mem_fraction_statics[index]}"
     --enable-metrics --uvicorn-access-log-exclude-prefixes /get_load /metrics /health
     --disaggregation-mode decode --disaggregation-transfer-backend nixl
   )
@@ -168,7 +191,7 @@ infer_args=(
   --router-port "${ROUTER_PORT}"
   --prefill-port "${p_ports[0]}" --prefill-ports "${p_ports_csv}"
   --decode-port "${d_ports[0]}" --decode-ports "${d_ports_csv}"
-  --math-ratio 0.5 --requests "${REQUESTS}" --warmup-requests 0
+  --math-ratio "${MATH_RATIO}" --requests "${REQUESTS}" --warmup-requests 0
   --dispatch-policy fixed --schedule-file "${SCHEDULE_FILE}"
   --request-rate 100 --arrival-distribution fixed --max-inflight "${MAX_INFLIGHT}"
   --metrics-interval 2 --seed "${SEED}" --temperature 0 --top-p 1 --top-k -1

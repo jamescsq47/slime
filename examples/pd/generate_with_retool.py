@@ -43,6 +43,15 @@ from tool_sandbox import TOOL_CONFIGS, tool_registry
 TOOL_DELAY_REMAINING_KEY = "pending_tool_delay_remaining"
 
 
+def _return_logprob() -> bool:
+    return os.getenv("PD_INFERENCE_RETURN_LOGPROB", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+
+
 def _int_env(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
 
@@ -730,7 +739,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         payload = {
             "input_ids": current_token_ids,
             "sampling_params": per_turn_sampling_params,
-            "return_logprob": True,  # Request log probabilities for training
+            "return_logprob": _return_logprob(),
         }
         if agentic_request_id is not None:
             # The envelope carries a generation-scoped radix key plus the
@@ -812,14 +821,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             # middle of a JSON/tool call, so never execute it here. The next
             # attempt prefills prompt + this prefix, generates the suffix, and
             # parses the complete assistant turn exactly once.
-            if "output_token_logprobs" not in output["meta_info"]:
+            if not _return_logprob():
+                cur_response_token_ids = list(output.get("output_ids") or [])
+                cur_log_probs = []
+            elif "output_token_logprobs" not in output["meta_info"]:
                 return _save_partial_for_resume(turn, reason="sglang_abort_missing_logprobs")
-
-            cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-            if sample.rollout_log_probs is None:
-                sample.rollout_log_probs = []
-            sample.rollout_log_probs += cur_log_probs
+            else:
+                cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            if _return_logprob():
+                if sample.rollout_log_probs is None:
+                    sample.rollout_log_probs = []
+                sample.rollout_log_probs += cur_log_probs
             response_token_ids += cur_response_token_ids
             response = state.tokenizer.decode(response_token_ids)
             if _should_mask_offpolicy(args, sample):
@@ -831,7 +844,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 continuing_partial_assistant = True
             return _save_partial_for_resume(turn, reason="sglang_abort")
 
-        if "output_token_logprobs" in output["meta_info"]:
+        if not _return_logprob():
+            cur_response_token_ids = list(output.get("output_ids") or [])
+            cur_response = state.tokenizer.decode(cur_response_token_ids)
+        elif "output_token_logprobs" in output["meta_info"]:
             cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             cur_response = state.tokenizer.decode(cur_response_token_ids)
             cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
