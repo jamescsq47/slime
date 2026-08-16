@@ -56,7 +56,7 @@ def make_runtime_args(cli: argparse.Namespace) -> Namespace:
         # Existing slime-compatible data/generation interface.
         hf_checkpoint=cli.model,
         rollout_global_dataset=True,
-        rollout_shuffle=True,
+        rollout_shuffle=not cli.preserve_source_order,
         rollout_seed=cli.seed,
         rollout_max_prompt_len=cli.max_context_length,
         input_key="prompt",
@@ -136,6 +136,7 @@ def balanced_dispatch_samples(
     seed: int,
     math_ratio: float = 0.5,
     profile_schedule: list[dict[str, Any]] | None = None,
+    preserve_source_order: bool = False,
 ) -> tuple[list["Sample"], list[dict[str, Any]]]:
     """Select a fixed-composition sample set, changing only its dispatch order."""
     if not 0.0 <= math_ratio <= 1.0:
@@ -145,9 +146,10 @@ def balanced_dispatch_samples(
         task_type = (sample.metadata or {}).get("task_type")
         if task_type in pools:
             pools[task_type].append(sample)
-    rng = random.Random(seed)
-    for pool in pools.values():
-        rng.shuffle(pool)
+    if not preserve_source_order:
+        rng = random.Random(seed)
+        for pool in pools.values():
+            rng.shuffle(pool)
 
     math_count = round(measured_count * math_ratio)
     qa_count = measured_count - math_count
@@ -1097,6 +1099,7 @@ async def async_main(cli: argparse.Namespace) -> None:
         seed=cli.seed,
         math_ratio=cli.math_ratio,
         profile_schedule=profile_schedule,
+        preserve_source_order=cli.preserve_source_order,
     )
     if len(samples) != cli.warmup_requests + cli.requests:
         raise RuntimeError(f"requested {cli.warmup_requests + cli.requests} samples, got {len(samples)}")
@@ -1317,6 +1320,11 @@ def parse_args() -> argparse.Namespace:
         default="random",
     )
     parser.add_argument("--schedule-file", type=Path, default=None)
+    parser.add_argument(
+        "--preserve-source-order",
+        action="store_true",
+        help="select samples in dataset order instead of seed-shuffling each task pool",
+    )
     parser.add_argument("--dynamic-lookback-seconds", type=float, default=12.0)
     parser.add_argument("--dynamic-recent-seconds", type=float, default=10.0)
     parser.add_argument("--dynamic-history-start-seconds", type=float, default=20.0)

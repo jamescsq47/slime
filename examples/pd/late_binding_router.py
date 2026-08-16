@@ -30,6 +30,15 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
     unpack_agentic_extra_key,
 )
+from sglang.srt.disaggregation.agentic_host_staging import (
+    HostStageState,
+    SharedHostStagingLedger,
+)
+from sglang.srt.disaggregation.p2d_host_staging import (
+    P2D_CUSTOM_PREFILL_DOMAIN,
+    P2D_CUSTOM_SNAPSHOT_ID,
+    p2d_snapshot_id,
+)
 from sglang_router.mini_lb import (
     AIOHTTP_STREAM_READ_CHUNK_SIZE,
     MiniLoadBalancer,
@@ -82,6 +91,8 @@ class DecodeReservation:
     rooms: tuple[int, ...]
     created_at: float
     draining: bool = False
+    p2d_host_snapshot_id: Optional[str] = None
+    prefill_domain: Optional[int] = None
 
 
 @dataclass
@@ -212,9 +223,18 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self.prefill_new_aging_seconds = _env_float(
             "SGLANG_PD_LATE_BIND_NEW_AGING_S", 10.0
         )
-        self._prefill_admission = _PrefillAdmissionGate(
-            self.max_prefill_inflight, self.prefill_new_aging_seconds
-        )
+        # Admission bounds the small HTTP/tokenizer bootstrap window in front
+        # of each P.  A single global gate unnecessarily couples independent P
+        # workers: pressure on P0 must not consume P1's admission capacity.
+        self._prefill_admissions = [
+            _PrefillAdmissionGate(
+                self.max_prefill_inflight, self.prefill_new_aging_seconds
+            )
+            for _ in self.prefill_urls
+        ]
+        # Retain the legacy attribute for single-P users and lightweight test
+        # fixtures constructed without __init__.
+        self._prefill_admission = self._prefill_admissions[0]
         self.load_timeout = _env_float("SGLANG_PD_LATE_BIND_LOAD_TIMEOUT_S", 2.0)
         self.reservation_timeout = _env_float(
             "SGLANG_PD_LATE_BIND_RESERVATION_TIMEOUT_S", 120.0
@@ -321,6 +341,21 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS"
         )
         self.global_decode = _env_bool("SGLANG_PD_LATE_BIND_GLOBAL_DECODE")
+        self.p2d_host_staging = _env_bool(
+            "SGLANG_AGENTIC_KV_P2D_HOST_STAGING"
+        )
+        self.p2d_host_spill_delay = _env_float(
+            "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS", 0.05
+        )
+        self.p2d_host_ledger = None
+        if self.p2d_host_staging:
+            p2d_ledger_path = os.getenv(
+                "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH",
+                f"{os.getenv('SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH', '')}.p2d",
+            )
+            if not p2d_ledger_path or p2d_ledger_path == ".p2d":
+                raise ValueError("P->D Host staging requires a ledger path")
+            self.p2d_host_ledger = SharedHostStagingLedger(p2d_ledger_path)
         if self.numa_domains and (
             len(self.prefill_urls) < 2
             or len(self.decode_urls) % len(self.prefill_urls) != 0
@@ -341,7 +376,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             self.early_claim_store = AgenticEarlyClaimStore(early_claim_dir)
         logger.info(
             "Late-binding PD enabled: ready_dir=%s decodes=%d headroom=%d "
-            "early_claim=%s max_prefill_inflight=%d",
+            "early_claim=%s max_prefill_inflight_per_p=%d",
             self.p_ready_dir,
             len(self.decode_urls),
             self.decode_headroom_tokens,
@@ -531,6 +566,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         )
         return prefill_server
 
+    def _prefill_admission_for_domain(self, domain: int) -> _PrefillAdmissionGate:
+        """Return the independent HTTP/bootstrap admission gate for one P."""
+        gates = getattr(self, "_prefill_admissions", None)
+        if gates is None:
+            # Compatibility with tests and embedders that build the router via
+            # __new__ and provide the historical single gate explicitly.
+            return self._prefill_admission
+        if domain < 0 or domain >= len(gates):
+            raise ValueError(f"Invalid Prefill domain P{domain}")
+        return gates[domain]
+
     def _domain_decode_urls(self, domain: int) -> set[str]:
         if (
             not getattr(self, "numa_domains", False)
@@ -539,6 +585,24 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             return set(self.decode_urls)
         width = len(self.decode_urls) // len(self.prefill_urls)
         return set(self.decode_urls[domain * width : (domain + 1) * width])
+
+    def _local_domain_decode_urls(self, domain: int) -> set[str]:
+        """Return the physical NUMA-local D partition, ignoring fast routing."""
+
+        if not getattr(self, "numa_domains", False):
+            return set(self.decode_urls)
+        width = len(self.decode_urls) // len(self.prefill_urls)
+        return set(self.decode_urls[domain * width : (domain + 1) * width])
+
+    @staticmethod
+    def _set_p2d_host_metadata(
+        request: dict[str, Any], snapshot_id: str, prefill_domain: int
+    ) -> None:
+        sampling = request.setdefault("sampling_params", {})
+        custom = dict(sampling.get("custom_params") or {})
+        custom[P2D_CUSTOM_SNAPSHOT_ID] = str(snapshot_id)
+        custom[P2D_CUSTOM_PREFILL_DOMAIN] = int(prefill_domain)
+        sampling["custom_params"] = custom
 
     async def _resolve_dynamic_prefill_work(
         self,
@@ -1524,12 +1588,39 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         wait_started = time.monotonic()
         next_wait_log = time.monotonic() + 5.0
         draining_reservation: Optional[DecodeReservation] = None
+        p2d_snapshot = (
+            p2d_snapshot_id(rooms[0])
+            if getattr(self, "p2d_host_ledger", None) is not None
+            and len(rooms) == 1
+            else None
+        )
+        p2d_offer_published = False
         try:
             while True:
                 async with self._selection_lock:
                     loads = await self._all_decode_loads(session)
                     self._prune_accounted_reservations()
-                    allowed_urls = self._domain_decode_urls(domain)
+                    p2d_entry = (
+                        None
+                        if p2d_snapshot is None
+                        else self.p2d_host_ledger.get(p2d_snapshot)
+                    )
+                    p2d_state = (
+                        None if p2d_entry is None else p2d_entry.get("state")
+                    )
+                    p2d_claimed = p2d_state in {
+                        HostStageState.HOST_RESERVED.value,
+                        HostStageState.HOST_WRITING.value,
+                        HostStageState.HOST_READY.value,
+                        HostStageState.H2D_LOADING.value,
+                        HostStageState.CONSUMED.value,
+                    }
+                    p2d_ready = p2d_state == HostStageState.HOST_READY.value
+                    allowed_urls = (
+                        self._local_domain_decode_urls(domain)
+                        if p2d_claimed
+                        else self._domain_decode_urls(domain)
+                    )
                     loads = [load for load in loads if load.url in allowed_urls]
                     if not loads:
                         raise RuntimeError(f"No usable D worker in domain {domain}")
@@ -1641,9 +1732,21 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         )
 
                     feasible = [item for item in scored if not item[0]]
-                    if draining_reservation is None and (
+                    if draining_reservation is None and not (
+                        p2d_claimed and not p2d_ready
+                    ) and (
                         feasible or not self.wait_for_feasible_decode
                     ):
+                        if p2d_state == HostStageState.OFFERED.value:
+                            # D capacity won the race.  Cancel the unclaimed
+                            # Host offer atomically; if P claimed concurrently,
+                            # retry and commit to the same-NUMA Host route.
+                            cancelled = self.p2d_host_ledger.transition(
+                                p2d_snapshot, HostStageState.REJECTED
+                            )
+                            if not cancelled:
+                                continue
+                            p2d_state = HostStageState.REJECTED.value
                         candidates = feasible or scored
                         (
                             _,
@@ -1663,6 +1766,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             request_count=len(rooms),
                             rooms=rooms,
                             created_at=time.monotonic(),
+                            p2d_host_snapshot_id=(
+                                p2d_snapshot if p2d_ready else None
+                            ),
+                            prefill_domain=(domain if p2d_ready else None),
                         )
                         self._reservations[reservation.reservation_id] = reservation
                         logger.info(
@@ -1690,6 +1797,15 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             work_score,
                             projected_kv,
                         )
+                        if p2d_ready:
+                            logger.info(
+                                "PD_P2D_HOST_BIND snapshot=%s rooms=%s P=%d D=%s "
+                                "policy=same_numa_feasible_least_work",
+                                p2d_snapshot,
+                                rooms,
+                                domain,
+                                selected.url,
+                            )
                         return reservation
 
                     # Reserve future, not current, D capacity for one old
@@ -1697,10 +1813,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     # from starving forever while later short requests consume
                     # every small gap.  No KV is allocated on D at this point.
                     waited = time.monotonic() - wait_started
-                    should_soft_reserve = (
+                    should_soft_reserve = not p2d_claimed and (
+                        (
                         admission_tokens >= self.soft_reservation_min_tokens
                         and waited >= self.soft_reservation_delay
-                    ) or waited >= self.soft_reservation_force_after
+                        )
+                        or waited >= self.soft_reservation_force_after
+                    )
                     if draining_reservation is None and should_soft_reserve:
                         draining_urls = {
                             reservation.url
@@ -1752,6 +1871,31 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                 work_score,
                             )
 
+                    if (
+                        p2d_snapshot is not None
+                        and not p2d_offer_published
+                        and waited >= self.p2d_host_spill_delay
+                    ):
+                        offered = self.p2d_host_ledger.offer(
+                            {
+                                "snapshot_id": p2d_snapshot,
+                                "bootstrap_room": int(rooms[0]),
+                                "token_count": int(prompt_tokens),
+                                "prefill_domain": int(domain),
+                                "request_direction": "p2d",
+                            }
+                        )
+                        p2d_offer_published = True
+                        logger.info(
+                            "PD_P2D_HOST_OFFER snapshot=%s rooms=%s P=%d "
+                            "prompt_tokens=%d state=%s",
+                            p2d_snapshot,
+                            rooms,
+                            domain,
+                            prompt_tokens,
+                            offered.get("state"),
+                        )
+
                 now = time.monotonic()
                 if now >= deadline:
                     raise TimeoutError(
@@ -1773,6 +1917,22 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         draining_reservation.reservation_id, None
                     )
                     self._load_cache_at = 0.0
+            if p2d_snapshot is not None:
+                entry = self.p2d_host_ledger.get(p2d_snapshot)
+                if entry is not None and entry.get("state") not in {
+                    HostStageState.CONSUMED.value,
+                    HostStageState.REJECTED.value,
+                    HostStageState.FAILED.value,
+                }:
+                    owner = entry.get("p_owner")
+                    terminal = (
+                        HostStageState.REJECTED
+                        if entry.get("state") == HostStageState.OFFERED.value
+                        else HostStageState.FAILED
+                    )
+                    self.p2d_host_ledger.transition(
+                        p2d_snapshot, terminal, owner=owner
+                    )
             raise
 
     async def _release_reservation_when_admitted(
@@ -1867,17 +2027,19 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         modified_request, domain
                     )
                 rooms = self._rooms(modified_request)
-                admission_wait = await self._prefill_admission.acquire(
+                prefill_admission = self._prefill_admission_for_domain(domain)
+                admission_wait = await prefill_admission.acquire(
                     parent_turn=parent_turn
                 )
                 if admission_wait >= 1.0:
                     logger.info(
                         "PD_P_ADMISSION rooms=%s parent_turn=%s wait_s=%.3f "
-                        "active=%d limit=%d",
+                        "P=%d active=%d limit=%d",
                         rooms,
                         parent_turn,
                         admission_wait,
-                        self._prefill_admission.active,
+                        domain,
+                        prefill_admission.active,
                         self.max_prefill_inflight,
                     )
                 prefill_submit_at = time.monotonic()
@@ -1900,7 +2062,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             self.max_prefill_inflight,
                         )
                 finally:
-                    await self._prefill_admission.release()
+                    await prefill_admission.release()
                 try:
                     await self._wait_until_prefill_scheduled(
                         rooms, prefill_task, route_task
@@ -1965,6 +2127,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 reservation = await self._select_and_reserve_decode(
                     session, modified_request, rooms, prompt_tokens, domain
                 )
+                if reservation.p2d_host_snapshot_id is not None:
+                    self._set_p2d_host_metadata(
+                        modified_request,
+                        reservation.p2d_host_snapshot_id,
+                        int(reservation.prefill_domain),
+                    )
                 decode_task = asyncio.create_task(
                     session.post(
                         f"{reservation.url}/{endpoint}",
@@ -2007,6 +2175,23 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             if reservation is not None:
                 async with self._selection_lock:
                     self._reservations.pop(reservation.reservation_id, None)
+                if (
+                    reservation.p2d_host_snapshot_id is not None
+                    and getattr(self, "p2d_host_ledger", None) is not None
+                ):
+                    entry = self.p2d_host_ledger.get(
+                        reservation.p2d_host_snapshot_id
+                    )
+                    if entry is not None and entry.get("state") not in {
+                        HostStageState.CONSUMED.value,
+                        HostStageState.FAILED.value,
+                    }:
+                        self.p2d_host_ledger.transition(
+                            reservation.p2d_host_snapshot_id,
+                            HostStageState.FAILED,
+                            owner=entry.get("p_owner"),
+                            reason="router_dispatch_failed",
+                        )
             for room in rooms:
                 try:
                     self._accepted_path(room).unlink(missing_ok=True)

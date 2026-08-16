@@ -9,6 +9,8 @@ created_ready_dir=0
 created_ledger=0
 created_staging_ledger=0
 created_host_arena=0
+created_p2d_staging_ledger=0
+created_p2d_host_arena=0
 service_runner_pid=""
 if [[ -z "${PD_P_READY_DIR:-}" ]]; then
   PD_P_READY_DIR="$(mktemp -d "/dev/shm/sglang-agentic-p-ready-${BOOTSTRAP_PORT}.XXXXXX")"
@@ -28,6 +30,17 @@ if [[ -z "${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR:-}" ]]; then
   SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="$(mktemp -d "/dev/shm/sglang-agentic-host-arena-${BOOTSTRAP_PORT}.XXXXXX")"
   created_host_arena=1
 fi
+if [[ "${SGLANG_AGENTIC_KV_P2D_HOST_STAGING:-false}" == "true" ]]; then
+  if [[ -z "${SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH:-}" ]]; then
+    SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH="${SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH}.p2d"
+    created_p2d_staging_ledger=1
+    rm -f -- "${SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH}"
+  fi
+  if [[ -z "${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR:-}" ]]; then
+    SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR="$(mktemp -d "/dev/shm/sglang-agentic-p2d-arena-${BOOTSTRAP_PORT}.XXXXXX")"
+    created_p2d_host_arena=1
+  fi
+fi
 
 cleanup_ready_dir() {
   if (( created_ready_dir == 1 )) && [[ -d "${PD_P_READY_DIR}" ]]; then
@@ -46,6 +59,13 @@ cleanup_ready_dir() {
   if (( created_host_arena == 1 )) && [[ -d "${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}" ]]; then
     find "${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}" -mindepth 1 -type f -delete
     find "${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}" -depth -type d -empty -delete
+  fi
+  if (( created_p2d_staging_ledger == 1 )); then
+    rm -f -- "${SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH}"
+  fi
+  if (( created_p2d_host_arena == 1 )) && [[ -d "${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR}" ]]; then
+    find "${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR}" -mindepth 1 -type f -delete
+    find "${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR}" -depth -type d -empty -delete
   fi
 }
 
@@ -77,6 +97,12 @@ export SGLANG_AGENTIC_KV_D_HOSTLESS="${SGLANG_AGENTIC_KV_D_HOSTLESS:-true}"
 export SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB:-128}"
+export SGLANG_AGENTIC_KV_P2D_HOST_STAGING="${SGLANG_AGENTIC_KV_P2D_HOST_STAGING:-false}"
+if [[ "${SGLANG_AGENTIC_KV_P2D_HOST_STAGING}" == "true" ]]; then
+  export SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH
+  export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR
+fi
+export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB="${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB:-32}"
 export SGLANG_AGENTIC_KV_RELAY_ENABLED="${SGLANG_AGENTIC_KV_RELAY_ENABLED:-true}"
 export SGLANG_AGENTIC_KV_RELAY_D2H_GIBPS="${SGLANG_AGENTIC_KV_RELAY_D2H_GIBPS:-21.0}"
 export SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS="${SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS:-7.45}"

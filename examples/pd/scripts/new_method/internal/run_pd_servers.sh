@@ -453,6 +453,7 @@ for index in "${!prefill_gpus[@]}"; do
     SGLANG_AGENTIC_KV_PREFILL_DOMAIN="${index}" \
     SGLANG_AGENTIC_KV_ARENA_NUMA_NODE="${prefill_numa}" \
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}/p-${index}-numa-${prefill_numa}" \
+    SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR:-/dev/shm/sglang-agentic-p2d-disabled}/p-${index}-numa-${prefill_numa}" \
     SGLANG_PD_P_READY_DIR="${PD_P_READY_DIR}" \
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${PD_HICACHE_STORAGE_DIR}" \
     python -m sglang.launch_server \
@@ -489,6 +490,7 @@ for index in "${!decode_gpus[@]}"; do
     SGLANG_AGENTIC_KV_GPU_NUMA_NODE="${decode_numa}" \
     SGLANG_AGENTIC_KV_ARENA_NUMA_NODE="${arena_numa}" \
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}/p-${domain}-numa-${arena_numa}" \
+    SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR:-/dev/shm/sglang-agentic-p2d-disabled}/p-${domain}-numa-${arena_numa}" \
     SGLANG_PD_MAX_TRANSFER_INFLIGHT="${PD_MAX_TRANSFER_INFLIGHT}" \
     SGLANG_PD_P_READY_DIR="${PD_P_READY_DIR}" \
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${PD_HICACHE_STORAGE_DIR}" \

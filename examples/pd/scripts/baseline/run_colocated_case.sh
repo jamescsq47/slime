@@ -27,6 +27,7 @@ SCHEDULE_FILE="${SCHEDULE_FILE:-${PD_DIR}/configs/workloads/fixed_random_s2026_n
 MATH_RATIO="${MATH_RATIO:-0.5}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 MODEL_MEM_FRACTION_STATICS="${MODEL_MEM_FRACTION_STATICS:-}"
+PRESERVE_SOURCE_ORDER="${PRESERVE_SOURCE_ORDER:-false}"
 
 read -r -a model_gpus <<<"${MODEL_GPUS}"
 read -r -a model_ports <<<"${MODEL_PORTS}"
@@ -86,6 +87,10 @@ router_pid=$!; pd_track_group "${router_pid}"
 pd_wait_http router "http://127.0.0.1:${ROUTER_PORT}/health" "${router_pid}" 300
 
 ports_csv="$(IFS=,; echo "${model_ports[*]}")"
+inference_order_args=()
+if [[ "${PRESERVE_SOURCE_ORDER}" == "true" ]]; then
+  inference_order_args+=(--preserve-source-order)
+fi
 SLIME_HTTP_READ_TIMEOUT_SECONDS="${SLIME_HTTP_READ_TIMEOUT_SECONDS:-3600}" \
 "${PD_ENV_BIN}/python" inference.py --model "${MODEL_PATH}" \
   --math-data "${MATH_DATA}" --qa-data "${QA_DATA}" --router-port "${ROUTER_PORT}" \
@@ -99,6 +104,7 @@ SLIME_HTTP_READ_TIMEOUT_SECONDS="${SLIME_HTTP_READ_TIMEOUT_SECONDS:-3600}" \
   --closed-loop-warmup-completions 0 --closed-loop-recent-seconds 120 \
   --closed-loop-max-warmup-seconds "$((WARMUP_SECONDS + 120))" \
   --closed-loop-measurement-seconds "${MEASURE_SECONDS}" --output-dir "${RUN_DIR}" \
+  "${inference_order_args[@]}" \
   >"${RUN_DIR}/inference.log" 2>&1
 "${PD_ENV_BIN}/python" "${SCRIPT_DIR}/../tools/analyze_pd_offload.py" --run-dir "${RUN_DIR}"
 echo "baseline colocated case complete: ${RUN_DIR}"

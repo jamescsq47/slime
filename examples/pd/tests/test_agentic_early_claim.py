@@ -224,3 +224,30 @@ def test_generation_producer_is_single_winner_and_generation_scoped():
         assert second_process.producer_path(generation_one).exists()
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_arrival_watcher_observes_atomic_publish_without_directory_rescan():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        watcher = store.watch_arrivals(max_age_seconds=5.0)
+        # Consume the one-time startup snapshot before publishing the marker.
+        assert watcher.poll() == []
+        store.iter_arrivals = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("normal inotify delivery must not rescan the directory")
+        )
+        request = RequestGeneration("trajectory-inotify", 3)
+        store.publish_arrival(request, target_prefill_domain=1)
+
+        deadline = time.monotonic() + 1.0
+        arrivals = []
+        while not arrivals and time.monotonic() < deadline:
+            arrivals = watcher.poll(0.05)
+        watcher.close()
+
+        assert len(arrivals) == 1
+        observed, payload = arrivals[0]
+        assert observed == request
+        assert payload["target_prefill_domain"] == 1
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
