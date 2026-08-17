@@ -37,6 +37,7 @@ ARRIVAL_RATES="${ARRIVAL_RATES:-${ARRIVAL_RATE}}"
 ARRIVAL_DISTRIBUTION="${ARRIVAL_DISTRIBUTION:-poisson}"
 DISPATCH_POLICY="${DISPATCH_POLICY:-random}"
 SCHEDULE_FILE="${SCHEDULE_FILE:-}"
+PRESERVE_SOURCE_ORDER="${PRESERVE_SOURCE_ORDER:-false}"
 DYNAMIC_LOOKBACK_SECONDS="${DYNAMIC_LOOKBACK_SECONDS:-12}"
 DYNAMIC_RECENT_SECONDS="${DYNAMIC_RECENT_SECONDS:-10}"
 DYNAMIC_HISTORY_START_SECONDS="${DYNAMIC_HISTORY_START_SECONDS:-20}"
@@ -610,6 +611,9 @@ for rate in "${rates[@]}"; do
   schedule_args=()
   if [[ -n "${SCHEDULE_FILE}" ]]; then
     schedule_args+=(--schedule-file "${SCHEDULE_FILE}")
+  fi
+  if [[ "${PRESERVE_SOURCE_ORDER}" == "true" ]]; then
+    schedule_args+=(--preserve-source-order)
   fi
   closed_loop_args=()
   if [[ "${CLOSED_LOOP}" == "1" ]]; then

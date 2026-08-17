@@ -84,6 +84,11 @@ def request_reuse(requests: list[dict], page_size: int = 64) -> dict[str, float 
     page_eligible_turns = 0
     page_reverse_hit_turns = 0
     page_full_hit_turns = 0
+    page_parent_expected = 0
+    page_parent_reused = 0
+    page_parent_full_hit_turns = 0
+    page_parent_partial_hit_turns = 0
+    page_parent_zero_hit_turns = 0
     for row in requests:
         row_turns = row.get("turn_metrics", [])
         for index, turn in enumerate(row_turns[1:], 1):
@@ -109,6 +114,15 @@ def request_reuse(requests: list[dict], page_size: int = 64) -> dict[str, float 
             aligned_end = (
                 (previous_prompt + previous_completion - 1) // page_size
             ) * page_size
+            parent_reused = min(aligned_end, turn["cached_tokens"])
+            page_parent_expected += aligned_end
+            page_parent_reused += parent_reused
+            if parent_reused == aligned_end:
+                page_parent_full_hit_turns += 1
+            elif parent_reused > 0:
+                page_parent_partial_hit_turns += 1
+            else:
+                page_parent_zero_hit_turns += 1
             page_eligible = max(
                 0,
                 min(previous_completion, aligned_end - previous_prompt),
@@ -147,6 +161,20 @@ def request_reuse(requests: list[dict], page_size: int = 64) -> dict[str, float 
         "page_aligned_eligible_later_turns": page_eligible_turns,
         "page_aligned_reverse_hit_later_turns": page_reverse_hit_turns,
         "page_aligned_full_hit_later_turns": page_full_hit_turns,
+        # Full parent-prefix accounting is the colocated KV-thrashing metric.
+        # Unlike the reverse-KV fields above, it includes prompt/tool history
+        # that must also be recomputed when an earlier Radix branch is lost.
+        "page_aligned_expected_parent_prefix_tokens": page_parent_expected,
+        "page_aligned_reused_parent_prefix_tokens": page_parent_reused,
+        "page_aligned_extra_prefill_from_parent_kv_loss": (
+            page_parent_expected - page_parent_reused
+        ),
+        "page_aligned_parent_prefix_reuse_fraction": (
+            page_parent_reused / page_parent_expected if page_parent_expected else 0.0
+        ),
+        "page_aligned_parent_full_hit_later_turns": page_parent_full_hit_turns,
+        "page_aligned_parent_partial_hit_later_turns": page_parent_partial_hit_turns,
+        "page_aligned_parent_zero_hit_later_turns": page_parent_zero_hit_turns,
     }
 
 
@@ -278,6 +306,20 @@ def main() -> None:
         - boundary["state_at_measurement_start"]["successes"]
     )
     reuse = request_reuse(completed)
+    parent_loss = reuse["page_aligned_extra_prefill_from_parent_kv_loss"]
+    reuse["page_aligned_extra_prefill_from_parent_kv_loss_per_second"] = (
+        parent_loss / duration if duration else 0.0
+    )
+    reuse["page_aligned_extra_prefill_from_parent_kv_loss_per_agent"] = (
+        parent_loss / len(completed) if completed else 0.0
+    )
+    reuse["page_aligned_extra_prefill_fraction"] = (
+        parent_loss / reuse["actual_prefill_tokens"]
+        if reuse["actual_prefill_tokens"] else 0.0
+    )
+    reuse["counterfactual_prefill_without_parent_kv_loss"] = (
+        reuse["actual_prefill_tokens"] - parent_loss
+    )
     terminal_repairs = terminal_repair_summary(completed, duration)
     moon_x, moon_usage, mooncake = mooncake_series(
         args.run_dir / "logs" / "mooncake-master.log", origin, start, end
