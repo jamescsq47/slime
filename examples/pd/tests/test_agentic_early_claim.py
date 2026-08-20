@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
 import time
 
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
@@ -222,5 +223,63 @@ def test_generation_producer_is_single_winner_and_generation_scoped():
         assert second_process.claim_generation_producer(generation_one)
         assert first_process.producer_path(generation_zero).exists()
         assert second_process.producer_path(generation_one).exists()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_tp_generation_producer_publish_is_atomic_and_rank0_owned():
+    directory = _directory()
+    try:
+        rank0 = AgenticEarlyClaimStore(directory)
+        follower = AgenticEarlyClaimStore(directory)
+        generation = RequestGeneration("trajectory-tp-producer", 3)
+        owner = "decode-0:model-request"
+        results = {}
+
+        # Let the follower arrive first.  It must wait for rank 0 instead of
+        # creating or independently electing a producer tombstone.
+        thread = threading.Thread(
+            target=lambda: results.setdefault(
+                "follower",
+                follower.wait_generation_producer(
+                    generation, owner, timeout_seconds=1.0
+                ),
+            )
+        )
+        thread.start()
+        time.sleep(0.01)
+        assert rank0.claim_generation_producer(generation, producer_id=owner)
+        thread.join(timeout=1.0)
+
+        assert results == {"follower": True}
+        assert rank0.producer_path(generation).read_text().strip() == owner
+        assert not list(rank0.directory.glob(".producer-*.tmp"))
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_arrival_watcher_observes_atomic_publish_without_directory_rescan():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        watcher = store.watch_arrivals(max_age_seconds=5.0)
+        # Consume the one-time startup snapshot before publishing the marker.
+        assert watcher.poll() == []
+        store.iter_arrivals = lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("normal inotify delivery must not rescan the directory")
+        )
+        request = RequestGeneration("trajectory-inotify", 3)
+        store.publish_arrival(request, target_prefill_domain=1)
+
+        deadline = time.monotonic() + 1.0
+        arrivals = []
+        while not arrivals and time.monotonic() < deadline:
+            arrivals = watcher.poll(0.05)
+        watcher.close()
+
+        assert len(arrivals) == 1
+        observed, payload = arrivals[0]
+        assert observed == request
+        assert payload["target_prefill_domain"] == 1
     finally:
         shutil.rmtree(directory, ignore_errors=True)

@@ -11,6 +11,11 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
     RequestGeneration,
 )
+from sglang.srt.disaggregation.agentic_host_staging import (
+    HostStageState,
+    SharedHostStagingLedger,
+)
+from sglang.srt.disaggregation.p2d_host_staging import p2d_snapshot_id
 
 from late_binding_router import (
     DecodeLoad,
@@ -697,6 +702,29 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(gate._next_waiter(now), parent)
 
+    async def test_prefill_admission_capacity_is_independent_per_p(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router._prefill_admissions = [
+            _PrefillAdmissionGate(limit=1, new_aging_seconds=10),
+            _PrefillAdmissionGate(limit=1, new_aging_seconds=10),
+        ]
+
+        p0 = router._prefill_admission_for_domain(0)
+        p1 = router._prefill_admission_for_domain(1)
+        await p0.acquire(parent_turn=False)
+        p0_waiter = asyncio.create_task(p0.acquire(parent_turn=True))
+        await asyncio.sleep(0)
+
+        # Saturating P0 does not consume P1's independent capacity.
+        await asyncio.wait_for(p1.acquire(parent_turn=False), timeout=1)
+        self.assertFalse(p0_waiter.done())
+        self.assertEqual((p0.active, p1.active), (1, 1))
+
+        await p0.release()
+        await asyncio.wait_for(p0_waiter, timeout=1)
+        await p0.release()
+        await p1.release()
+
     async def test_atomic_reservation_spreads_simultaneous_requests(self):
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))
@@ -905,6 +933,93 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(selected.url, "http://d0")
             self.assertGreaterEqual(attempts, 2)
+
+    async def test_p2d_host_claim_locks_restore_to_same_numa(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.prefill_urls = ["http://p0", "http://p1"]
+            router.decode_urls = [
+                "http://d0",
+                "http://d1",
+                "http://d2",
+                "http://d3",
+            ]
+            router.numa_domains = True
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            router.soft_reservation_delay = 100.0
+            router.soft_reservation_force_after = 100.0
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            snapshot_id = p2d_snapshot_id(401)
+            attempts = 0
+
+            async def loads(_session):
+                nonlocal attempts
+                attempts += 1
+                entry = ledger.get(snapshot_id)
+                if entry is not None and entry["state"] == HostStageState.OFFERED.value:
+                    claimed = ledger.claim(snapshot_id, "p2d-p:test")
+                    self.assertIsNotNone(claimed)
+                    self.assertTrue(
+                        ledger.publish_grants(
+                            snapshot_id,
+                            "p2d-p:test",
+                            [{"kind": "shared_host_extent"}],
+                        )
+                    )
+                    self.assertTrue(ledger.ack_chunk(snapshot_id, "p2d-p:test", 0))
+                    self.assertTrue(
+                        ledger.mark_host_ready(snapshot_id, "p2d-p:test", 1)
+                    )
+                used = 99_000 if attempts == 1 else 20_000
+                return [
+                    DecodeLoad("http://d0", used, 100_000, 20, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", used, 100_000, 25, 0, 0, 0, 100),
+                    # Remote NUMA is deliberately less loaded.  A staged
+                    # snapshot must nevertheless stay with P0's local Ds.
+                    DecodeLoad("http://d2", used, 100_000, 1, 0, 0, 0, 100),
+                    DecodeLoad("http://d3", used, 100_000, 2, 0, 0, 0, 100),
+                ]
+
+            router._all_decode_loads = loads
+            selected = await router._select_and_reserve_decode(
+                None, {"max_tokens": 1000}, (401,), 5_000, domain=0
+            )
+            self.assertEqual(selected.url, "http://d0")
+            self.assertEqual(selected.p2d_host_snapshot_id, snapshot_id)
+            self.assertEqual(selected.prefill_domain, 0)
+
+    async def test_p2d_unclaimed_offer_is_cancelled_when_d_frees(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            router.soft_reservation_delay = 100.0
+            router.soft_reservation_force_after = 100.0
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            attempts = 0
+
+            async def loads(_session):
+                nonlocal attempts
+                attempts += 1
+                used = 99_000 if attempts == 1 else 20_000
+                return [
+                    DecodeLoad("http://d0", used, 100_000, 10, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", used, 100_000, 11, 0, 0, 0, 100),
+                ]
+
+            router._all_decode_loads = loads
+            selected = await router._select_and_reserve_decode(
+                None, {"max_tokens": 1000}, (402,), 5_000, domain=0
+            )
+            self.assertIsNone(selected.p2d_host_snapshot_id)
+            self.assertEqual(
+                ledger.get(p2d_snapshot_id(402))["state"],
+                HostStageState.REJECTED.value,
+            )
 
     async def test_large_request_soft_reserves_future_capacity(self):
         with tempfile.TemporaryDirectory() as directory:

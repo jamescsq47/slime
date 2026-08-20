@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import types
+from collections import deque
 
 import torch
 
@@ -21,6 +22,9 @@ from sglang.srt.managers.scheduler import (
     AgenticEarlyDirectReceive,
     Scheduler,
 )
+from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
 
 class _Req:
@@ -28,6 +32,48 @@ class _Req:
         self.rid = rid
         if queue_class is not None:
             self._agentic_kv_queue_class = queue_class
+
+
+def test_hiradix_write_back_falls_back_when_host_has_no_capacity():
+    """Host pressure must evict an unlocked cache leaf, not crash serving."""
+
+    cache = HiRadixCache.__new__(HiRadixCache)
+    class Node:
+        lock_ref = 0
+        backuped = False
+        evicted = False
+
+    node = Node()
+    node.parent = types.SimpleNamespace(children={})
+    node.parent.children["leaf"] = node
+    cache.evictable_leaves = {node}
+    cache.eviction_strategy = types.SimpleNamespace(get_priority=lambda _node: 0)
+    cache.cache_controller = types.SimpleNamespace(write_policy="write_back")
+    cache.write_backup = lambda _node, write_back=False: 0
+    regular = []
+    cache._evict_regular = lambda victim: regular.append(victim) or 64
+    cache.writing_check = lambda write_back=False: None
+    cache.update_eviction_metrics = lambda *_args: None
+
+    result = cache.evict(EvictParams(num_tokens=64))
+
+    assert result.num_tokens_evicted == 64
+    assert regular == [node]
+def test_p_agentic_transient_backup_stays_out_of_generic_storage():
+    cache = HiRadixCache.__new__(HiRadixCache)
+    cache.ongoing_backup = {}
+    cache.cache_controller = types.SimpleNamespace(
+        write_storage=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("transient P KV must use the agentic slow path, not generic L3")
+        )
+    )
+    node = types.SimpleNamespace(
+        key=types.SimpleNamespace(extra_key="agentic-v1:snapshot:g1"),
+    )
+
+    cache.write_backup_storage(node)
+
+    assert cache.ongoing_backup == {}
 
 
 def test_direct_page_credit_reserves_and_recycles_by_tokens():
@@ -66,32 +112,27 @@ def test_direct_page_credit_reserves_and_recycles_by_tokens():
     assert pool.unaccounted_tokens == 256
 
 
-def test_direct_page_credit_promotes_received_pages_without_copying_kv():
+def test_direct_page_credit_ownership_swap_replenishes_transit_buffer():
     class Allocator:
         def alloc(self, count):
             return torch.arange(64, 64 + count, dtype=torch.int64)
 
-        def free(self, indices):
-            raise AssertionError("promotion must not free received KV")
+        def free(self, _indices):
+            raise AssertionError("ownership swap must not free either page set")
 
     pool = AgenticDirectPageCreditPool(
-        Allocator(), capacity_tokens=256, page_size=64
+        Allocator(), capacity_tokens=128, page_size=64
     )
     allocation = pool.allocate(128)
     assert allocation is not None
-    received_pages = pool.device_view(allocation).clone()
-    ordinary_empty_pages = torch.arange(1024, 1152, dtype=torch.int64)
+    received_indices = pool.device_view(allocation).clone()
+    replacement = torch.arange(640, 768, dtype=torch.int64)
 
-    pool.promote_to_ordinary(allocation, ordinary_empty_pages)
+    pool.promote_to_ordinary(allocation, replacement)
 
-    # The Radix-owned received pages keep their original ids while the same
-    # two transit slots are immediately reusable with fresh backing pages.
-    assert received_pages.tolist() == list(range(64, 192))
-    assert pool.free_tokens == 256
-    reused = pool.allocate(128)
-    assert reused is not None
-    assert reused.page_indices.tolist() == [16, 17]
-    assert pool.device_view(reused).tolist() == list(range(1024, 1152))
+    assert pool.free_tokens == 128
+    assert pool.device_indices.tolist() == replacement.tolist()
+    assert received_indices.tolist() == list(range(64, 192))
 
 
 def test_early_direct_transport_progresses_off_scheduler_thread(monkeypatch):
@@ -110,6 +151,10 @@ def test_early_direct_transport_progresses_off_scheduler_thread(monkeypatch):
     scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
     scheduler.agentic_early_direct_progress_stop = threading.Event()
+    scheduler._agentic_poll_early_direct_receives = types.MethodType(
+        lambda self: setattr(entry, "transport_poll", entry.receiver.poll()),
+        scheduler,
+    )
     monkeypatch.setenv(
         "SGLANG_AGENTIC_KV_P_DIRECT_PROGRESS_INTERVAL_SECONDS", "0.001"
     )
@@ -126,6 +171,151 @@ def test_early_direct_transport_progresses_off_scheduler_thread(monkeypatch):
 
     assert entry.transport_poll is KVPoll.Success
     assert entry.completed_at is None
+
+
+def test_scheduler_direct_gate_never_drives_transport_progress(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    parent = RequestGeneration("trajectory-nonblocking-gate", 0)
+    manifest = types.SimpleNamespace(
+        request=parent,
+        state=SnapshotState.DIRECT_READY,
+        created_at=time.time(),
+    )
+    req = _Req("tokenized-child")
+    req._agentic_kv_gate_complete = False
+    scheduler.agentic_host_staging_manager = None
+    scheduler.agentic_early_direct_receives = {}
+    scheduler.agentic_early_claim_store = types.SimpleNamespace(
+        read_arrival=lambda *args, **kwargs: {"kind": "arrival"},
+        read_final=lambda *args, **kwargs: None,
+    )
+    scheduler._agentic_snapshot_store = types.MethodType(
+        lambda self: types.SimpleNamespace(
+            load=lambda request, require_ready=False: manifest
+        ),
+        scheduler,
+    )
+    scheduler._agentic_poll_early_direct_receives = types.MethodType(
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("the GPU scheduler must not progress Direct transport")
+        ),
+        scheduler,
+    )
+    scheduler._agentic_bind_early_direct_receive = types.MethodType(
+        lambda self, child, request: None,
+        scheduler,
+    )
+    scheduler._agentic_start_direct_load = types.MethodType(
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy Req-owned Direct must not start")
+        ),
+        scheduler,
+    )
+    monkeypatch.setattr(
+        scheduler_module.AgenticRequestMetadata,
+        "from_req",
+        lambda req: types.SimpleNamespace(parent=parent),
+    )
+
+    assert scheduler._agentic_should_defer(
+        req, time.monotonic(), allow_start_io=True
+    ) is True
+
+
+def test_blocking_direct_poll_does_not_hold_scheduler_state_lock(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    request = RequestGeneration("trajectory-blocking-poll", 0)
+    poll_started = threading.Event()
+    release_poll = threading.Event()
+
+    def blocking_poll():
+        poll_started.set()
+        assert release_poll.wait(timeout=1.0)
+        return KVPoll.Transferring
+
+    entry = AgenticEarlyDirectReceive(
+        request=request,
+        manifest=types.SimpleNamespace(token_count=64),
+        claim_id="claim",
+        receiver=types.SimpleNamespace(poll=blocking_poll),
+        device_indices=torch.tensor([1]),
+        started_at=time.monotonic(),
+        arrived_at=time.time(),
+    )
+    scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
+    scheduler.agentic_early_direct_terminal = {}
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_early_direct_next_scan_at = float("inf")
+    scheduler.agentic_early_claim_store = object()
+    scheduler.agentic_direct_runtime = object()
+    scheduler._agentic_snapshot_store = types.MethodType(
+        lambda self: object(), scheduler
+    )
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT", "120")
+
+    worker = threading.Thread(
+        target=scheduler._agentic_poll_early_direct_receives_once,
+        daemon=True,
+    )
+    worker.start()
+    assert poll_started.wait(timeout=1.0)
+
+    acquired = scheduler.agentic_early_direct_poll_lock.acquire(timeout=0.05)
+    if acquired:
+        scheduler.agentic_early_direct_poll_lock.release()
+    release_poll.set()
+    worker.join(timeout=1.0)
+
+    assert acquired
+    assert not worker.is_alive()
+
+
+def test_early_direct_batches_transport_progress_once_per_manager(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    manager = object()
+    batch_calls = []
+
+    class Receiver:
+        def __init__(self):
+            self.kv_mgr = manager
+
+        def poll(self):
+            raise AssertionError("individual poll must not repeat manager progress")
+
+        @classmethod
+        def poll_many(cls, receivers):
+            batch_calls.append(tuple(receivers))
+            return [KVPoll.Transferring] * len(receivers)
+
+    entries = {}
+    for index in range(3):
+        request = RequestGeneration(f"trajectory-batched-poll-{index}", 0)
+        entries[request.snapshot_id] = AgenticEarlyDirectReceive(
+            request=request,
+            manifest=types.SimpleNamespace(token_count=64),
+            claim_id=f"claim-{index}",
+            receiver=Receiver(),
+            device_indices=torch.tensor([index + 1]),
+            started_at=time.monotonic(),
+            arrived_at=time.time(),
+        )
+
+    scheduler.agentic_early_direct_receives = entries
+    scheduler.agentic_early_direct_terminal = {}
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_early_direct_next_scan_at = float("inf")
+    scheduler.agentic_early_claim_store = object()
+    scheduler.agentic_direct_runtime = object()
+    scheduler._agentic_snapshot_store = types.MethodType(
+        lambda self: object(), scheduler
+    )
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT", "120")
+
+    scheduler._agentic_poll_early_direct_receives_once()
+
+    assert len(batch_calls) == 1
+    assert len(batch_calls[0]) == 3
+    assert all(entry.transport_poll is KVPoll.Transferring for entry in entries.values())
 
 
 def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
@@ -156,10 +346,17 @@ def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
     scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
     scheduler.agentic_early_direct_terminal = {}
     inserted = []
+    parent_node = object()
+    locks = []
     scheduler.tree_cache = types.SimpleNamespace(
         insert=lambda params: (
             inserted.append(params) or types.SimpleNamespace(prefix_len=0)
-        )
+        ),
+        match_prefix=lambda _params: types.SimpleNamespace(
+            device_indices=entry.device_indices,
+            last_device_node=parent_node,
+        ),
+        inc_lock_ref=lambda node: locks.append(node),
     )
     scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
         free=lambda indices: None
@@ -173,42 +370,232 @@ def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
     assert inserted[0].key.token_ids == tokens
     assert inserted[0].value is entry.device_indices
     assert req._agentic_kv_direct_hit_tokens == len(tokens)
+    assert req._agentic_direct_parent_pin_node is parent_node
+    assert locks == [parent_node]
     assert request.snapshot_id not in scheduler.agentic_early_direct_receives
 
 
-def test_completed_direct_waiters_bind_outside_prefill_admission_batch(monkeypatch):
+def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
     scheduler = Scheduler.__new__(Scheduler)
-    now = time.monotonic()
-    reqs = [_Req(f"ready-{index}", "fast") for index in range(20)]
-    parents = {
-        req.rid: RequestGeneration(f"trajectory-{index}", 0)
-        for index, req in enumerate(reqs)
-    }
-    scheduler.agentic_kv_waiting_queue = [(req, now) for req in reqs]
-    scheduler.agentic_early_direct_receives = {
-        parent.snapshot_id: types.SimpleNamespace(completed_at=now)
-        for parent in parents.values()
-    }
+    request = RequestGeneration("trajectory-direct-transit", 0)
+    tokens = list(range(64))
+    manifest = SnapshotManifest(
+        request=request,
+        page_keys=(),
+        token_count=64,
+        byte_size=0,
+        state=SnapshotState.DIRECT_LOADING,
+        token_digest=token_ids_digest(tokens),
+        direct_bootstrap_addr="127.0.0.1:1",
+        direct_room=8,
+        claim_id="claim",
+    )
+    allocation = types.SimpleNamespace(allocated_tokens=64, token_count=64)
+    ordinary_replacement = torch.arange(640, 704, dtype=torch.int64)
+    entry = AgenticEarlyDirectReceive(
+        request=request,
+        manifest=manifest,
+        claim_id="claim",
+        receiver=object(),
+        device_indices=torch.arange(64, dtype=torch.int64),
+        started_at=time.monotonic(),
+        arrived_at=time.time(),
+        credit_allocation=allocation,
+        ordinary_replacement_indices=ordinary_replacement,
+        completed_at=time.monotonic(),
+    )
+    scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
+    scheduler.agentic_early_direct_terminal = {}
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
-    monkeypatch.setattr(
-        scheduler_module.AgenticRequestMetadata,
-        "from_req",
-        lambda req: types.SimpleNamespace(parent=parents[req.rid]),
+    inserted = []
+    scheduler.tree_cache = types.SimpleNamespace(
+        insert=lambda params: (
+            inserted.append(params) or types.SimpleNamespace(prefix_len=0)
+        )
     )
-    bound = []
-
-    def bind(self, req, parent):
-        bound.append(parent.snapshot_id)
-        req._agentic_kv_gate_complete = True
-        return False
-
-    scheduler._agentic_bind_early_direct_receive = types.MethodType(
-        bind, scheduler
+    scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
+        alloc=lambda _tokens: (_ for _ in ()).throw(
+            AssertionError("ordinary pages must be reserved before Direct claim")
+        ),
+        free=lambda _indices: None,
     )
-    scheduler._agentic_bind_completed_waiters()
+    parent_node = object()
+    locks = []
+    scheduler.tree_cache.match_prefix = lambda _params: types.SimpleNamespace(
+        device_indices=entry.device_indices,
+        last_device_node=parent_node,
+    )
+    scheduler.tree_cache.inc_lock_ref = lambda node: locks.append(node)
+    promoted = []
+    scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
+        promote_to_ordinary=lambda alloc, replacement: promoted.append(
+            (alloc, replacement)
+        ),
+        mark_bound=lambda _alloc: (_ for _ in ()).throw(
+            AssertionError("successful ownership swap must not stay reserve-owned")
+        ),
+        free_tokens=0,
+    )
+    req = _Req("tokenized-direct-transit")
+    req.origin_input_ids = tokens + [999]
+    req.extra_key = "cache-salt"
+    req.priority = 0
 
-    assert len(bound) == 20
-    assert all(req._agentic_kv_gate_complete for req in reqs)
+    assert scheduler._agentic_bind_early_direct_receive(req, request) is False
+    assert len(inserted) == 1
+    assert promoted == [(allocation, ordinary_replacement)]
+    assert locks == [parent_node]
+    assert not hasattr(req, "_agentic_direct_credit_allocation")
+    assert req._agentic_direct_parent_pin_node is parent_node
+    assert request.snapshot_id not in scheduler.agentic_early_direct_receives
+
+
+def test_native_prefill_lock_atomically_releases_direct_parent_pin():
+    events = []
+    native_node = object()
+    direct_parent_node = object()
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.is_hybrid_swa = False
+    adder.tree_cache = types.SimpleNamespace(
+        inc_lock_ref=lambda node: events.append(("inc", node))
+        or types.SimpleNamespace(),
+        dec_lock_ref=lambda node: events.append(("dec", node)),
+    )
+    req = types.SimpleNamespace(
+        last_node=native_node,
+        _agentic_direct_parent_pin_node=direct_parent_node,
+    )
+
+    adder._req_inc_lock_ref(req)
+
+    assert events == [("inc", native_node), ("dec", direct_parent_node)]
+    assert not hasattr(req, "_agentic_direct_parent_pin_node")
+
+
+def test_abort_releases_direct_parent_pin_and_request_generation_cache():
+    scheduler = Scheduler.__new__(Scheduler)
+    parent_node = object()
+    events = []
+    scheduler.tree_cache = types.SimpleNamespace(
+        dec_lock_ref=lambda node: events.append(("unpin", node)),
+        release_agentic_request_cache=lambda req, committed_len: events.append(
+            ("release", req.rid, committed_len)
+        ),
+        release_aborted_request=lambda rid: events.append(("abort", rid)),
+    )
+    req = _Req("aborted-direct-parent")
+    req._agentic_direct_parent_pin_node = parent_node
+    req._agentic_direct_parent_token_count = 4096
+
+    scheduler._agentic_abort_cleanup(req)
+
+    assert events == [
+        ("unpin", parent_node),
+        ("release", req.rid, 4096),
+        ("abort", req.rid),
+    ]
+    assert not hasattr(req, "_agentic_direct_parent_pin_node")
+    assert not hasattr(req, "_agentic_direct_parent_token_count")
+
+
+def test_inotify_arrivals_are_deduplicated_then_admitted_from_fifo(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    request = RequestGeneration("trajectory-event-admission", 0)
+    payload = {
+        "arrived_at": time.time(),
+        "target_prefill_domain": 1,
+    }
+    scheduler.agentic_early_direct_arrival_watcher = types.SimpleNamespace(
+        poll=lambda _timeout: [(request, payload), (request, payload)]
+    )
+    scheduler.agentic_early_direct_admission_queue = deque()
+    scheduler.agentic_early_direct_admission_ids = set()
+    scheduler.agentic_early_direct_reservation_queue = deque()
+    scheduler.agentic_early_direct_reserved_queue = deque()
+    scheduler.agentic_early_direct_receives = {}
+    scheduler.agentic_early_direct_terminal = {}
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    allocation = types.SimpleNamespace(allocated_tokens=1024)
+    scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
+        allocate=lambda tokens: allocation if tokens == 1024 else None,
+        release=lambda _allocation: None,
+    )
+    scheduler.server_args = types.SimpleNamespace(page_size=64)
+    ordinary = torch.arange(1024, dtype=torch.int64)
+    scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
+        alloc=lambda tokens: ordinary if tokens == 1024 else None,
+        free=lambda _indices: None,
+    )
+    manifest = types.SimpleNamespace(
+        request=request,
+        state=SnapshotState.DIRECT_READY,
+        created_at=payload["arrived_at"],
+        token_count=1024,
+    )
+    snapshot_store = types.SimpleNamespace(
+        load=lambda _request, require_ready=False: manifest
+    )
+    admitted = []
+    scheduler._agentic_start_early_direct_receive = types.MethodType(
+        lambda self, observed, *_args, **kwargs: admitted.append(
+            (observed, kwargs)
+        )
+        or True,
+        scheduler,
+    )
+    monkeypatch.setenv("SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS", "1")
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_PREFILL_DOMAIN", "1")
+
+    scheduler._agentic_collect_direct_arrivals(
+        scheduler.agentic_early_direct_poll_lock
+    )
+    assert len(scheduler.agentic_early_direct_admission_queue) == 1
+    scheduler._agentic_admit_queued_direct_receives(
+        snapshot_store,
+        direct_timeout=2.0,
+        poll_lock=scheduler.agentic_early_direct_poll_lock,
+    )
+
+    assert not scheduler.agentic_early_direct_admission_queue
+    assert len(scheduler.agentic_early_direct_reservation_queue) == 1
+
+    scheduler._agentic_reserve_queued_direct_pages()
+    assert len(scheduler.agentic_early_direct_reserved_queue) == 1
+    scheduler._agentic_start_reserved_direct_receives(snapshot_store)
+
+    assert admitted[0][0] == request
+    assert admitted[0][1]["credit_allocation"] is allocation
+    assert admitted[0][1]["ordinary_replacement_indices"] is ordinary
+    assert not scheduler.agentic_early_direct_reserved_queue
+    assert request.snapshot_id not in scheduler.agentic_early_direct_admission_ids
+
+
+def test_early_direct_ordinary_reservation_failure_never_claims():
+    scheduler = Scheduler.__new__(Scheduler)
+    request = RequestGeneration("trajectory-no-ordinary-space", 0)
+    manifest = types.SimpleNamespace(token_count=1024)
+    allocation = object()
+    released = []
+    scheduler.server_args = types.SimpleNamespace(page_size=64)
+    scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
+        allocate=lambda _tokens: allocation,
+        release=lambda value: released.append(value),
+    )
+    scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
+        alloc=lambda _tokens: None
+    )
+    scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_early_direct_reservation_queue = deque(
+        [(request, manifest, time.time(), 0)]
+    )
+    scheduler.agentic_early_direct_reserved_queue = deque()
+    scheduler.agentic_early_direct_admission_ids = {request.snapshot_id}
+
+    scheduler._agentic_reserve_queued_direct_pages()
+
+    assert released == [allocation]
+    assert not scheduler.agentic_early_direct_reserved_queue
+    assert request.snapshot_id not in scheduler.agentic_early_direct_admission_ids
 
 
 def test_early_direct_pages_are_counted_as_transport_reservation():
@@ -277,7 +664,7 @@ def test_arrival_marker_never_falls_back_to_req_owned_direct(monkeypatch):
     assert scheduler._agentic_should_defer(
         req, time.monotonic(), allow_start_io=True
     ) is True
-    assert polls == [True]
+    assert polls == []
     assert bind_calls == [parent.snapshot_id, parent.snapshot_id]
 
 
@@ -333,7 +720,7 @@ def test_final_manifest_recomputes_without_ready_timeout(monkeypatch):
     assert req._agentic_kv_fallback == "final"
 
 
-def test_missing_parent_wait_covers_direct_to_host_transition(monkeypatch):
+def test_missing_parent_wait_uses_request_level_ready_timeout(monkeypatch):
     monkeypatch.setenv("SGLANG_AGENTIC_KV_READY_TIMEOUT", "120")
     monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT", "2")
     monkeypatch.setenv("SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE", "8")
@@ -363,12 +750,53 @@ def test_missing_parent_wait_covers_direct_to_host_transition(monkeypatch):
         waiting, time.monotonic() - 3.0
     ) is True
 
+    transitioning = _Req("transition-still-publishing")
+    transitioning._agentic_kv_gate_complete = False
+    assert scheduler._agentic_should_defer(
+        transitioning, time.monotonic() - 11.0
+    ) is True
+
     expired = _Req("transition-expired")
     expired._agentic_kv_gate_complete = False
     assert scheduler._agentic_should_defer(
-        expired, time.monotonic() - 11.0
+        expired, time.monotonic() - 121.0
     ) is False
     assert expired._agentic_kv_fallback == "timeout:missing"
+
+
+def test_direct_loading_parent_waits_instead_of_recomputing(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_READY_TIMEOUT", "120")
+    scheduler = Scheduler.__new__(Scheduler)
+    parent = RequestGeneration("trajectory-direct-loading", 0)
+    manifest = types.SimpleNamespace(
+        request=parent,
+        state=SnapshotState.DIRECT_LOADING,
+        created_at=time.time(),
+    )
+    scheduler.agentic_host_staging_manager = None
+    scheduler.agentic_early_claim_store = None
+    scheduler.agentic_early_direct_receives = {}
+    scheduler._agentic_bind_early_direct_receive = types.MethodType(
+        lambda self, child, request: None, scheduler
+    )
+    scheduler._agentic_snapshot_store = types.MethodType(
+        lambda self: types.SimpleNamespace(
+            load=lambda request, require_ready=False: manifest
+        ),
+        scheduler,
+    )
+    monkeypatch.setattr(
+        scheduler_module.AgenticRequestMetadata,
+        "from_req",
+        lambda req: types.SimpleNamespace(parent=parent),
+    )
+
+    waiting = _Req("direct-loading-child")
+    waiting._agentic_kv_gate_complete = False
+    assert scheduler._agentic_should_defer(
+        waiting, time.monotonic() - 10.0
+    ) is True
+    assert waiting._agentic_kv_gate_complete is False
 
 
 def test_ready_merge_is_stable_fast_then_slow_then_new():

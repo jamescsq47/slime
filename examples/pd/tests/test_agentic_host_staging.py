@@ -93,6 +93,87 @@ def test_claim_is_atomic_across_competing_p_threads():
         os.unlink(path)
 
 
+def test_tp_host_h2d_ready_barrier_waits_for_every_rank():
+    ledger, path = _ledger()
+    try:
+        ledger.offer(_offer())
+        assert ledger.claim("req:0", "p-group") is not None
+        assert ledger.publish_grants(
+            "req:0",
+            "p-group",
+            [{"seq": 0, "room": 11, "slot": 0, "start_page": 0, "num_pages": 3}],
+        )
+        assert ledger.ack_chunk("req:0", "p-group", 0)
+        assert ledger.mark_host_ready("req:0", "p-group", 1)
+
+        assert not ledger.mark_host_h2d_ready_rank(
+            "req:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.mark_host_h2d_ready_rank(
+            "req:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.get("req:0")["h2d_ready_ranks"] == [0, 1]
+        assert not ledger.tp_host_followers_loaded("req:0", "p-group", tp_size=2)
+        assert ledger.complete_host_load_rank(
+            "req:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.tp_host_followers_loaded("req:0", "p-group", tp_size=2)
+    finally:
+        os.unlink(path)
+
+
+def test_tp_host_load_selection_is_rank0_owned_and_group_atomic():
+    ledger, path = _ledger()
+    try:
+        # A non-primary rank cannot independently select its local queue head.
+        assert ledger.select_tp_host_load(
+            "rank1-head:0", "p-group", tp_rank=1, tp_size=2
+        ) == (None, False)
+        assert ledger.select_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        ) == ("rank0-head:0", False)
+        # Rank 1 is redirected to rank 0's snapshot until it joins that exact
+        # request-generation.
+        assert ledger.select_tp_host_load(
+            "rank1-head:0", "p-group", tp_rank=1, tp_size=2
+        ) == ("rank0-head:0", False)
+        assert ledger.select_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        ) == ("rank0-head:0", True)
+        assert ledger.active_tp_host_load("p-group", tp_size=2) == "rank0-head:0"
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.admit_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.active_tp_host_load("p-group", tp_size=2) == "rank0-head:0"
+        assert ledger.admit_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.active_tp_host_load("p-group", tp_size=2) is None
+    finally:
+        os.unlink(path)
+
+
 def test_p_only_claims_offers_for_its_numa_arena():
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager.arena_numa_node = 0
@@ -109,6 +190,115 @@ def test_p_only_claims_offers_for_its_numa_arena():
     )
 
     manager._admit_one({"numa-one:0": offer})
+
+
+def test_p_only_claims_offers_for_its_domain_within_numa():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager.arena_numa_node = 0
+    manager.arena_domain = 0
+    manager.ledger = types.SimpleNamespace(
+        claim=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wrong-domain offer must not be claimed")
+        )
+    )
+    offer = _offer("domain-one:0")
+    offer.update(
+        state=HostStageState.OFFERED.value,
+        arena_numa_node=0,
+        arena_domain=1,
+        created_at=1.0,
+    )
+
+    assert manager._admit_one({"domain-one:0": offer}) is False
+
+
+def test_p_accepts_legacy_numa_only_offer_without_domain():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager.arena_numa_node = 0
+    manager.arena_domain = 1
+
+    offer = _offer("legacy:0")
+    offer.update(arena_numa_node=0)
+
+    assert manager._offer_targets_this_arena(offer) is True
+
+
+def test_d_offer_carries_the_p_owned_arena_domain():
+    offered = []
+    client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.ledger = types.SimpleNamespace(
+        offer=lambda payload: offered.append(payload) or payload
+    )
+    client.source_numa_node = 0
+    client.arena_numa_node = 0
+    client.arena_domain = 1
+    client.direct_runtime = None
+    metadata = AgenticRequestMetadata("domain-offer", 2, parent_generation=1)
+    manifest = SnapshotManifest(
+        request=metadata.current,
+        page_keys=(),
+        token_count=64,
+        byte_size=0,
+        state=SnapshotState.SLOW_FALLBACK,
+    )
+
+    client.offer(
+        manifest=manifest,
+        metadata=metadata,
+        token_count=64,
+        token_digest="digest",
+        logical_hashes=["page"],
+        byte_size=1024,
+    )
+
+    assert offered[0]["arena_numa_node"] == 0
+    assert offered[0]["arena_domain"] == 1
+
+
+def test_p_keeps_capacity_blocked_offer_pending():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager.arena_numa_node = -1
+    manager.page_size = 64
+    claimed = []
+    manager.ledger = types.SimpleNamespace(
+        claim=lambda snapshot_id, owner: claimed.append((snapshot_id, owner))
+    )
+    manager.owner = "p0"
+    manager._capacity_wait_timeout_seconds = 0.0
+    manager._can_admit = lambda byte_size: False
+    offer = _offer("capacity-wait:0")
+    offer.update(state=HostStageState.OFFERED.value, created_at=1.0)
+
+    assert manager._admit_one({"capacity-wait:0": offer}) is False
+    assert claimed == []
+
+
+def test_p_rejects_expired_capacity_blocked_offer_for_d_fail_open():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager.arena_numa_node = -1
+    manager.arena_domain = -1
+    manager.page_size = 64
+    manager.owner = "p0"
+    manager._capacity_wait_timeout_seconds = 2.0
+    transitions = []
+    offer = _offer("capacity-expired:0")
+    offer.update(state=HostStageState.OFFERED.value, created_at=1.0)
+    manager.ledger = types.SimpleNamespace(
+        claim=lambda snapshot_id, owner: dict(offer, owner=owner),
+        transition=lambda snapshot_id, state, **kwargs: transitions.append(
+            (snapshot_id, state, kwargs)
+        ),
+    )
+    manager._can_admit = lambda byte_size: False
+
+    assert manager._admit_one({"capacity-expired:0": offer}) is True
+    assert transitions == [
+        (
+            "capacity-expired:0",
+            HostStageState.REJECTED,
+            {"owner": "p0", "reason": "p_host_capacity_wait_timeout"},
+        )
+    ]
 
 
 def test_ledger_snapshot_reads_multiple_entries_once():

@@ -165,8 +165,7 @@ def test_blocked_isolated_relay_does_not_stop_p_to_d_progress():
     manager._decode_io_async_enabled = True
     manager._decode_io_threads = {}
     manager._decode_io_wakeups = {
-        name: threading.Event()
-        for name in ("transfer", "prealloc", "agentic", "relay")
+        name: threading.Event() for name in ("transfer", "prealloc", "agentic", "relay")
     }
     manager._decode_io_stop = threading.Event()
     manager._decode_io_intervals = {
@@ -226,12 +225,14 @@ def test_prefill_producer_enqueues_fifo_without_touching_sender():
     scheduler._prefill_ready_queue = __import__("collections").deque()
     scheduler._prefill_ready_queued_rids = set()
     first = types.SimpleNamespace(
-        rid="first", disagg_kv_sender=Sender(),
+        rid="first",
+        disagg_kv_sender=Sender(),
         disagg_p_ready_deferred=True,
         _async_prefill_transfer_payload=(1, [1], None),
     )
     second = types.SimpleNamespace(
-        rid="second", disagg_kv_sender=Sender(),
+        rid="second",
+        disagg_kv_sender=Sender(),
         disagg_p_ready_deferred=True,
         _async_prefill_transfer_payload=(1, [2], None),
     )
@@ -314,6 +315,7 @@ def test_blocked_prefill_sender_does_not_block_another_consumer():
     scheduler._prefill_ready_condition = threading.Condition()
     scheduler._prefill_ready_queue = __import__("collections").deque([blocked, fast])
     scheduler._prefill_ready_queued_rids = {blocked.rid, fast.rid}
+    scheduler._prefill_transfer_active_reqs = {}
     scheduler._publish_deferred_prefill_ready = lambda _req: None
 
     workers = [
@@ -343,6 +345,121 @@ def test_blocked_prefill_sender_does_not_block_another_consumer():
         scheduler._prefill_ready_condition.notify_all()
     for worker in workers:
         worker.join(timeout=1.0)
+
+
+def test_nonterminal_senders_cannot_exhaust_prefill_progress_pool():
+    """Later P results progress even when all old worker slots would be busy."""
+
+    class WaitingSender:
+        def poll(self):
+            return KVPoll.Transferring
+
+    class FastSender:
+        def poll(self):
+            return KVPoll.Success
+
+    worker_count = 4
+    waiting = [
+        types.SimpleNamespace(
+            rid=f"prefill-waiting-{index}", disagg_kv_sender=WaitingSender()
+        )
+        for index in range(worker_count * 2)
+    ]
+    fast = types.SimpleNamespace(
+        rid="prefill-later-fast", disagg_kv_sender=FastSender()
+    )
+    queued = [*waiting, fast]
+
+    scheduler = _PrefillHarness()
+    scheduler.disagg_prefill_inflight_queue = queued
+    scheduler._prefill_transfer_poll_lock = threading.Lock()
+    scheduler._prefill_transfer_stop = threading.Event()
+    scheduler._prefill_transfer_interval = 0.001
+    scheduler._prefill_ready_condition = threading.Condition()
+    scheduler._prefill_ready_queue = __import__("collections").deque(queued)
+    scheduler._prefill_ready_queued_rids = {req.rid for req in queued}
+    scheduler._prefill_transfer_active_reqs = {}
+    scheduler._publish_deferred_prefill_ready = lambda _req: None
+
+    workers = [
+        threading.Thread(
+            target=scheduler._prefill_transfer_consumer_worker,
+            args=(index,),
+            daemon=True,
+        )
+        for index in range(worker_count)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        deadline = time.monotonic() + 0.2
+        while not hasattr(fast, "_async_prefill_transfer_poll"):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert fast._async_prefill_transfer_poll == int(KVPoll.Success)
+        assert all(req._async_prefill_transfer_consumer_active for req in waiting)
+    finally:
+        scheduler._prefill_transfer_stop.set()
+        with scheduler._prefill_ready_condition:
+            scheduler._prefill_ready_condition.notify_all()
+        for worker in workers:
+            worker.join(timeout=1.0)
+
+
+def test_queued_prefill_sender_yields_when_direct_requests_lock():
+    """A sender queued before Direct arrived must recheck priority in-lock."""
+
+    entered_lock = threading.Event()
+    release_lock = threading.Event()
+
+    class ControlledLock:
+        def __enter__(self):
+            entered_lock.set()
+            assert release_lock.wait(timeout=1.0)
+            return self
+
+        def __exit__(self, *_args):
+            scheduler._prefill_transfer_stop.set()
+
+    class Sender:
+        def __init__(self):
+            self.poll_count = 0
+
+        def poll(self):
+            self.poll_count += 1
+            return KVPoll.Transferring
+
+    sender = Sender()
+    req = types.SimpleNamespace(rid="prefill-yields-to-direct", disagg_kv_sender=sender)
+    scheduler = _PrefillHarness()
+    scheduler.disagg_prefill_inflight_queue = [req]
+    scheduler._prefill_transfer_poll_lock = threading.Lock()
+    scheduler._prefill_transfer_stop = threading.Event()
+    scheduler._prefill_transfer_interval = 0.001
+    scheduler._prefill_ready_condition = threading.Condition()
+    scheduler._prefill_ready_queue = __import__("collections").deque([req])
+    scheduler._prefill_ready_queued_rids = {req.rid}
+    scheduler._prefill_transfer_active_reqs = {}
+    scheduler._publish_deferred_prefill_ready = lambda _req: None
+    scheduler.agentic_direct_poll_requested = threading.Event()
+    scheduler.agentic_nixl_control_lock = ControlledLock()
+
+    worker = threading.Thread(
+        target=scheduler._prefill_transfer_consumer_worker,
+        args=(0,),
+        daemon=True,
+    )
+    worker.start()
+    assert entered_lock.wait(timeout=1.0)
+    scheduler.agentic_direct_poll_requested.set()
+    release_lock.set()
+    with scheduler._prefill_ready_condition:
+        scheduler._prefill_ready_condition.notify_all()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert sender.poll_count == 0
+    assert req._async_prefill_transfer_last_poll == int(KVPoll.Transferring)
 
 
 def test_prefill_terminal_poll_survives_scheduler_snapshot_race():
@@ -494,9 +611,7 @@ def test_unknown_output_publishes_provisional_direct_candidate():
     )
 
     ordinary = _finished_agentic_req("malformed output requiring repair")
-    assert manager._offload_agentic_finished_snapshot(
-        ordinary, _agentic_metadata()
-    )
+    assert manager._offload_agentic_finished_snapshot(ordinary, _agentic_metadata())
     assert len(published) == 1
 
 
@@ -519,14 +634,10 @@ def test_explicit_tool_continuation_can_publish_reverse_kv():
     manager.agentic_direct_runtime = object()
     published = []
     manager._publish_agentic_direct_candidate = (
-        lambda req, metadata, tokens: published.append(
-            (req, metadata, list(tokens))
-        )
+        lambda req, metadata, tokens: published.append((req, metadata, list(tokens)))
         or True
     )
-    tool = _finished_agentic_req(
-        '{"name":"code_interpreter"}</tool_call> '
-    )
+    tool = _finished_agentic_req('{"name":"code_interpreter"}</tool_call> ')
     assert manager._offload_agentic_finished_snapshot(tool, _agentic_metadata())
     assert len(published) == 1
 
@@ -563,9 +674,7 @@ def test_unconfirmed_tool_candidate_fails_without_becoming_final():
         ),
     }
 
-    assert manager._agentic_fail_unconfirmed_tool_candidate(
-        candidate, manifest, 12.0
-    )
+    assert manager._agentic_fail_unconfirmed_tool_candidate(candidate, manifest, 12.0)
     assert failed == [(manifest, "application_tool_unconfirmed")]
     assert snapshot_id not in manager.agentic_direct_candidates
     assert ("claim", "unconfirmed_tool") in released

@@ -9,8 +9,11 @@ Supported entry points:
   c256, seed 2026, 300-second warmup and 1200-second measurement.
 - `run_1p5d_case.sh`: scale-out 1P:5D configuration.
 - `run_2p6d_numa_case.sh`: two-NUMA-domain 2P:6D configuration.
+- `run_4p4d_numa_case.sh`: four-P-domain 4P:4D configuration.  Each D uses
+  the Host/slow-path arena of its same-NUMA paired P, while completed Prefill
+  KV may still be late-bound to any feasible D.
 - `internal/`: Mooncake, lifecycle and model-service implementation used by
-  the three entry points.  Do not launch these files directly.
+  the entry points.  Do not launch these files directly.
 
 The current policy uses a 2-second fast-tool threshold, a 2-second Direct
 handshake bound, exact-size Direct receive pages, Direct > slow recovery > new

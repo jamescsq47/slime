@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 from inference import (
     DynamicScheduler,
     _parse_engine_metrics,
     arrival_offsets,
+    balanced_dispatch_samples,
     build_engine_timeseries,
     build_summary,
 )
@@ -42,6 +45,34 @@ def test_arrival_offsets_are_seeded_and_monotonic():
     assert first[0] == 0.0
     assert first == sorted(first)
     assert arrival_offsets(3, 0.5, "fixed", 7) == [0.0, 2.0, 4.0]
+
+
+def test_balanced_dispatch_can_preserve_dataset_order():
+    source = SimpleNamespace(
+        origin_samples=[
+            SimpleNamespace(
+                metadata={"task_type": "qa", "source_position": position},
+                index=-1,
+                group_index=-1,
+            )
+            for position in range(4)
+        ]
+    )
+    schedule = [
+        {"task_type": "qa", "experiment_sample_id": f"qa-{position}"}
+        for position in range(4)
+    ]
+    samples, _ = balanced_dispatch_samples(
+        source,
+        measured_count=4,
+        warmup_count=0,
+        policy="fixed",
+        seed=2026,
+        math_ratio=0.0,
+        profile_schedule=schedule,
+        preserve_source_order=True,
+    )
+    assert [sample.metadata["source_position"] for sample in samples] == [0, 1, 2, 3]
 
 
 def test_dynamic_scheduler_routes_away_from_the_heavier_node():

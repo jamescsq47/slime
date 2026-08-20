@@ -51,12 +51,12 @@ HISTOGRAMS = {
 }
 
 
-def make_runtime_args(cli: argparse.Namespace) -> Namespace:
+def make_runtime_args(cli: argparse.Namespace, workload: Any | None = None) -> Namespace:
     return Namespace(
         # Existing slime-compatible data/generation interface.
         hf_checkpoint=cli.model,
         rollout_global_dataset=True,
-        rollout_shuffle=True,
+        rollout_shuffle=not cli.preserve_source_order,
         rollout_seed=cli.seed,
         rollout_max_prompt_len=cli.max_context_length,
         input_key="prompt",
@@ -66,20 +66,7 @@ def make_runtime_args(cli: argparse.Namespace) -> Namespace:
         multimodal_keys=None,
         apply_chat_template=True,
         apply_chat_template_kwargs={},
-        math_data_path=cli.math_data,
-        qa_data_path=cli.qa_data,
-        terminal_data_path=None,
-        math_ratio=cli.math_ratio,
-        terminal_ratio=0.0,
-        batch_alternation=False,
-        count_aware_alternation=False,
-        dynamic_alternation=False,
         n_samples_per_prompt=1,
-        rollout_batch_size=1,
-        current_policy_version=0,
-        save=str(cli.output_dir),
-        load=None,
-        dump_details=None,
         # GenerateState and copied Math/QA agents.
         sglang_router_ip=cli.router_host,
         sglang_router_port=cli.router_port,
@@ -107,12 +94,13 @@ def make_runtime_args(cli: argparse.Namespace) -> Namespace:
         sglang_context_length=cli.max_context_length,
         context_parallel_size=1,
         max_tokens_per_gpu=cli.max_context_length,
-        partial_rollout=False,
         use_slime_dashboard=True,
         enable_tool_delay=False,
-        mask_offpolicy_in_partial_rollout=False,
-        mask_offpolicy_math=None,
-        mask_offpolicy_qa=None,
+        workload_dataset_options=(
+            {dataset.id: dict(dataset.options) for dataset in workload.datasets}
+            if workload is not None
+            else {}
+        ),
     )
 
 
@@ -136,6 +124,7 @@ def balanced_dispatch_samples(
     seed: int,
     math_ratio: float = 0.5,
     profile_schedule: list[dict[str, Any]] | None = None,
+    preserve_source_order: bool = False,
 ) -> tuple[list["Sample"], list[dict[str, Any]]]:
     """Select a fixed-composition sample set, changing only its dispatch order."""
     if not 0.0 <= math_ratio <= 1.0:
@@ -145,9 +134,10 @@ def balanced_dispatch_samples(
         task_type = (sample.metadata or {}).get("task_type")
         if task_type in pools:
             pools[task_type].append(sample)
-    rng = random.Random(seed)
-    for pool in pools.values():
-        rng.shuffle(pool)
+    if not preserve_source_order:
+        rng = random.Random(seed)
+        for pool in pools.values():
+            rng.shuffle(pool)
 
     math_count = round(measured_count * math_ratio)
     qa_count = measured_count - math_count
@@ -469,11 +459,14 @@ def sample_record(
     error: str | None = None,
 ) -> dict[str, Any]:
     turns = generation_turns(getattr(sample, "trace", None))
-    task_type = (sample.metadata or {}).get("task_type", "unknown")
+    metadata = sample.metadata or {}
+    task_type = metadata.get("task_type", "unknown")
     return {
         "sample_index": sample.index,
         "group_index": sample.group_index,
         "task_type": task_type,
+        "dataset_id": metadata.get("dataset_id", task_type),
+        "harness_id": metadata.get("harness_id"),
         "scheduled_ts": scheduled_ts,
         "arrival_ts": arrival_ts,
         "started_ts": started_ts,
@@ -818,9 +811,20 @@ def build_summary(
     prefill_rate = _role_throughput(engine_records, "prefill", "sglang_prompt_tokens_total")
     cached_rate = _role_throughput(engine_records, "prefill", "sglang_cached_tokens_total")
     domains = {}
-    for domain in ("math", "qa"):
-        subset = [record for record in records if record["task_type"] == domain]
-        domains[domain] = {
+    dataset_ids = sorted(
+        {
+            str(record.get("dataset_id") or record.get("task_type") or "unknown")
+            for record in records
+        }
+    )
+    for dataset_id in dataset_ids:
+        subset = [
+            record
+            for record in records
+            if str(record.get("dataset_id") or record.get("task_type") or "unknown")
+            == dataset_id
+        ]
+        domains[dataset_id] = {
             "count": len(subset),
             "completed": sum(record["status"] == "completed" for record in subset),
             "agent_latency_seconds": distribution([record["agent_latency_seconds"] for record in subset]),
@@ -1048,14 +1052,38 @@ async def run_closed_loop(
 
 
 async def async_main(cli: argparse.Namespace) -> None:
-    from custom_data_source import CustomDataSource
+    from data.config import legacy_workload, load_workload
+    from data.dispatch import select_samples
+    from data.loading import load_samples
     from slime.rollout.sglang_rollout import GenerateState
     from slime.utils.http_utils import init_http_client
     from slime.utils.types import Sample
 
     cli.output_dir.mkdir(parents=True, exist_ok=True)
-    args = make_runtime_args(cli)
-    source = CustomDataSource(args)
+    workload = (
+        load_workload(cli.workload_config)
+        if cli.workload_config is not None
+        else legacy_workload(
+            math_path=cli.math_data,
+            qa_path=cli.qa_data,
+            math_ratio=cli.math_ratio,
+            policy=cli.dispatch_policy,
+            seed=cli.seed,
+            preserve_source_order=cli.preserve_source_order,
+            schedule_file=str(cli.schedule_file) if cli.schedule_file else None,
+        )
+    )
+    if cli.workload_config is not None:
+        cli.seed = workload.sampling.seed
+        cli.dispatch_policy = workload.sampling.policy
+        cli.preserve_source_order = workload.sampling.preserve_source_order
+        cli.schedule_file = (
+            Path(workload.sampling.schedule_file)
+            if workload.sampling.schedule_file is not None
+            else None
+        )
+    args = make_runtime_args(cli, workload)
+    source = load_samples(args, workload)
     profile_schedule = None
     if cli.dispatch_policy in {"profile_balanced", "fixed"}:
         if cli.schedule_file is None:
@@ -1089,24 +1117,27 @@ async def async_main(cli: argparse.Namespace) -> None:
                 offsets[task_type] += 1
         else:
             raise ValueError("unsupported schedule file format")
-    samples, dispatch_log = balanced_dispatch_samples(
-        source,
+    samples, dispatch_log = select_samples(
+        source.pools,
+        workload,
         measured_count=cli.requests,
         warmup_count=cli.warmup_requests,
-        policy=cli.dispatch_policy,
-        seed=cli.seed,
-        math_ratio=cli.math_ratio,
-        profile_schedule=profile_schedule,
+        schedule=profile_schedule,
     )
     if len(samples) != cli.warmup_requests + cli.requests:
         raise RuntimeError(f"requested {cli.warmup_requests + cli.requests} samples, got {len(samples)}")
 
     config = vars(cli) | {"output_dir": str(cli.output_dir)}
+    config["workload_config"] = str(cli.workload_config) if cli.workload_config else None
     config["schedule_file"] = str(cli.schedule_file) if cli.schedule_file else None
     write_json(cli.output_dir / "config.json", config)
+    write_json(cli.output_dir / "resolved_workload.json", workload.to_dict())
     if cli.dry_run:
         write_json(cli.output_dir / "dispatch_sequence.json", dispatch_log)
-        preview = [(sample.index, sample.metadata.get("task_type")) for sample in samples]
+        preview = [
+            (sample.index, sample.metadata.get("dataset_id"), sample.metadata.get("harness_id"))
+            for sample in samples
+        ]
         write_json(cli.output_dir / "dispatch_preview.json", preview)
         print(json.dumps(preview, ensure_ascii=False))
         return
@@ -1117,7 +1148,7 @@ async def async_main(cli: argparse.Namespace) -> None:
         await run_closed_loop(cli, args, samples[cli.warmup_requests :], dispatch_log)
         return
     for sample in samples[: cli.warmup_requests]:
-        LOG.info("warmup sample=%s domain=%s", sample.index, sample.metadata.get("task_type"))
+        LOG.info("warmup sample=%s dataset=%s", sample.index, sample.metadata.get("dataset_id"))
         await run_one(args, sample, time.monotonic(), time.time(), asyncio.Semaphore(1))
 
     sampler = EngineSampler(
@@ -1149,6 +1180,10 @@ async def async_main(cli: argparse.Namespace) -> None:
     semaphore = asyncio.Semaphore(cli.max_inflight)
     selected_samples: dict[int, Sample] = {}
     if cli.dispatch_policy == "dynamic":
+        if set(workload.dataset_ids) != {"math", "qa"}:
+            raise ValueError(
+                "the current pressure-feedback scheduler is defined only for the legacy math/qa mix"
+            )
         pools = {
             task_type: [
                 sample
@@ -1260,6 +1295,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=str(WORKSPACE_ROOT / "Qwen3-8B"))
     parser.add_argument(
+        "--workload-config",
+        type=Path,
+        default=None,
+        help="YAML/JSON dataset mixture; when set, replaces --math-data/--qa-data/--math-ratio",
+    )
+    parser.add_argument(
         "--math-data",
         default=str(WORKSPACE_ROOT / "data/dapo-math-17k/dapo-math-17k.jsonl"),
     )
@@ -1317,6 +1358,11 @@ def parse_args() -> argparse.Namespace:
         default="random",
     )
     parser.add_argument("--schedule-file", type=Path, default=None)
+    parser.add_argument(
+        "--preserve-source-order",
+        action="store_true",
+        help="select samples in dataset order instead of seed-shuffling each task pool",
+    )
     parser.add_argument("--dynamic-lookback-seconds", type=float, default=12.0)
     parser.add_argument("--dynamic-recent-seconds", type=float, default=10.0)
     parser.add_argument("--dynamic-history-start-seconds", type=float, default=20.0)
