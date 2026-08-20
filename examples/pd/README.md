@@ -1,15 +1,20 @@
 # Agentic PD serving experiments
 
-This directory contains the mixed Retool/BrowseComp serving workload, the
-clean SGLang baselines, and the request-generation KV pipeline.  Runtime
-modules stay at the directory root because the rollout workers import them as
-top-level modules; experiment launchers and one-off utilities do not.
+This directory contains pluggable agentic serving workloads, the clean SGLang
+baselines, and the request-generation KV pipeline. Retool, BrowseComp and
+Terminal-Bench now live under `data/`; thin root-level compatibility modules
+keep existing experiment imports working.
 
 ## Layout
 
 ```text
 examples/pd/
 ├── configs/                 environment and fixed workload schedules
+│   └── experiments/         dataset mixtures and reproducible sampling rules
+├── data/                    dataset loaders and inference-only harness plugins
+│   ├── retool/
+│   ├── browsecomp/
+│   └── terminal_bench/
 ├── docs/                    design and validation notes
 ├── patches/                 SGLang patch kept for reproducibility
 ├── requirement.txt          PD runtime, transport and analysis dependencies
@@ -24,7 +29,7 @@ examples/pd/
 ├── runs-host/
 │   ├── baseline/            retained formal baseline results only
 │   └── new-method/          retained latest-method result only
-└── *.py                     serving workload/runtime modules
+└── *.py                     shared PD runtime and compatibility modules
 ```
 
 Historical sweep, smoke-test, superseded launcher and temporary visualization
@@ -109,18 +114,26 @@ hf download --repo-type dataset Tevatron/browsecomp-plus-corpus
 hf download --repo-type dataset miaolu3/browsecomp-plus
 ```
 
-All launchers accept `MODEL_PATH`, while `inference.py` accepts `--math-data`
-and `--qa-data`.  For example:
+All maintained launchers accept `MODEL_PATH` and `WORKLOAD_CONFIG`. Dataset
+paths, harnesses, mixture weights and sampling semantics belong in that
+YAML/JSON config. For example:
 
 ```bash
 export MODEL_PATH="${PD_MODEL_ROOT}/Qwen3-8B"
-export MATH_DATA="${PD_DATA_ROOT}/dapo-math-17k/dapo-math-17k.jsonl"
-export QA_DATA="${PD_DATA_ROOT}/browsecomp/bc_train.jsonl"
+export PD_DATA_ROOT=/path/to/pd-data
+export WORKLOAD_CONFIG=examples/pd/configs/experiments/mixed_retool_browsecomp_1to1.yaml
 ```
 
-The maintained formal launchers already pass their workload through
-`inference.py`; override its defaults through launcher environment variables
-or edit a copied experiment launcher when using non-default dataset paths.
+The old `MATH_DATA`, `QA_DATA`, and `MATH_RATIO` variables remain compatible
+when `WORKLOAD_CONFIG` is unset. The legacy path produces the same two-stage
+shuffle as before. Every run records the resolved config and exact sample
+order, so a new mixture can be replayed rather than randomly regenerated.
+See `data/README.md` for the plugin contract and extension instructions.
+
+BrowseComp retrieval and Terminal-Bench OpenEnv are deliberately external
+services. A harness only connects to the configured endpoint; it never starts
+a GPU search worker or a task container itself. Existing launchers may still
+manage BrowseComp search as an explicit service lifecycle step.
 
 ## SGLang source checkouts
 
@@ -262,6 +275,25 @@ git -C "${SGLANG_SRC_ROOT}/pd_baseline" rev-parse HEAD
 ```
 
 ## Formal experiments
+
+Select a config-driven workload without changing the serving topology:
+
+```bash
+PD_DATA_ROOT="${PD_DATA_ROOT}" \
+WORKLOAD_CONFIG=examples/pd/configs/experiments/mixed_retool_browsecomp_1to1.yaml \
+bash examples/pd/scripts/new_method/run_1p3d_case.sh
+```
+
+Before using Terminal-Bench, start its OpenEnv service manually, set
+`environment_url` in `configs/experiments/terminal_bench.yaml`, and use that
+config in the same way.
+
+```bash
+cd /path/to/openenv/envs/tbench2_env
+TB2_MODE=docker \
+TB2_TASKS_DIR=/path/to/terminal-bench-2 \
+python -m tbench2_env.server.app --port 8003
+```
 
 Run the four-GPU colocated/1P:3D baseline comparison:
 

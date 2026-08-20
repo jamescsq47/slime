@@ -12,6 +12,7 @@ MODEL_PATH="${MODEL_PATH:-/dataset/model/qwen3/Qwen3-8B}"
 WORKSPACE_ROOT="$(dirname -- "$(cd -- "${PD_DIR}/../.." && pwd)")"
 MATH_DATA="${MATH_DATA:-${WORKSPACE_ROOT}/data/dapo-math-17k/dapo-math-17k.jsonl}"
 QA_DATA="${QA_DATA:-${WORKSPACE_ROOT}/data/browsecomp/bc_train.jsonl}"
+WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-}"
 CASE_MODE="${CASE_MODE:-no_reverse}"
 RUN_DIR="${RUN_DIR:-${PD_DIR}/runs-host/baseline-${CASE_MODE}}"
 PREFILL_GPUS="${PREFILL_GPUS:-0}"
@@ -187,11 +188,11 @@ pd_wait_http router "http://127.0.0.1:${ROUTER_PORT}/health" "${router_pid}" 300
 p_ports_csv="$(IFS=,; echo "${p_ports[*]}")"
 d_ports_csv="$(IFS=,; echo "${d_ports[*]}")"
 infer_args=(
-  --model "${MODEL_PATH}" --math-data "${MATH_DATA}" --qa-data "${QA_DATA}"
+  --model "${MODEL_PATH}"
   --router-port "${ROUTER_PORT}"
   --prefill-port "${p_ports[0]}" --prefill-ports "${p_ports_csv}"
   --decode-port "${d_ports[0]}" --decode-ports "${d_ports_csv}"
-  --math-ratio "${MATH_RATIO}" --requests "${REQUESTS}" --warmup-requests 0
+  --requests "${REQUESTS}" --warmup-requests 0
   --dispatch-policy fixed --schedule-file "${SCHEDULE_FILE}"
   --request-rate 100 --arrival-distribution fixed --max-inflight "${MAX_INFLIGHT}"
   --metrics-interval 2 --seed "${SEED}" --temperature 0 --top-p 1 --top-k -1
@@ -200,6 +201,11 @@ infer_args=(
   --closed-loop-max-warmup-seconds "$((WARMUP_SECONDS + 120))"
   --closed-loop-measurement-seconds "${MEASURE_SECONDS}" --output-dir "${RUN_DIR}"
 )
+if [[ -n "${WORKLOAD_CONFIG}" ]]; then
+  infer_args+=(--workload-config "${WORKLOAD_CONFIG}")
+else
+  infer_args+=(--math-data "${MATH_DATA}" --qa-data "${QA_DATA}" --math-ratio "${MATH_RATIO}")
+fi
 if [[ "${CASE_MODE}" == native_mooncake ]]; then
   infer_args+=(--pd-enable-decode-offload-kvcache --pd-hicache-storage-backend mooncake \
     --pd-hicache-storage-dir "${RUN_DIR}/hicache" \

@@ -1883,6 +1883,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                 "token_count": int(prompt_tokens),
                                 "prefill_domain": int(domain),
                                 "request_direction": "p2d",
+                                "control_offer": True,
+                                "tp_size": int(
+                                    os.getenv("SGLANG_AGENTIC_KV_TP_SIZE", "1")
+                                ),
                             }
                         )
                         p2d_offer_published = True

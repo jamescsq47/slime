@@ -1,0 +1,28 @@
+schema_version: 1
+
+datasets:
+  - id: math
+    harness: retool
+    path: ${PD_DATA_ROOT}/dapo-math-17k/dapo-math-17k.jsonl
+    weight: 1
+    options:
+      max_response_tokens: 8192
+
+  - id: qa
+    harness: browsecomp
+    path: ${PD_DATA_ROOT}/browsecomp/bc_train.jsonl
+    weight: 1
+    options:
+      max_response_tokens: 36864
+      max_tokens_per_turn: 2048
+      max_turns: 100
+      search_url: http://127.0.0.1:8730
+
+sampling:
+  policy: fixed
+  seed: 2026
+  preserve_source_order: false
+  shuffle_algorithm: legacy_two_stage_v1
+  count_algorithm: legacy_two_dataset_round_v1
+  pool_reuse_algorithm: cover_all_cycle_v1
+  schedule_file: ../workloads/fixed_random_s2026_n4096.json

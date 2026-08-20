@@ -13,10 +13,15 @@ cd "${PD_DIR}"
 MODEL_PATH="${MODEL_PATH:-/dataset/model/qwen3/Qwen3-8B}"
 MATH_DATA="${MATH_DATA:-${WORKSPACE_ROOT}/data/dapo-math-17k/dapo-math-17k.jsonl}"
 QA_DATA="${QA_DATA:-${WORKSPACE_ROOT}/data/browsecomp/bc_train.jsonl}"
+WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-}"
 PREFILL_GPU="${PREFILL_GPU:-0}"
 PREFILL_GPUS="${PREFILL_GPUS:-${PREFILL_GPU}}"
+PREFILL_GPU_GROUPS="${PREFILL_GPU_GROUPS:-}"
+PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-1}"
 DECODE_GPU="${DECODE_GPU:-1}"
 DECODE_GPUS="${DECODE_GPUS:-${DECODE_GPU}}"
+DECODE_GPU_GROUPS="${DECODE_GPU_GROUPS:-}"
+DECODE_TP_SIZE="${DECODE_TP_SIZE:-1}"
 SEARCH_GPU="${SEARCH_GPU:-2}"
 PREFILL_PORT="${PREFILL_PORT:-30000}"
 PREFILL_PORTS="${PREFILL_PORTS:-${PREFILL_PORT}}"
@@ -31,6 +36,7 @@ BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 BOOTSTRAP_PORTS="${BOOTSTRAP_PORTS:-${BOOTSTRAP_PORT}}"
 SEARCH_PORT="${SEARCH_PORT:-8000}"
 PD_SKIP_SEARCH="${PD_SKIP_SEARCH:-0}"
+SEARCH_START_AFTER_MODELS="${SEARCH_START_AFTER_MODELS:-false}"
 SEARCH_SERVER_EMBEDDING_CACHE="${SEARCH_SERVER_EMBEDDING_CACHE:-${REPO_ROOT}/examples/artifacts/search/corpus_embeddings.pkl}"
 ARRIVAL_RATE="${ARRIVAL_RATE:-0.05}"
 ARRIVAL_RATES="${ARRIVAL_RATES:-${ARRIVAL_RATE}}"
@@ -338,10 +344,8 @@ wait_http() {
   return 1
 }
 
-read -r -a prefill_gpus <<<"${PREFILL_GPUS}"
 read -r -a prefill_ports <<<"${PREFILL_PORTS}"
 read -r -a bootstrap_ports <<<"${BOOTSTRAP_PORTS}"
-read -r -a decode_gpus <<<"${DECODE_GPUS}"
 read -r -a decode_ports <<<"${DECODE_PORTS}"
 read -r -a decode_mem_fraction_statics <<<"${DECODE_MEM_FRACTION_STATICS}"
 read -r -a local_gpus <<<"${LOCAL_GPUS}"
@@ -349,24 +353,73 @@ read -r -a local_ports <<<"${LOCAL_PORTS}"
 decode_ports_csv="$(IFS=,; echo "${decode_ports[*]}")"
 prefill_ports_csv="$(IFS=,; echo "${prefill_ports[*]}")"
 local_ports_csv="$(IFS=,; echo "${local_ports[*]}")"
-if (( ${#decode_gpus[@]} != ${#decode_ports[@]} )); then
-  echo "DECODE_GPUS and DECODE_PORTS must contain the same number of entries" >&2
+
+# A semicolon separates logical engines and a comma separates TP ranks inside
+# one engine.  Legacy whitespace-delimited *_GPUS remains byte-for-byte
+# compatible and is converted to singleton TP=1 groups only when the new
+# variables are absent.
+if [[ -n "${PREFILL_GPU_GROUPS}" ]]; then
+  IFS=';' read -r -a prefill_gpu_groups <<<"${PREFILL_GPU_GROUPS}"
+else
+  read -r -a legacy_prefill_gpus <<<"${PREFILL_GPUS}"
+  prefill_gpu_groups=("${legacy_prefill_gpus[@]}")
+fi
+if [[ -n "${DECODE_GPU_GROUPS}" ]]; then
+  IFS=';' read -r -a decode_gpu_groups <<<"${DECODE_GPU_GROUPS}"
+else
+  read -r -a legacy_decode_gpus <<<"${DECODE_GPUS}"
+  decode_gpu_groups=("${legacy_decode_gpus[@]}")
+fi
+
+validate_gpu_groups() {
+  local role="$1" tp_size="$2"
+  shift 2
+  local group gpu
+  local -a ranks
+  [[ "${tp_size}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "${role}_TP_SIZE must be a positive integer" >&2
+    exit 1
+  }
+  for group in "$@"; do
+    IFS=',' read -r -a ranks <<<"${group}"
+    if (( ${#ranks[@]} != tp_size )); then
+      echo "${role} GPU group '${group}' has ${#ranks[@]} ranks; expected ${tp_size}" >&2
+      exit 1
+    fi
+    for gpu in "${ranks[@]}"; do
+      [[ "${gpu}" =~ ^[0-9]+$ ]] || {
+        echo "invalid GPU '${gpu}' in ${role} group '${group}'" >&2
+        exit 1
+      }
+    done
+  done
+}
+
+validate_gpu_groups PREFILL "${PREFILL_TP_SIZE}" "${prefill_gpu_groups[@]}"
+validate_gpu_groups DECODE "${DECODE_TP_SIZE}" "${decode_gpu_groups[@]}"
+if (( PREFILL_TP_SIZE != DECODE_TP_SIZE )); then
+  echo "Agentic TP currently requires equal PREFILL_TP_SIZE and DECODE_TP_SIZE" >&2
   exit 1
 fi
-if (( ${#prefill_gpus[@]} != ${#prefill_ports[@]} || ${#prefill_gpus[@]} != ${#bootstrap_ports[@]} )); then
-  echo "PREFILL_GPUS, PREFILL_PORTS and BOOTSTRAP_PORTS must have equal lengths" >&2
+export SGLANG_AGENTIC_KV_TP_SIZE="${PREFILL_TP_SIZE}"
+if (( ${#decode_gpu_groups[@]} != ${#decode_ports[@]} )); then
+  echo "DECODE GPU groups and DECODE_PORTS must contain the same number of entries" >&2
   exit 1
 fi
-if (( ${#decode_gpus[@]} % ${#prefill_gpus[@]} != 0 )); then
-  echo "DECODE_GPUS must split evenly across P workers" >&2
+if (( ${#prefill_gpu_groups[@]} != ${#prefill_ports[@]} || ${#prefill_gpu_groups[@]} != ${#bootstrap_ports[@]} )); then
+  echo "PREFILL GPU groups, PREFILL_PORTS and BOOTSTRAP_PORTS must have equal lengths" >&2
+  exit 1
+fi
+if (( ${#decode_gpu_groups[@]} % ${#prefill_gpu_groups[@]} != 0 )); then
+  echo "DECODE GPU groups must split evenly across logical P workers" >&2
   exit 1
 fi
 if (( ${#decode_mem_fraction_statics[@]} == 0 )); then
-  for _ in "${decode_gpus[@]}"; do
+  for _ in "${decode_gpu_groups[@]}"; do
     decode_mem_fraction_statics+=("${MEM_FRACTION_STATIC}")
   done
-elif (( ${#decode_mem_fraction_statics[@]} != ${#decode_gpus[@]} )); then
-  echo "DECODE_MEM_FRACTION_STATICS must be empty or match DECODE_GPUS" >&2
+elif (( ${#decode_mem_fraction_statics[@]} != ${#decode_gpu_groups[@]} )); then
+  echo "DECODE_MEM_FRACTION_STATICS must be empty or match logical DECODE GPU groups" >&2
   exit 1
 fi
 if (( ${#local_gpus[@]} != ${#local_ports[@]} )); then
@@ -376,6 +429,13 @@ fi
 if (( ${#local_gpus[@]} > 0 )) && [[ -z "${LOCAL_ROUTER_PORT}" ]]; then
   echo "LOCAL_ROUTER_PORT is required when LOCAL_GPUS is non-empty" >&2
   exit 1
+fi
+
+if [[ "${PD_TOPOLOGY_VALIDATE_ONLY:-0}" == "1" ]]; then
+  printf 'prefill_tp=%s groups=%s\n' "${PREFILL_TP_SIZE}" "${prefill_gpu_groups[*]}"
+  printf 'decode_tp=%s groups=%s\n' "${DECODE_TP_SIZE}" "${decode_gpu_groups[*]}"
+  printf 'decode_mem_fraction_statics=%s\n' "${decode_mem_fraction_statics[*]}"
+  exit 0
 fi
 
 agentic_direct_ports=()
@@ -407,11 +467,24 @@ for port in "${ports_to_check[@]}"; do
     exit 1
   fi
 done
-gpus_to_check=("${prefill_gpus[@]}" "${decode_gpus[@]}" "${local_gpus[@]}")
-[[ "${PD_SKIP_SEARCH}" != "1" ]] && gpus_to_check+=("${SEARCH_GPU}")
-for gpu in "${gpus_to_check[@]}"; do
+model_gpus=()
+for group in "${prefill_gpu_groups[@]}" "${decode_gpu_groups[@]}"; do
+  IFS=',' read -r -a group_ranks <<<"${group}"
+  model_gpus+=("${group_ranks[@]}")
+done
+declare -A seen_gpus=()
+for gpu in "${model_gpus[@]}" "${local_gpus[@]}"; do
+  if [[ -n "${seen_gpus[${gpu}]:-}" ]]; then
+    echo "GPU ${gpu} appears in more than one model group" >&2
+    exit 1
+  fi
+  seen_gpus["${gpu}"]=1
   check_gpu_idle "${gpu}"
 done
+# SEARCH_GPU is intentionally allowed to share a Decode rank.
+if [[ "${PD_SKIP_SEARCH}" != "1" ]]; then
+  check_gpu_idle "${SEARCH_GPU}"
+fi
 
 local_pids=()
 for index in "${!local_gpus[@]}"; do
@@ -427,7 +500,7 @@ for index in "${!local_gpus[@]}"; do
   pids+=("$!")
 done
 
-if [[ "${PD_SKIP_SEARCH}" != "1" ]]; then
+start_search_server() {
   setsid env CUDA_VISIBLE_DEVICES="${SEARCH_GPU}" SEARCH_SERVER_GPU_IDS=0 \
     SEARCH_SERVER_EMBEDDING_CACHE="${SEARCH_SERVER_EMBEDDING_CACHE}" \
     python "${PD_DIR}/search_server.py" \
@@ -439,26 +512,40 @@ if [[ "${PD_SKIP_SEARCH}" != "1" ]]; then
   search_pid=$!
   pids+=("${search_pid}")
   wait_http search "http://127.0.0.1:${SEARCH_PORT}/health" "${search_pid}" 1200
+}
+
+if [[ "${PD_SKIP_SEARCH}" != "1" && "${SEARCH_START_AFTER_MODELS}" != "true" ]]; then
+  start_search_server
 fi
 
-prefill_numas=()
+prefill_numa_vectors=()
 prefill_pids=()
-for index in "${!prefill_gpus[@]}"; do
-  prefill_numa="$(gpu_numa_node "${prefill_gpus[$index]}")"
-  prefill_numas+=("${prefill_numa}")
+for index in "${!prefill_gpu_groups[@]}"; do
+  prefill_group="${prefill_gpu_groups[$index]}"
+  IFS=',' read -r -a prefill_group_gpus <<<"${prefill_group}"
+  prefill_group_numas=()
+  for gpu in "${prefill_group_gpus[@]}"; do
+    prefill_group_numas+=("$(gpu_numa_node "${gpu}")")
+  done
+  prefill_numa_csv="$(IFS=,; echo "${prefill_group_numas[*]}")"
+  prefill_numa_vectors+=("${prefill_numa_csv}")
+  prefill_numa="${prefill_group_numas[0]}"
   prefill_launch=(setsid)
-  if [[ "${SGLANG_AGENTIC_KV_HOST_STAGING:-false}" == "true" ]] && command -v numactl >/dev/null 2>&1; then
+  if (( PREFILL_TP_SIZE == 1 )) && [[ "${SGLANG_AGENTIC_KV_HOST_STAGING:-false}" == "true" ]] && command -v numactl >/dev/null 2>&1; then
     prefill_launch+=(numactl --cpunodebind="${prefill_numa}" --membind="${prefill_numa}")
   fi
-  "${prefill_launch[@]}" env CUDA_VISIBLE_DEVICES="${prefill_gpus[$index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+  "${prefill_launch[@]}" env CUDA_VISIBLE_DEVICES="${prefill_group}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+    SGLANG_AGENTIC_KV_ENGINE_ID="prefill-${index}" \
     SGLANG_AGENTIC_KV_PREFILL_DOMAIN="${index}" \
     SGLANG_AGENTIC_KV_ARENA_NUMA_NODE="${prefill_numa}" \
+    SGLANG_AGENTIC_KV_TP_NUMA_NODES="${prefill_numa_csv}" \
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}/p-${index}-numa-${prefill_numa}" \
     SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR:-/dev/shm/sglang-agentic-p2d-disabled}/p-${index}-numa-${prefill_numa}" \
     SGLANG_PD_P_READY_DIR="${PD_P_READY_DIR}" \
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${PD_HICACHE_STORAGE_DIR}" \
     python -m sglang.launch_server \
       --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${prefill_ports[$index]}" \
+      --tp-size "${PREFILL_TP_SIZE}" --numa-node "${prefill_group_numas[@]}" \
       --context-length "${MAX_CONTEXT_LENGTH}" --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" --enable-metrics \
       --chunked-prefill-size "${PREFILL_CHUNKED_PREFILL_SIZE}" \
@@ -473,23 +560,44 @@ for index in "${!prefill_gpus[@]}"; do
   prefill_pids+=("${prefill_pid}")
   pids+=("${prefill_pid}")
   wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/health" "${prefill_pids[$index]}"
+  # The HTTP server can become healthy even when its auxiliary KV bootstrap
+  # listener failed to bind.  That produces a deceptive half-alive P: every
+  # later P->D handshake retries forever behind the first FIFO generation.
+  # Treat any listener bind failure during startup as fatal.
+  if grep -Eq 'Server error:.*address already in use|error while attempting to bind.*address already in use' \
+      "${RUN_DIR}/logs/prefill-${index}.log"; then
+    echo "prefill-${index} KV bootstrap listener failed; see ${RUN_DIR}/logs/prefill-${index}.log" >&2
+    exit 1
+  fi
 done
 
 decode_pids=()
-for index in "${!decode_gpus[@]}"; do
-  decode_numa="$(gpu_numa_node "${decode_gpus[$index]}")"
+for index in "${!decode_gpu_groups[@]}"; do
+  decode_group="${decode_gpu_groups[$index]}"
+  IFS=',' read -r -a decode_group_gpus <<<"${decode_group}"
+  decode_group_numas=()
+  for gpu in "${decode_group_gpus[@]}"; do
+    decode_group_numas+=("$(gpu_numa_node "${gpu}")")
+  done
+  decode_numa_csv="$(IFS=,; echo "${decode_group_numas[*]}")"
+  decode_numa="${decode_group_numas[0]}"
   decode_launch=(setsid)
-  if [[ "${SGLANG_AGENTIC_KV_HOST_STAGING:-false}" == "true" ]] && command -v numactl >/dev/null 2>&1; then
+  if (( DECODE_TP_SIZE == 1 )) && [[ "${SGLANG_AGENTIC_KV_HOST_STAGING:-false}" == "true" ]] && command -v numactl >/dev/null 2>&1; then
     decode_launch+=(numactl --cpunodebind="${decode_numa}" --membind="${decode_numa}")
   fi
-  domain="$((index / (${#decode_gpus[@]} / ${#prefill_gpus[@]})))"
-  arena_numa="${prefill_numas[$domain]}"
-  "${decode_launch[@]}" env CUDA_VISIBLE_DEVICES="${decode_gpus[$index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+  domain="$((index / (${#decode_gpu_groups[@]} / ${#prefill_gpu_groups[@]})))"
+  arena_numa_csv="${prefill_numa_vectors[$domain]}"
+  IFS=',' read -r -a arena_group_numas <<<"${arena_numa_csv}"
+  arena_numa="${arena_group_numas[0]}"
+  "${decode_launch[@]}" env CUDA_VISIBLE_DEVICES="${decode_group}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+    SGLANG_AGENTIC_KV_ENGINE_ID="decode-${index}" \
     SGLANG_AGENTIC_KV_PREFILL_DOMAIN="${domain}" \
     SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT="${agentic_direct_ports[$index]}" \
-    SGLANG_AGENTIC_KV_RELAY_ID="decode-${index}-gpu-${decode_gpus[$index]}" \
+    SGLANG_AGENTIC_KV_RELAY_ID="decode-${index}-gpus-${decode_group//,/-}" \
     SGLANG_AGENTIC_KV_GPU_NUMA_NODE="${decode_numa}" \
     SGLANG_AGENTIC_KV_ARENA_NUMA_NODE="${arena_numa}" \
+    SGLANG_AGENTIC_KV_TP_NUMA_NODES="${decode_numa_csv}" \
+    SGLANG_AGENTIC_KV_TP_ARENA_NUMA_NODES="${arena_numa_csv}" \
     SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR}/p-${domain}-numa-${arena_numa}" \
     SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR="${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR:-/dev/shm/sglang-agentic-p2d-disabled}/p-${domain}-numa-${arena_numa}" \
     SGLANG_PD_MAX_TRANSFER_INFLIGHT="${PD_MAX_TRANSFER_INFLIGHT}" \
@@ -498,6 +606,7 @@ for index in "${!decode_gpus[@]}"; do
     python -m sglang.launch_server \
       --model-path "${MODEL_PATH}" \
       --host 0.0.0.0 --port "${decode_ports[$index]}" \
+      --tp-size "${DECODE_TP_SIZE}" --numa-node "${decode_group_numas[@]}" \
       --context-length "${MAX_CONTEXT_LENGTH}" \
       --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${decode_mem_fraction_statics[$index]}" \
@@ -512,6 +621,10 @@ for index in "${!decode_gpus[@]}"; do
   pids+=("$!")
   wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/health" "${decode_pids[$index]}"
 done
+
+if [[ "${PD_SKIP_SEARCH}" != "1" && "${SEARCH_START_AFTER_MODELS}" == "true" ]]; then
+  start_search_server
+fi
 
 for index in "${!local_ports[@]}"; do
   wait_http "local-${index}" "http://127.0.0.1:${local_ports[$index]}/health" "${local_pids[$index]}"
@@ -630,10 +743,15 @@ for rate in "${rates[@]}"; do
   if (( ${#local_ports[@]} > 0 )); then
     local_args+=(--retool-local-router-port "${LOCAL_ROUTER_PORT}" --local-ports "${local_ports_csv}")
   fi
+  workload_args=()
+  if [[ -n "${WORKLOAD_CONFIG}" ]]; then
+    workload_args+=(--workload-config "${WORKLOAD_CONFIG}")
+  else
+    workload_args+=(--math-data "${MATH_DATA}" --qa-data "${QA_DATA}" --math-ratio "${MATH_RATIO}")
+  fi
   env CUDA_VISIBLE_DEVICES="" python "${INFERENCE_ENTRY}" \
     --model "${MODEL_PATH}" \
-    --math-data "${MATH_DATA}" \
-    --qa-data "${QA_DATA}" \
+    "${workload_args[@]}" \
     --router-port "${ROUTER_PORT}" \
     --router-request-timeout-seconds "${ROUTER_REQUEST_TIMEOUT_SECONDS:-3600}" \
     --prefill-port "${prefill_ports[0]}" \
@@ -644,7 +762,6 @@ for rate in "${rates[@]}"; do
     --pd-p-ready-dir "${PD_P_READY_DIR}" \
     "${hicache_metadata_args[@]}" \
     "${local_args[@]}" \
-    --math-ratio "${MATH_RATIO}" \
     --request-rate "${rate}" \
     --arrival-distribution "${ARRIVAL_DISTRIBUTION}" \
     --dispatch-policy "${DISPATCH_POLICY}" \

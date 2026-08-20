@@ -85,8 +85,13 @@ cleanup_pipeline() {
 trap cleanup_pipeline EXIT
 trap 'exit 130' INT TERM
 
-read -r -a decode_gpu_array <<<"${DECODE_GPUS}"
-decode_writers="${#decode_gpu_array[@]}"
+if [[ -n "${DECODE_GPU_GROUPS:-}" ]]; then
+  IFS=';' read -r -a decode_group_array <<<"${DECODE_GPU_GROUPS}"
+  decode_writers="${#decode_group_array[@]}"
+else
+  read -r -a decode_gpu_array <<<"${DECODE_GPUS}"
+  decode_writers="${#decode_gpu_array[@]}"
+fi
 
 export SGLANG_AGENTIC_KV_LIFECYCLE=true
 export SGLANG_AGENTIC_KV_CAPACITY_GIB="${SGLANG_AGENTIC_KV_CAPACITY_GIB:-256}"

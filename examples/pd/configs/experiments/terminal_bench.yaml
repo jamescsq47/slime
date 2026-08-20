@@ -1,0 +1,22 @@
+schema_version: 1
+
+datasets:
+  - id: terminal
+    harness: terminal_bench
+    path: ${PD_DATA_ROOT}/tbench2_train.jsonl
+    weight: 1
+    options:
+      # Start the OpenEnv TB2 Docker service manually, then set this endpoint.
+      environment_url: http://127.0.0.1:8003
+      environment_timeout_seconds: 4200
+      max_turns: 64
+      max_tokens_per_turn: 2048
+      max_response_tokens: 36864
+
+sampling:
+  policy: random
+  seed: 2026
+  preserve_source_order: false
+  shuffle_algorithm: legacy_two_stage_v1
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1

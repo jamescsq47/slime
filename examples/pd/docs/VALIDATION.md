@@ -3,8 +3,12 @@
 Validated on 2026-07-29 in the `search_r1` container:
 
 - Standalone syntax/metric tests: 4 passed.
-- Real `CustomDataSource` dry run: 20 seeded random requests contained only
-  Math and QA (9 Math, 11 QA).
+- Real workload-plugin dry run: the legacy CLI and the new 1:1 YAML config
+  produced byte-identical 20-entry `dispatch_sequence.json` files. Dataset
+  identity, source row and ordering therefore remain unchanged.
+- Inference-only Retool, BrowseComp and Terminal-Bench harness tests explicitly
+  disable token logprobs. The Terminal-Bench test executes a fake shell turn,
+  terminates, evaluates and closes the externally managed environment.
 - Qwen3-8B SGLang NIXL PD smoke on GPU2=P and GPU3=D: four capped requests at
   0.2 request/s reached the PD router with p95 queue delay below 0.02 ms.
   Measured engine counter rates were about 281.5 prefill prompt token/s and

@@ -93,6 +93,87 @@ def test_claim_is_atomic_across_competing_p_threads():
         os.unlink(path)
 
 
+def test_tp_host_h2d_ready_barrier_waits_for_every_rank():
+    ledger, path = _ledger()
+    try:
+        ledger.offer(_offer())
+        assert ledger.claim("req:0", "p-group") is not None
+        assert ledger.publish_grants(
+            "req:0",
+            "p-group",
+            [{"seq": 0, "room": 11, "slot": 0, "start_page": 0, "num_pages": 3}],
+        )
+        assert ledger.ack_chunk("req:0", "p-group", 0)
+        assert ledger.mark_host_ready("req:0", "p-group", 1)
+
+        assert not ledger.mark_host_h2d_ready_rank(
+            "req:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.mark_host_h2d_ready_rank(
+            "req:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.get("req:0")["h2d_ready_ranks"] == [0, 1]
+        assert not ledger.tp_host_followers_loaded("req:0", "p-group", tp_size=2)
+        assert ledger.complete_host_load_rank(
+            "req:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.tp_host_followers_loaded("req:0", "p-group", tp_size=2)
+    finally:
+        os.unlink(path)
+
+
+def test_tp_host_load_selection_is_rank0_owned_and_group_atomic():
+    ledger, path = _ledger()
+    try:
+        # A non-primary rank cannot independently select its local queue head.
+        assert ledger.select_tp_host_load(
+            "rank1-head:0", "p-group", tp_rank=1, tp_size=2
+        ) == (None, False)
+        assert ledger.select_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        ) == ("rank0-head:0", False)
+        # Rank 1 is redirected to rank 0's snapshot until it joins that exact
+        # request-generation.
+        assert ledger.select_tp_host_load(
+            "rank1-head:0", "p-group", tp_rank=1, tp_size=2
+        ) == ("rank0-head:0", False)
+        assert ledger.select_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        ) == ("rank0-head:0", True)
+        assert ledger.active_tp_host_load("p-group", tp_size=2) == "rank0-head:0"
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert not ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.progress_tp_host_admission(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.admit_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.active_tp_host_load("p-group", tp_size=2) == "rank0-head:0"
+        assert ledger.admit_tp_host_load(
+            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
+        )
+        assert ledger.active_tp_host_load("p-group", tp_size=2) is None
+    finally:
+        os.unlink(path)
+
+
 def test_p_only_claims_offers_for_its_numa_arena():
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager.arena_numa_node = 0

@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 
-EVENT_RE = re.compile(r"AgenticKV\s+(?P<event>[a-z_]+)\s+(?P<fields>.*)$")
+EVENT_RE = re.compile(r"AgenticKV\s+(?P<event>[a-z0-9_]+)\s+(?P<fields>.*)$")
 FIELD_RE = re.compile(r"([a-z_]+)=([^\s]+)")
 
 
