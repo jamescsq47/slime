@@ -1,11 +1,13 @@
 import asyncio
 import tempfile
+import threading
 import time
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 import orjson
+import late_binding_router as late_binding_router_module
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
@@ -35,6 +37,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router.prefill_queue_timeout = 1.0
         router.ready_poll_interval = 0.001
         router.load_timeout = 1.0
+        router.timeout = 10.0
         router.reservation_timeout = 1.0
         router.decode_headroom_tokens = 512
         router.max_decode_admission_tokens = 4096
@@ -45,15 +48,14 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router.wait_for_feasible_decode = True
         router.target_decode_kv_fraction = 1.0
         router.no_capacity_poll_interval = 0.001
-        router.soft_reservation_delay = 0.0
-        router.soft_reservation_min_tokens = 0
-        router.soft_reservation_force_after = 1.0
         router.load_cache_ttl = 0.05
         router.decode_urls = ["http://d0", "http://d1"]
         router._selection_lock = asyncio.Lock()
-        router._p_ready_fifo_lock = asyncio.Lock()
-        router._p_ready_fifo_locks = {}
         router._p_ready_submitted_sequences = set()
+        router._p_ready_fifo_waiters = {}
+        router._p_ready_fifo_events = {}
+        router._p_ready_fifo_dispatchers = {}
+        router._p_ready_fifo_active = {}
         router._p_ready_monitor_task = None
         router._p_ready_waiters = {}
         router._p_ready_snapshot = {}
@@ -61,15 +63,41 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router._last_loads = {}
         router._load_cache = []
         router._load_cache_at = 0.0
+        router._load_cache_sample_started_at = 0.0
+        router._load_sample_started_at_by_url = {}
         router._load_refresh_task = None
+        router._backend_session = None
+        router._load_session = None
         router._admitted_reservation_at = {}
         router._legacy_load_urls = set()
         router.prefill_urls = ["http://p0", "http://p1"]
         router._prefill_work_lock = asyncio.Lock()
         router._prefill_pending_tokens = [0, 0]
         router._prefill_pending_requests = [0, 0]
+        router._prefill_direct_pending_tokens = [0, 0]
         router._prefill_work_tiebreak = 0
+        router._prefill_pressure_domains = []
+        router._prefill_pressure_at = 0.0
+        router._prefill_pressure_sample_started_at = 0.0
+        router._prefill_pressure_interval = 0.2
         return router
+
+    async def test_backend_http_session_is_one_shared_pool(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        first = router._backend_http_session()
+        second = router._backend_http_session()
+        control = router._load_http_session()
+
+        self.assertIs(first, second)
+        self.assertIsNot(first, control)
+        self.assertIs(control, router._load_http_session())
+        self.assertTrue(control.connector.force_close)
+        self.assertFalse(first.connector.force_close)
+        self.assertEqual(first.connector._keepalive_timeout, 30.0)
+        self.assertFalse(first.closed)
+        await router.close()
+        self.assertTrue(first.closed)
+        self.assertTrue(control.closed)
 
     async def test_dynamic_prefill_shared_watcher_wakes_ready_batch(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
@@ -181,21 +209,25 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             )
 
             request["input_ids"] = list(range(7600))
-            selection = asyncio.create_task(
-                router._resolve_dynamic_prefill_work(request, metadata, original)
+            selected = await router._resolve_dynamic_prefill_work(
+                request, metadata, original
             )
-            for _ in range(100):
-                arrival = router.early_claim_store.read_arrival(
+            self.assertTrue(selected.route_pending)
+            # P selection only creates Router shadow accounting.  The
+            # physical Direct grant is published by _late_dispatch as soon as
+            # the target is known, independently of HTTP admission.
+            self.assertIsNone(
+                router.early_claim_store.read_arrival(
                     RequestGeneration("fixed-numa", 1),
                     not_before=0.0,
                     max_age_seconds=5.0,
                 )
-                if arrival is not None:
-                    break
-                await asyncio.sleep(0.001)
-            self.assertEqual(arrival["target_prefill_domain"], 1)
-            selected = await asyncio.wait_for(selection, timeout=1)
-            self.assertTrue(selected.route_pending)
+            )
+            router._publish_parent_arrival(
+                request,
+                target_prefill_domain=selected.domain,
+                arrived_at=original,
+            )
             router.early_claim_store.publish_route(
                 RequestGeneration("fixed-numa", 1),
                 route="direct_complete",
@@ -215,6 +247,125 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(arrival["arrived_at"], original)
             await router._release_prefill_work(selected)
             self.assertEqual(router._prefill_pending_tokens, [9000, 1000])
+
+    async def test_parent_direct_excludes_p_without_complete_workset_capacity(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory) / "ready")
+            router._prefill_pending_tokens = [0, 5000]
+            router._prefill_pressure_domains = [
+                {
+                    "domain": 0,
+                    "hbm_used_tokens": 4000,
+                    "hbm_capacity_tokens": 10000,
+                },
+                {
+                    "domain": 1,
+                    "hbm_used_tokens": 0,
+                    "hbm_capacity_tokens": 10000,
+                },
+            ]
+            router._prefill_pressure_at = time.monotonic()
+
+            selected = await router._reserve_prefill_work(
+                1000, direct_workset_tokens=8000
+            )
+
+            self.assertEqual(selected.domain, 1)
+            self.assertEqual(router._prefill_direct_pending_tokens, [0, 8000])
+            await router._release_prefill_work(selected)
+            self.assertEqual(router._prefill_direct_pending_tokens, [0, 0])
+
+    async def test_parent_direct_shadow_credit_covers_pressure_snapshot_lag(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory) / "ready")
+            router._prefill_pending_tokens = [0, 10000]
+            router._prefill_pressure_domains = [
+                {
+                    "domain": domain,
+                    "hbm_used_tokens": 0,
+                    "hbm_capacity_tokens": 10000,
+                }
+                for domain in range(2)
+            ]
+            router._prefill_pressure_at = time.monotonic()
+
+            first = await router._reserve_prefill_work(
+                1000, direct_workset_tokens=8000
+            )
+            second = await router._reserve_prefill_work(
+                1000, direct_workset_tokens=8000
+            )
+
+            self.assertEqual(first.domain, 0)
+            self.assertEqual(second.domain, 1)
+            self.assertEqual(router._prefill_direct_pending_tokens, [8000, 8000])
+            await router._settle_direct_workset(first)
+            self.assertEqual(router._prefill_direct_pending_tokens, [0, 8000])
+            await router._release_prefill_work(first)
+            await router._release_prefill_work(second)
+            self.assertEqual(router._prefill_direct_pending_tokens, [0, 0])
+
+    async def test_direct_shadow_hands_off_only_to_causally_new_pressure(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory) / "ready")
+            router._prefill_pending_tokens = [0, 10000]
+            router._prefill_pressure_domains = [
+                {
+                    "domain": domain,
+                    "hbm_used_tokens": 0,
+                    "hbm_capacity_tokens": 10000 if domain == 0 else 20000,
+                }
+                for domain in range(2)
+            ]
+            router._prefill_pressure_at = time.monotonic()
+            router._prefill_pressure_sample_started_at = time.monotonic()
+
+            first = await router._reserve_prefill_work(
+                1000, direct_workset_tokens=8000
+            )
+            terminal_at = time.monotonic()
+            handoff = asyncio.create_task(
+                router._settle_direct_workset_after_pressure(
+                    first, direct_terminal_at=terminal_at
+                )
+            )
+            await asyncio.sleep(0)
+
+            # A stale physical sample must not combine with cleared shadow
+            # credit and admit another workset to P0.
+            third = await router._reserve_prefill_work(
+                1000, direct_workset_tokens=8000
+            )
+            self.assertEqual(third.domain, 1)
+            self.assertEqual(router._prefill_direct_pending_tokens, [8000, 8000])
+            self.assertFalse(handoff.done())
+
+            # Publish a sample fetched after Direct completion.  Its physical
+            # used count now replaces, rather than overlaps or misses, shadow.
+            router._prefill_pressure_domains = [
+                {
+                    "domain": 0,
+                    "hbm_used_tokens": 8000,
+                    "hbm_capacity_tokens": 10000,
+                },
+                {
+                    "domain": 1,
+                    "hbm_used_tokens": 0,
+                    "hbm_capacity_tokens": 20000,
+                },
+            ]
+            router._prefill_pressure_sample_started_at = terminal_at + 0.001
+            router._prefill_pressure_at = time.monotonic()
+            await asyncio.wait_for(handoff, timeout=1)
+            self.assertEqual(router._prefill_direct_pending_tokens, [0, 8000])
+
+            fourth = await router._reserve_prefill_work(
+                1000, direct_workset_tokens=8000
+            )
+            self.assertEqual(fourth.domain, 1)
+            await router._release_prefill_work(first)
+            await router._release_prefill_work(third)
+            await router._release_prefill_work(fourth)
 
     async def test_direct_fallback_moves_work_to_host_local_p(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
@@ -246,20 +397,19 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 snapshot_tokens=8000,
             )
 
-            selection = asyncio.create_task(
-                router._resolve_dynamic_prefill_work(
-                    request, metadata, time.time()
-                )
+            selected = await router._resolve_dynamic_prefill_work(
+                request, metadata, time.time()
             )
-            for _ in range(100):
-                arrival = router.early_claim_store.read_arrival(
+            self.assertIsNone(
+                router.early_claim_store.read_arrival(
                     parent, not_before=0.0, max_age_seconds=5.0
                 )
-                if arrival is not None:
-                    break
-                await asyncio.sleep(0.001)
-            self.assertEqual(arrival["target_prefill_domain"], 1)
-            selected = await asyncio.wait_for(selection, timeout=1)
+            )
+            router._publish_parent_arrival(
+                request,
+                target_prefill_domain=selected.domain,
+                arrived_at=time.time(),
+            )
             watcher = asyncio.create_task(
                 router._watch_dynamic_prefill_route(
                     request, metadata, selected
@@ -347,7 +497,6 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))
             router.dynamic_prefill_domains = True
-            router._p_ready_fifo_locks = {}
             router._ready_path(1).write_bytes(
                 orjson.dumps(
                     {
@@ -367,15 +516,26 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            lock0, lock1 = await asyncio.gather(
-                router._acquire_p_ready_fifo(0, 0),
-                router._acquire_p_ready_fifo(0, 1),
+            entered = [asyncio.Event(), asyncio.Event()]
+            release = asyncio.Event()
+
+            async def dispatch(domain):
+                entered[domain].set()
+                await release.wait()
+                return domain
+
+            task0 = asyncio.create_task(
+                router._dispatch_p_ready_in_order(0, 0, lambda: dispatch(0))
             )
-            self.assertIsNot(lock0, lock1)
+            task1 = asyncio.create_task(
+                router._dispatch_p_ready_in_order(0, 1, lambda: dispatch(1))
+            )
+            await asyncio.gather(*(event.wait() for event in entered))
             self.assertIn((0, 0), router._p_ready_submitted_sequences)
             self.assertIn((1, 0), router._p_ready_submitted_sequences)
-            lock0.release()
-            lock1.release()
+            release.set()
+            self.assertEqual(await asyncio.gather(task0, task1), [0, 1])
+            await router.close()
 
     async def test_ready_marker_reports_exact_prompt_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -401,15 +561,25 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 orjson.dumps({"num_kv_tokens": 10, "ready_sequence": 5})
             )
 
-            later = asyncio.create_task(router._acquire_p_ready_fifo(5))
+            order = []
+
+            async def dispatch(sequence):
+                order.append(sequence)
+                return sequence
+
+            later = asyncio.create_task(
+                router._dispatch_p_ready_in_order(5, 0, lambda: dispatch(5))
+            )
             await asyncio.sleep(0.01)
             self.assertFalse(later.done())
 
-            await router._acquire_p_ready_fifo(4)
-            router._p_ready_fifo_lock.release()
-
-            await asyncio.wait_for(later, timeout=1)
-            router._p_ready_fifo_lock.release()
+            first = asyncio.create_task(
+                router._dispatch_p_ready_in_order(4, 0, lambda: dispatch(4))
+            )
+            self.assertEqual(await asyncio.wait_for(first, timeout=1), 4)
+            self.assertEqual(await asyncio.wait_for(later, timeout=1), 5)
+            self.assertEqual(order, [4, 5])
+            await router.close()
 
     async def test_p_ready_fifo_ignores_health_probe_marker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -433,10 +603,16 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            await asyncio.wait_for(
-                router._acquire_p_ready_fifo(3), timeout=1
+            async def dispatch():
+                return 3
+
+            self.assertEqual(
+                await asyncio.wait_for(
+                    router._dispatch_p_ready_in_order(3, 0, dispatch), timeout=1
+                ),
+                3,
             )
-            router._p_ready_fifo_lock.release()
+            await router.close()
 
     async def test_p_ready_fifo_ignores_room_zero_with_random_probe_rid(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -460,8 +636,656 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            await asyncio.wait_for(router._acquire_p_ready_fifo(1), timeout=1)
-            router._p_ready_fifo_lock.release()
+            async def dispatch():
+                return 1
+
+            self.assertEqual(
+                await asyncio.wait_for(
+                    router._dispatch_p_ready_in_order(1, 0, dispatch), timeout=1
+                ),
+                1,
+            )
+            await router.close()
+
+    async def test_p_ready_fifo_ignores_late_marker_from_redirected_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router._active_prefill_attempts = {22: "current-rid"}
+            router._p_ready_snapshot = {
+                11: {
+                    "_path": router._ready_path(11),
+                    "rid": "aborted-rid",
+                    "prefill_domain": 0,
+                    "ready_sequence": 4,
+                },
+                22: {
+                    "_path": router._ready_path(22),
+                    "rid": "current-rid",
+                    "prefill_domain": 0,
+                    "ready_sequence": 5,
+                },
+            }
+            router._ready_path(11).write_bytes(
+                orjson.dumps(router._p_ready_snapshot[11] | {"_path": None})
+            )
+            router._ready_path(22).write_bytes(
+                orjson.dumps(router._p_ready_snapshot[22] | {"_path": None})
+            )
+
+            async def dispatch():
+                return 5
+
+            self.assertEqual(
+                await asyncio.wait_for(
+                    router._dispatch_p_ready_in_order(5, 0, dispatch), timeout=1
+                ),
+                5,
+            )
+            self.assertFalse(router._ready_path(11).exists())
+            self.assertTrue(router._ready_path(22).exists())
+            await router.close()
+
+    async def test_p_ready_fifo_still_orders_two_owned_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router._active_prefill_attempts = {31: "first", 32: "second"}
+            for room, rid, sequence in ((31, "first", 4), (32, "second", 5)):
+                payload = {
+                    "rid": rid,
+                    "prefill_domain": 0,
+                    "ready_sequence": sequence,
+                }
+                path = router._ready_path(room)
+                path.write_bytes(orjson.dumps(payload))
+                router._p_ready_snapshot[room] = payload | {"_path": path}
+
+            order = []
+
+            async def dispatch(sequence):
+                order.append(sequence)
+                return sequence
+
+            later = asyncio.create_task(
+                router._dispatch_p_ready_in_order(5, 0, lambda: dispatch(5))
+            )
+            await asyncio.sleep(0.01)
+            self.assertFalse(later.done())
+            first = asyncio.create_task(
+                router._dispatch_p_ready_in_order(4, 0, lambda: dispatch(4))
+            )
+            self.assertEqual(await asyncio.wait_for(first, timeout=1), 4)
+            self.assertEqual(await asyncio.wait_for(later, timeout=1), 5)
+            self.assertEqual(order, [4, 5])
+            await router.close()
+
+    async def test_p_ready_fifo_has_one_order_scan_per_submission_not_per_waiter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router._active_prefill_attempts = {}
+            for sequence in range(64):
+                room = 10_000 + sequence
+                rid = f"rid-{sequence}"
+                payload = {
+                    "rid": rid,
+                    "prefill_domain": 0,
+                    "ready_sequence": sequence,
+                }
+                path = router._ready_path(room)
+                path.write_bytes(orjson.dumps(payload))
+                router._p_ready_snapshot[room] = payload | {"_path": path}
+                router._active_prefill_attempts[room] = rid
+
+            original_oldest = router._oldest_p_ready_sequence
+            scans = 0
+
+            def counted_oldest(domain=0):
+                nonlocal scans
+                scans += 1
+                return original_oldest(domain)
+
+            router._oldest_p_ready_sequence = counted_oldest
+            tasks = {
+                sequence: asyncio.create_task(
+                    router._dispatch_p_ready_in_order(
+                        sequence,
+                        0,
+                        lambda value=sequence: asyncio.sleep(0, result=value),
+                    )
+                )
+                for sequence in reversed(range(64))
+            }
+            for sequence in range(64):
+                self.assertEqual(
+                    await asyncio.wait_for(tasks[sequence], timeout=1), sequence
+                )
+
+            # A per-waiter polling design performs thousands of full scans for
+            # this burst. The dispatcher performs approximately one per item.
+            self.assertLessEqual(scans, 128)
+            await router.close()
+
+    async def test_p_ready_broker_pipelines_fifo_heads_without_overcommit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router.global_decode = True
+            router.numa_domains = True
+            router._active_prefill_attempts = {}
+            router._p2d_host_offered_snapshots = set()
+            router._p_ready_admission_window_per_p = 4
+            loads = [
+                DecodeLoad(
+                    url=url,
+                    used_tokens=0,
+                    capacity_tokens=4096,
+                    running=0,
+                    waiting=0,
+                    prealloc=0,
+                    transfer=0,
+                    max_running=128,
+                )
+                for url in router.decode_urls
+            ]
+            router._all_decode_loads = AsyncMock(return_value=loads)
+            router._load_http_session = lambda: object()
+
+            release_first = asyncio.Event()
+            commit_started = asyncio.Event()
+            committed = []
+
+            async def submit(domain, sequence, room):
+                rid = f"p{domain}-s{sequence}"
+                payload = {
+                    "rid": rid,
+                    "prefill_domain": domain,
+                    "ready_sequence": sequence,
+                }
+                router._ready_path(room).write_bytes(orjson.dumps(payload))
+                router._p_ready_snapshot[room] = payload | {
+                    "_path": router._ready_path(room)
+                }
+                router._active_prefill_attempts[room] = rid
+
+                async def fallback():
+                    self.fail("ordinary Direct admission used fallback selector")
+
+                async def commit(reservation):
+                    committed.append((domain, sequence, reservation.url))
+                    if sequence == 1:
+                        commit_started.set()
+                        await release_first.wait()
+                    return reservation
+
+                return await router._dispatch_p_ready_in_order(
+                    sequence,
+                    domain,
+                    fallback,
+                    request={"sampling_params": {"max_new_tokens": 512}},
+                    rooms=(room,),
+                    prompt_tokens=512,
+                    commit=commit,
+                )
+
+            tasks = [
+                asyncio.create_task(submit(domain, sequence, 100 + domain * 10 + sequence))
+                for domain in (0, 1)
+                for sequence in (1, 2)
+            ]
+            await asyncio.wait_for(commit_started.wait(), timeout=1)
+            deadline = time.monotonic() + 1
+            while len(router._reservations) < 4 and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            self.assertEqual(len(router._reservations), 4)
+            for url in router.decode_urls:
+                reserved = sum(
+                    item.admission_tokens
+                    for item in router._reservations.values()
+                    if item.url == url
+                )
+                self.assertLessEqual(reserved, 4096)
+
+            release_first.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+            for domain in (0, 1):
+                self.assertEqual(
+                    [sequence for p, sequence, _url in committed if p == domain],
+                    [1, 2],
+                )
+            await router.close()
+
+    async def test_p_ready_host_staging_releases_producer_before_d_capacity(self):
+        """Blocked FIFO heads may stage concurrently but enter D in order."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router._active_prefill_attempts = {}
+            router._p_ready_stage_lanes_per_p = 2
+
+            async def no_direct(admissions):
+                return {admission: None for admission in admissions}
+
+            router._reserve_p_ready_direct_batch = no_direct
+            staged = []
+            committed = []
+            first_commit_started = asyncio.Event()
+            release_first_commit = asyncio.Event()
+
+            async def submit(sequence, room):
+                rid = f"staged-{sequence}"
+                payload = {
+                    "rid": rid,
+                    "prefill_domain": 0,
+                    "ready_sequence": sequence,
+                }
+                path = router._ready_path(room)
+                path.write_bytes(orjson.dumps(payload))
+                router._p_ready_snapshot[room] = payload | {"_path": path}
+                router._active_prefill_attempts[room] = rid
+
+                async def prepare():
+                    staged.append(sequence)
+                    await asyncio.sleep(0)
+                    # None means a complete Host snapshot now owns the KV, so
+                    # the P scheduler may release this generation immediately.
+                    return None
+
+                async def dispatch():
+                    committed.append(sequence)
+                    if sequence == 1:
+                        first_commit_started.set()
+                        await release_first_commit.wait()
+                    return sequence
+
+                return await router._dispatch_p_ready_in_order(
+                    sequence,
+                    0,
+                    dispatch,
+                    request={"max_tokens": 512},
+                    rooms=(room,),
+                    prompt_tokens=512,
+                    commit=lambda reservation: asyncio.sleep(
+                        0, result=reservation
+                    ),
+                    prepare=prepare,
+                )
+
+            first = asyncio.create_task(submit(1, 501))
+            second = asyncio.create_task(submit(2, 502))
+            await asyncio.wait_for(first_commit_started.wait(), timeout=1)
+            deadline = time.monotonic() + 1
+            while len(staged) < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+
+            self.assertEqual(staged, [1, 2])
+            self.assertEqual(committed, [1])
+            release_first_commit.set()
+            self.assertEqual(
+                await asyncio.wait_for(asyncio.gather(first, second), timeout=1),
+                [1, 2],
+            )
+            self.assertEqual(committed, [1, 2])
+            await router.close()
+
+    async def test_stage_returns_at_host_durability_without_d_capacity(self):
+        """Host durability, not D admission, is the P-HBM release boundary."""
+
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            snapshot_id = p2d_snapshot_id(503)
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._p2d_host_offered_snapshots = set()
+
+            staged = asyncio.create_task(
+                router._stage_p2d_until_durable((503,), 5_000, 0)
+            )
+            deadline = time.monotonic() + 1
+            while ledger.get(snapshot_id) is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+
+            owner = "p2d-p:test"
+            self.assertIsNotNone(ledger.claim(snapshot_id, owner))
+            self.assertTrue(
+                ledger.publish_grants(
+                    snapshot_id, owner, [{"kind": "shared_host_extent"}]
+                )
+            )
+            self.assertTrue(ledger.ack_chunk(snapshot_id, owner, 0))
+            self.assertTrue(ledger.mark_host_ready(snapshot_id, owner, 1))
+
+            self.assertTrue(await asyncio.wait_for(staged, timeout=1))
+            self.assertEqual(router._reservations, {})
+
+    async def test_stage_rejected_without_host_owner_retains_p_for_direct(self):
+        """Arena-capacity rejection is RETAIN_P, not a stuck/error state."""
+
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            snapshot_id = p2d_snapshot_id(504)
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._p2d_host_offered_snapshots = set()
+
+            staged = asyncio.create_task(
+                router._stage_p2d_until_durable((504,), 5_000, 0)
+            )
+            deadline = time.monotonic() + 1
+            while ledger.get(snapshot_id) is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.001)
+            self.assertTrue(
+                ledger.reject_unclaimed_offer(
+                    snapshot_id, reason="p2d_host_capacity"
+                )
+            )
+
+            self.assertFalse(await asyncio.wait_for(staged, timeout=1))
+            self.assertEqual(
+                ledger.get(snapshot_id)["state"], HostStageState.REJECTED.value
+            )
+
+    async def test_shutdown_releases_direct_reservation_before_fifo_handoff(self):
+        """A reservation waiting behind its predecessor is still Router-owned."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router._ensure_p_ready_admission_state()
+            loop = asyncio.get_running_loop()
+            predecessor = loop.create_future()
+            reservation = DecodeReservation(
+                reservation_id="shutdown-reservation",
+                url="http://d0",
+                prompt_tokens=512,
+                admission_tokens=1024,
+                request_count=1,
+                rooms=(505,),
+                created_at=time.monotonic(),
+            )
+            router._reservations[reservation.reservation_id] = reservation
+            admission = late_binding_router_module._PReadyAdmission(
+                domain=0,
+                sequence=1,
+                submitted_key=1,
+                enqueued_at=time.monotonic(),
+                dispatch=lambda: asyncio.sleep(0),
+                future=loop.create_future(),
+                finished=asyncio.Event(),
+                rooms=(505,),
+                commit=lambda value: asyncio.sleep(0, result=value),
+                commit_predecessor=predecessor,
+                commit_done=loop.create_future(),
+            )
+            router._p_ready_fifo_active = {0: {1: admission}}
+            task = asyncio.create_task(
+                router._run_p_ready_admission(admission, reservation)
+            )
+            admission.dispatch_task = task
+
+            deadline = time.monotonic() + 1
+            while not admission.ownership_started and time.monotonic() < deadline:
+                await asyncio.sleep(0)
+            await router.close()
+
+            self.assertNotIn(reservation.reservation_id, router._reservations)
+            self.assertTrue(admission.finished.is_set())
+
+    async def test_p_ready_broker_cancellation_during_load_does_not_reserve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.global_decode = True
+            router.numa_domains = False
+            router._p2d_host_offered_snapshots = set()
+            payload = {"rid": "cancel", "ready_sequence": 1}
+            router._ready_path(17).write_bytes(orjson.dumps(payload))
+            load_started = asyncio.Event()
+            release_load = asyncio.Event()
+
+            async def loads(_session):
+                load_started.set()
+                await release_load.wait()
+                return [
+                    DecodeLoad(
+                        "http://d0", 0, 100_000, 0, 0, 0, 0, 128
+                    )
+                ]
+
+            router._all_decode_loads = loads
+            router._load_http_session = lambda: object()
+            caller = asyncio.create_task(
+                router._dispatch_p_ready_in_order(
+                    1,
+                    0,
+                    lambda: asyncio.sleep(0),
+                    request={"max_tokens": 512},
+                    rooms=(17,),
+                    prompt_tokens=512,
+                    commit=lambda reservation: asyncio.sleep(
+                        0, result=reservation
+                    ),
+                )
+            )
+            await asyncio.wait_for(load_started.wait(), timeout=1)
+            caller.cancel()
+            release_load.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+            await asyncio.sleep(0)
+            self.assertFalse(router._reservations)
+            await router.close()
+
+    async def test_p_ready_fifo_cancel_before_dispatch_removes_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            payload = {"rid": "first", "num_kv_tokens": 10, "ready_sequence": 6}
+            router._ready_path(6).write_bytes(orjson.dumps(payload))
+            router._ready_path(7).write_bytes(
+                orjson.dumps(payload | {"rid": "cancel-me", "ready_sequence": 7})
+            )
+            blocker = asyncio.Event()
+
+            async def block_first():
+                await blocker.wait()
+
+            first = asyncio.create_task(
+                router._dispatch_p_ready_in_order(6, 0, block_first)
+            )
+            await asyncio.sleep(0)
+            cancelled = asyncio.create_task(
+                router._dispatch_p_ready_in_order(
+                    7, 0, lambda: asyncio.sleep(0, result=7)
+                )
+            )
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            self.assertNotIn(7, router._p_ready_fifo_waiters[0])
+            blocker.set()
+            await first
+            await router.close()
+
+    async def test_p_ready_fifo_cancel_active_dispatch_finishes_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            payload = {"rid": "active", "num_kv_tokens": 10, "ready_sequence": 8}
+            router._ready_path(8).write_bytes(orjson.dumps(payload))
+            entered = asyncio.Event()
+            allow_commit = asyncio.Event()
+            physically_quiesced = asyncio.Event()
+            submitted = []
+
+            async def active_dispatch():
+                try:
+                    entered.set()
+                    await allow_commit.wait()
+                    submitted.append(True)
+                finally:
+                    # Models the selector reaching its atomic D-submit
+                    # boundary before caller cancellation becomes visible.
+                    await asyncio.sleep(0)
+                    physically_quiesced.set()
+
+            caller = asyncio.create_task(
+                router._dispatch_p_ready_in_order(8, 0, active_dispatch)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            caller.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(caller.done())
+            allow_commit.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+
+            self.assertTrue(physically_quiesced.is_set())
+            self.assertEqual(submitted, [True])
+            self.assertNotIn(0, router._p_ready_fifo_active)
+            self.assertIn(8, router._p_ready_submitted_sequences)
+            await router.close()
+
+    async def test_p_ready_fifo_shutdown_joins_active_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            payload = {"rid": "shutdown", "num_kv_tokens": 10, "ready_sequence": 9}
+            router._ready_path(9).write_bytes(orjson.dumps(payload))
+            entered = asyncio.Event()
+            physically_quiesced = asyncio.Event()
+
+            async def active_dispatch():
+                try:
+                    entered.set()
+                    await asyncio.Event().wait()
+                finally:
+                    await asyncio.sleep(0)
+                    physically_quiesced.set()
+
+            caller = asyncio.create_task(
+                router._dispatch_p_ready_in_order(9, 0, active_dispatch)
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            await router.close()
+
+            self.assertTrue(physically_quiesced.is_set())
+            self.assertNotIn(0, router._p_ready_fifo_active)
+            self.assertNotIn(9, router._p_ready_submitted_sequences)
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+
+    async def test_p_ready_fifo_scan_failure_fails_waiter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router._oldest_p_ready_sequence = lambda _domain=0: (_ for _ in ()).throw(
+                RuntimeError("scan failed")
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "scan failed"):
+                await router._dispatch_p_ready_in_order(
+                    9, 0, lambda: asyncio.sleep(0)
+                )
+            await router.close()
+
+    def test_prefill_attempt_ownership_tracks_all_tp_rooms_and_exact_rids(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router._active_prefill_attempts = {}
+        request = {
+            "bootstrap_room": [101, 102],
+            "rid": ["rank-0", "rank-1"],
+        }
+
+        router._activate_prefill_attempt(request, (101, 102))
+        self.assertEqual(
+            router._active_prefill_attempts,
+            {101: "rank-0", 102: "rank-1"},
+        )
+        self.assertTrue(
+            router._p_ready_marker_is_owned(101, {"rid": "rank-0"})
+        )
+        self.assertFalse(
+            router._p_ready_marker_is_owned(101, {"rid": "stale-rank-0"})
+        )
+
+        router._deactivate_prefill_attempt(request, (101, 102))
+        self.assertEqual(router._active_prefill_attempts, {})
+
+    def test_batch_scalar_rid_is_normalized_for_all_tp_rooms(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router._active_prefill_attempts = {}
+        request = {"bootstrap_room": [201, 202], "rid": "batch"}
+
+        router._set_prefill_attempt_rid(request, replace=False)
+        self.assertEqual(request["rid"], ["batch_0", "batch_1"])
+        router._activate_prefill_attempt(request, (201, 202))
+        self.assertEqual(
+            router._active_prefill_attempts,
+            {201: "batch_0", 202: "batch_1"},
+        )
+
+    def test_prefill_attempt_duplicate_room_rejected_atomically(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router._active_prefill_attempts = {301: "existing"}
+        request = {
+            "bootstrap_room": [302, 301],
+            "rid": ["new-rank-0", "new-rank-1"],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "already owned"):
+            router._activate_prefill_attempt(request, (302, 301))
+        self.assertEqual(router._active_prefill_attempts, {301: "existing"})
+
+    def test_prefill_attempt_finally_style_cleanup_does_not_remove_new_owner(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router._active_prefill_attempts = {401: "new-owner"}
+
+        router._deactivate_prefill_attempt(
+            {"bootstrap_room": 401, "rid": "old-owner"}, (401,)
+        )
+
+        self.assertEqual(router._active_prefill_attempts, {401: "new-owner"})
+
+    async def test_stale_monitor_snapshot_does_not_delete_current_owned_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router._active_prefill_attempts = {501: "current"}
+            path = router._ready_path(501)
+            path.write_bytes(
+                orjson.dumps(
+                    {
+                        "rid": "current",
+                        "prefill_domain": 0,
+                        "ready_sequence": 8,
+                    }
+                )
+            )
+            router._p_ready_snapshot = {
+                501: {
+                    "_path": path,
+                    "rid": "stale",
+                    "prefill_domain": 0,
+                    "ready_sequence": 7,
+                }
+            }
+
+            async def dispatch():
+                return 8
+
+            self.assertEqual(
+                await asyncio.wait_for(
+                    router._dispatch_p_ready_in_order(8, 0, dispatch), timeout=1
+                ),
+                8,
+            )
+            self.assertTrue(path.exists())
+            self.assertEqual(router._p_ready_snapshot[501]["rid"], "current")
+            await router.close()
 
     async def test_d_admission_wait_does_not_hold_global_p_ready_fifo(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -505,16 +1329,147 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(
                 router._late_dispatch(
                     Session(),
-                    {"bootstrap_room": 7, "sampling_params": {}},
+                    {
+                        "bootstrap_room": 7,
+                        "sampling_params": {},
+                        "return_logprob": False,
+                    },
                     "http://p0",
                     "generate",
                     {},
                 )
             )
             await asyncio.wait_for(admission_started.wait(), timeout=1)
-            self.assertFalse(router._p_ready_fifo_lock.locked())
+            self.assertFalse(router._p_ready_fifo_waiters[0])
             release_admission.set()
             await asyncio.wait_for(task, timeout=1)
+            await router.close()
+
+    async def test_prefill_response_is_released_before_decode_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.early_claim_store = None
+            router.max_prefill_inflight = 4
+            router._prefill_admission = _PrefillAdmissionGate(4, 10)
+            router._wait_until_prefill_accepted = AsyncMock()
+            router._wait_until_prefill_scheduled = AsyncMock()
+            router._wait_until_prefill_ready = AsyncMock(return_value=1024)
+            router._p_ready_sequence = lambda rooms: 1
+            router._select_and_reserve_decode = AsyncMock(
+                return_value=DecodeReservation(
+                    reservation_id="response-lifecycle",
+                    url="http://d0",
+                    prompt_tokens=1024,
+                    admission_tokens=1536,
+                    request_count=1,
+                    rooms=(7,),
+                    created_at=0.0,
+                )
+            )
+            router._release_reservation_when_admitted = AsyncMock()
+            prefill_read = asyncio.Event()
+            prefill_released = asyncio.Event()
+            finish_decode = asyncio.Event()
+
+            class PrefillResponse:
+                status = 200
+
+                async def read(self):
+                    prefill_read.set()
+                    return b"{}"
+
+                def release(self):
+                    prefill_released.set()
+
+            class DecodeResponse:
+                status = 200
+
+            class Session:
+                async def post(self, url, **kwargs):
+                    if url == "http://d0/generate":
+                        await finish_decode.wait()
+                        return DecodeResponse()
+                    return PrefillResponse()
+
+            task = asyncio.create_task(
+                router._late_dispatch(
+                    Session(),
+                    {
+                        "bootstrap_room": 7,
+                        "sampling_params": {},
+                        "return_logprob": False,
+                    },
+                    "http://p0",
+                    "generate",
+                    {},
+                )
+            )
+            await asyncio.wait_for(prefill_released.wait(), timeout=1)
+            self.assertTrue(prefill_read.is_set())
+            self.assertFalse(task.done())
+            finish_decode.set()
+            prefill_response, _ = await asyncio.wait_for(task, timeout=1)
+            self.assertIsNone(prefill_response)
+
+    async def test_prefill_read_failure_releases_p_and_cancels_d(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.early_claim_store = None
+            router.max_prefill_inflight = 4
+            router._prefill_admission = _PrefillAdmissionGate(4, 10)
+            router._wait_until_prefill_accepted = AsyncMock()
+            router._wait_until_prefill_scheduled = AsyncMock()
+            router._wait_until_prefill_ready = AsyncMock(return_value=1024)
+            router._p_ready_sequence = lambda rooms: 1
+            router._select_and_reserve_decode = AsyncMock(
+                return_value=DecodeReservation(
+                    reservation_id="response-read-failure",
+                    url="http://d0",
+                    prompt_tokens=1024,
+                    admission_tokens=1536,
+                    request_count=1,
+                    rooms=(7,),
+                    created_at=0.0,
+                )
+            )
+            router._release_reservation_when_admitted = AsyncMock()
+            prefill_released = asyncio.Event()
+            decode_cancelled = asyncio.Event()
+
+            class PrefillResponse:
+                status = 200
+
+                async def read(self):
+                    raise ConnectionError("prefill body failed")
+
+                def release(self):
+                    prefill_released.set()
+
+            class Session:
+                async def post(self, url, **kwargs):
+                    if url == "http://d0/generate":
+                        try:
+                            await asyncio.Future()
+                        except asyncio.CancelledError:
+                            decode_cancelled.set()
+                            raise
+                    return PrefillResponse()
+
+            with self.assertRaisesRegex(ConnectionError, "prefill body failed"):
+                await asyncio.wait_for(
+                    router._late_dispatch(
+                        Session(),
+                        {"bootstrap_room": 7, "sampling_params": {}},
+                        "http://p0",
+                        "generate",
+                        {},
+                    ),
+                    timeout=1,
+                )
+            self.assertTrue(prefill_released.is_set())
+            self.assertTrue(decode_cancelled.is_set())
 
     async def test_dynamic_dispatch_aborts_then_reposts_on_numa_host_fallback(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
@@ -574,14 +1529,6 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             router._wait_until_prefill_scheduled = scheduled
             router._wait_until_prefill_ready = AsyncMock(return_value=9000)
             router._p_ready_sequence = lambda _rooms: 0
-
-            fifo_lock = asyncio.Lock()
-
-            async def acquire_fifo(_sequence, _domain=0):
-                await fifo_lock.acquire()
-                return fifo_lock
-
-            router._acquire_p_ready_fifo = acquire_fifo
             decode_reservation = DecodeReservation(
                 reservation_id="redirect-d",
                 url="http://d0",
@@ -633,6 +1580,102 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(
                 generate_calls[0][1]["rid"], generate_calls[1][1]["rid"]
             )
+            self.assertEqual(router._prefill_admission.active, 0)
+
+    async def test_parent_direct_arrival_precedes_admission_and_gate_ends_at_accept(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory) / "ready")
+            router.numa_domains = False
+            router.dynamic_prefill_domains = False
+            router.max_prefill_inflight = 1
+            router._prefill_admission = _PrefillAdmissionGate(1, 10)
+            router.early_claim_store = AgenticEarlyClaimStore(
+                str(Path(directory) / "claims")
+            )
+            await router._prefill_admission.acquire(parent_turn=False)
+
+            router._wait_until_prefill_accepted = AsyncMock()
+            router._wait_until_prefill_scheduled = AsyncMock()
+            router._wait_until_prefill_ready = AsyncMock(return_value=4096)
+            router._p_ready_sequence = lambda _rooms: 1
+            router._select_and_reserve_decode = AsyncMock(
+                return_value=DecodeReservation(
+                    reservation_id="parent-admission",
+                    url="http://d0",
+                    prompt_tokens=4096,
+                    admission_tokens=4608,
+                    request_count=1,
+                    rooms=(17,),
+                    created_at=0.0,
+                )
+            )
+            router._release_reservation_when_admitted = AsyncMock()
+
+            prefill_started = asyncio.Event()
+            finish_prefill = asyncio.Event()
+            finish_decode = asyncio.Event()
+
+            class Response:
+                status = 200
+
+                async def read(self):
+                    return b"{}"
+
+                def release(self):
+                    return None
+
+            class Session:
+                async def post(self, url, **kwargs):
+                    if url == "http://p0/generate":
+                        prefill_started.set()
+                        await finish_prefill.wait()
+                    elif url == "http://d0/generate":
+                        await finish_decode.wait()
+                    return Response()
+
+            parent = RequestGeneration("admission-agent", 0)
+            request = {
+                "bootstrap_room": 17,
+                "input_ids": list(range(4096)),
+                "sampling_params": {
+                    "custom_params": {
+                        "agentic_request_id": "admission-agent",
+                        "agentic_generation": 1,
+                        "agentic_parent_generation": 0,
+                    }
+                },
+            }
+            task = asyncio.create_task(
+                router._late_dispatch(
+                    Session(), request, "http://p0", "generate", {}
+                )
+            )
+            await asyncio.sleep(0.02)
+            arrival = router.early_claim_store.read_arrival(
+                parent, not_before=0.0, max_age_seconds=5.0
+            )
+            self.assertIsNotNone(arrival)
+            self.assertEqual(arrival["prompt_token_count"], 4096)
+
+            await router._prefill_admission.release()
+            await asyncio.wait_for(prefill_started.wait(), timeout=1)
+            # HTTP acceptance, not the later P->D handoff, is the admission
+            # boundary.  The exact parent+suffix workset lease independently
+            # protects HBM until Prefill and delivery finish.
+            await asyncio.sleep(0)
+            self.assertEqual(router._prefill_admission.active, 0)
+            blocked = asyncio.create_task(
+                router._prefill_admission.acquire(parent_turn=True)
+            )
+            await asyncio.wait_for(blocked, timeout=1)
+            self.assertFalse(task.done())
+
+            finish_prefill.set()
+            self.assertFalse(task.done())
+            await router._prefill_admission.release()
+            finish_decode.set()
+            await asyncio.wait_for(task, timeout=1)
+            self.assertEqual(router._prefill_admission.active, 0)
 
     async def test_same_generation_retries_join_one_detached_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -785,7 +1828,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 DecodeLoad("http://d1", 10_000, 100_000, 10, 0, 0, 0, 100),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return equal_loads
 
             router._all_decode_loads = loads
@@ -812,14 +1855,214 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             )
             router._reservations[reservation.reservation_id] = reservation
             router._load_cache_at = 10.0
+            router._load_cache_sample_started_at = 10.0
             router._admitted_reservation_at[reservation.reservation_id] = 11.0
 
             self.assertEqual(router._reserved_for("http://d0"), (10_000, 12_000, 1))
 
             router._load_cache_at = 12.0
+            router._load_cache_sample_started_at = 12.0
             router._prune_accounted_reservations()
             self.assertEqual(router._reserved_for("http://d0"), (0, 0, 0))
             self.assertNotIn(reservation.reservation_id, router._reservations)
+
+    async def test_load_sample_started_before_admission_cannot_clear_credit(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        old_poll_started = asyncio.Event()
+        release_old_poll = asyncio.Event()
+
+        async def fetch(_session, url):
+            old_poll_started.set()
+            await release_old_poll.wait()
+            return DecodeLoad(url, 10_000, 100_000, 10, 0, 0, 0, 100)
+
+        router._fetch_decode_load = fetch
+        old_poll = asyncio.create_task(router._refresh_decode_loads(None))
+        await asyncio.wait_for(old_poll_started.wait(), timeout=1)
+
+        reservation = DecodeReservation(
+            reservation_id="causal-credit",
+            url="http://d0",
+            prompt_tokens=10_000,
+            admission_tokens=12_000,
+            request_count=1,
+            rooms=(92,),
+            created_at=time.monotonic(),
+        )
+        router._reservations[reservation.reservation_id] = reservation
+        admitted_at = time.monotonic()
+        router._admitted_reservation_at[reservation.reservation_id] = admitted_at
+
+        release_old_poll.set()
+        await old_poll
+        self.assertLess(router._load_cache_sample_started_at, admitted_at)
+        router._prune_accounted_reservations()
+        self.assertEqual(router._reserved_for("http://d0"), (10_000, 12_000, 1))
+
+        # A poll whose sampling begins after admission is causally allowed to
+        # observe it and therefore retire the Router-side credit.
+        await router._refresh_decode_loads(None)
+        self.assertGreaterEqual(router._load_cache_sample_started_at, admitted_at)
+        router._prune_accounted_reservations()
+        self.assertNotIn(reservation.reservation_id, router._reservations)
+
+    async def test_older_load_refresh_cannot_overwrite_newer_epoch(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        calls = 0
+
+        async def fetch(_session, url):
+            nonlocal calls
+            calls += 1
+            call = calls
+            if call <= len(router.decode_urls):
+                old_started.set()
+                await release_old.wait()
+                used = 80_000
+            else:
+                used = 20_000
+            return DecodeLoad(url, used, 100_000, 10, 0, 0, 0, 100)
+
+        router._fetch_decode_load = fetch
+        old_poll = asyncio.create_task(router._refresh_decode_loads(None))
+        await asyncio.wait_for(old_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        new_loads = await router._refresh_decode_loads(None)
+        newer_epoch = router._load_cache_sample_started_at
+        self.assertTrue(all(load.used_tokens == 20_000 for load in new_loads))
+
+        release_old.set()
+        old_result = await old_poll
+        self.assertEqual(router._load_cache_sample_started_at, newer_epoch)
+        self.assertTrue(all(load.used_tokens == 20_000 for load in old_result))
+        self.assertTrue(
+            all(load.used_tokens == 20_000 for load in router._load_cache)
+        )
+
+    async def test_initial_decode_load_refresh_is_singleflight(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        refreshes = 0
+        loads = [
+            DecodeLoad("http://d0", 10_000, 100_000, 10, 0, 0, 0, 100),
+            DecodeLoad("http://d1", 10_000, 100_000, 10, 0, 0, 0, 100),
+        ]
+
+        async def refresh(_session):
+            nonlocal refreshes
+            refreshes += 1
+            refresh_started.set()
+            await release_refresh.wait()
+            router._load_cache = loads
+            router._load_cache_at = time.monotonic()
+            return loads
+
+        router._refresh_decode_loads = refresh
+        waiters = [
+            asyncio.create_task(router._all_decode_loads(None))
+            for _ in range(64)
+        ]
+        await asyncio.wait_for(refresh_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertEqual(refreshes, 1)
+
+        waiters[0].cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiters[0]
+        release_refresh.set()
+        results = await asyncio.gather(*waiters[1:])
+        self.assertEqual(refreshes, 1)
+        self.assertTrue(all(result is loads for result in results))
+
+    async def test_failed_d_poll_cannot_clear_that_d_reservation_credit(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+
+        async def initial_fetch(_session, url):
+            return DecodeLoad(url, 10_000, 100_000, 10, 0, 0, 0, 100)
+
+        router._fetch_decode_load = initial_fetch
+        await router._refresh_decode_loads(None)
+
+        reservation = DecodeReservation(
+            reservation_id="partial-refresh-credit",
+            url="http://d0",
+            prompt_tokens=10_000,
+            admission_tokens=12_000,
+            request_count=1,
+            rooms=(93,),
+            created_at=time.monotonic(),
+        )
+        router._reservations[reservation.reservation_id] = reservation
+        router._admitted_reservation_at[reservation.reservation_id] = time.monotonic()
+
+        async def partial_fetch(_session, url):
+            if url == "http://d0":
+                raise RuntimeError("d0 unavailable")
+            return DecodeLoad(url, 20_000, 100_000, 10, 0, 0, 0, 100)
+
+        router._fetch_decode_load = partial_fetch
+        await router._refresh_decode_loads(None)
+        router._prune_accounted_reservations()
+        self.assertIn(reservation.reservation_id, router._reservations)
+        self.assertEqual(router._reserved_for("http://d0"), (10_000, 12_000, 1))
+
+        router._fetch_decode_load = initial_fetch
+        await router._refresh_decode_loads(None)
+        router._prune_accounted_reservations()
+        self.assertNotIn(reservation.reservation_id, router._reservations)
+
+    async def test_all_failed_load_poll_does_not_refresh_stale_cache_ttl(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        stale = [
+            DecodeLoad(url, 90_000, 100_000, 10, 0, 0, 0, 100)
+            for url in router.decode_urls
+        ]
+        router._load_cache = stale
+        router._last_loads = {load.url: load for load in stale}
+        router._load_cache_at = 123.0
+        router._load_cache_sample_started_at = 122.0
+
+        async def failed_fetch(_session, _url):
+            raise RuntimeError("control plane unavailable")
+
+        router._fetch_decode_load = failed_fetch
+        result = await router._refresh_decode_loads(None)
+
+        self.assertIs(result, stale)
+        self.assertEqual(router._load_cache_at, 123.0)
+        self.assertEqual(router._load_cache_sample_started_at, 122.0)
+
+    async def test_legacy_load_network_wait_runs_outside_router_loop(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        loop_thread = threading.get_ident()
+        worker_threads = []
+        original = late_binding_router_module._sync_json_get
+
+        def fetch(_url, _timeout):
+            worker_threads.append(threading.get_ident())
+            return [
+                {
+                    "num_reqs": 7,
+                    "num_waiting_reqs": 1,
+                    "num_physical_used_tokens": 1234,
+                    "num_running_kv_tokens": 1000,
+                    "max_total_num_tokens": 100_000,
+                    "max_running_requests": 128,
+                }
+            ]
+
+        late_binding_router_module._sync_json_get = fetch
+        try:
+            load = await router._fetch_decode_load_legacy(None, "http://d0")
+        finally:
+            late_binding_router_module._sync_json_get = original
+
+        self.assertEqual(load.running, 6)
+        self.assertEqual(load.used_tokens, 1234)
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], loop_thread)
 
     async def test_least_running_dominates_kv_pressure_after_capacity_filter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -829,7 +2072,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 DecodeLoad("http://d1", 40_000, 100_000, 30, 0, 0, 0, 100),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -846,7 +2089,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 DecodeLoad("http://d1", 40_000, 100_000, 30, 0, 0, 0, 100),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -864,7 +2107,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 DecodeLoad("http://d1", 60_000, 100_000, 30, 0, 0, 0, 100),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -886,7 +2129,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 DecodeLoad("http://d0", 40_000, 100_000, 20, 0, 0, 0, 100)
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -915,7 +2158,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -939,7 +2182,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -956,7 +2199,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 DecodeLoad("http://d1", 20_000, 100_000, 10, 0, 0, 0, 100),
             ]
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 return loads_now
 
             router._all_decode_loads = loads
@@ -970,7 +2213,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             router = self.make_router(Path(directory))
             attempts = 0
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 nonlocal attempts
                 attempts += 1
                 used = 99_000 if attempts == 1 else 80_000
@@ -999,14 +2242,12 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             router.numa_domains = True
             router.global_decode = True
             router.p2d_host_spill_delay = 0.0
-            router.soft_reservation_delay = 100.0
-            router.soft_reservation_force_after = 100.0
             ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
             router.p2d_host_ledger = ledger
             snapshot_id = p2d_snapshot_id(401)
             attempts = 0
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 nonlocal attempts
                 attempts += 1
                 entry = ledger.get(snapshot_id)
@@ -1042,19 +2283,248 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(selected.p2d_host_snapshot_id, snapshot_id)
             self.assertEqual(selected.prefill_domain, 0)
 
+    async def test_p2d_cancel_live_writer_enters_aborting_until_fence(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            snapshot_id = p2d_snapshot_id(424)
+            owner = "p2d-p:test"
+            ledger.offer(
+                {
+                    "snapshot_id": snapshot_id,
+                    "token_count": 5_000,
+                    "prefill_domain": 0,
+                    "control_offer": True,
+                }
+            )
+            self.assertIsNotNone(ledger.claim(snapshot_id, owner))
+            self.assertTrue(
+                ledger.transition(
+                    snapshot_id, HostStageState.HOST_WRITING, owner=owner
+                )
+            )
+
+            async def loads(_session, *, force=False):
+                return [
+                    DecodeLoad("http://d0", 99_000, 100_000, 50, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", 99_000, 100_000, 50, 0, 0, 0, 100),
+                ]
+
+            router._all_decode_loads = loads
+            selector = asyncio.create_task(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 1000}, (424,), 5_000, domain=0
+                )
+            )
+            for _ in range(100):
+                if router._reservations:
+                    break
+                await asyncio.sleep(0.001)
+            selector.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await selector
+
+            self.assertEqual(
+                ledger.get(snapshot_id)["state"], HostStageState.ABORTING.value
+            )
+            self.assertEqual(router._reservations, {})
+            # Only the physical producer may publish FAILED after its CUDA
+            # fence.  The Router cancellation above must not skip this step.
+            self.assertTrue(
+                ledger.transition(snapshot_id, HostStageState.FAILED, owner=owner)
+            )
+            self.assertEqual(
+                ledger.get(snapshot_id)["state"], HostStageState.FAILED.value
+            )
+
+    def test_p2d_dispatch_abort_never_rolls_back_live_h2d(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            snapshot_id = p2d_snapshot_id(425)
+            owner = "p2d-p:test"
+            ledger.offer(
+                {
+                    "snapshot_id": snapshot_id,
+                    "token_count": 5_000,
+                    "control_offer": True,
+                }
+            )
+            self.assertIsNotNone(ledger.claim(snapshot_id, owner))
+            self.assertTrue(
+                ledger.publish_grants(
+                    snapshot_id, owner, [{"kind": "shared_host_extent"}]
+                )
+            )
+            self.assertTrue(ledger.ack_chunk(snapshot_id, owner, 0))
+            self.assertTrue(ledger.mark_host_ready(snapshot_id, owner, 1))
+            self.assertTrue(
+                ledger.begin_host_load_rank(
+                    snapshot_id, owner, tp_rank=0, tp_size=1
+                )
+            )
+            self.assertEqual(
+                ledger.get(snapshot_id)["state"], HostStageState.H2D_LOADING.value
+            )
+
+            router._abort_unsubmitted_p2d(snapshot_id, "router_dispatch_failed")
+            self.assertEqual(
+                ledger.get(snapshot_id)["state"], HostStageState.H2D_LOADING.value
+            )
+
+    def test_p2d_dispatch_abort_can_close_unloaded_host_ready(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            snapshot_id = p2d_snapshot_id(426)
+            owner = "p2d-p:test"
+            ledger.offer(
+                {
+                    "snapshot_id": snapshot_id,
+                    "token_count": 5_000,
+                    "control_offer": True,
+                }
+            )
+            self.assertIsNotNone(ledger.claim(snapshot_id, owner))
+            self.assertTrue(
+                ledger.publish_grants(
+                    snapshot_id, owner, [{"kind": "shared_host_extent"}]
+                )
+            )
+            self.assertTrue(ledger.ack_chunk(snapshot_id, owner, 0))
+            self.assertTrue(ledger.mark_host_ready(snapshot_id, owner, 1))
+
+            router._abort_unsubmitted_p2d(snapshot_id, "router_dispatch_failed")
+            self.assertEqual(
+                ledger.get(snapshot_id)["state"], HostStageState.FAILED.value
+            )
+    async def test_missing_local_d_refresh_does_not_hold_global_selection_lock(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.prefill_urls = ["http://p0", "http://p1"]
+            router.decode_urls = [
+                "http://d0",
+                "http://d1",
+                "http://d2",
+                "http://d3",
+            ]
+            router.numa_domains = True
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            snapshot_id = p2d_snapshot_id(451)
+            self.assertEqual(
+                router._publish_p2d_host_offer(
+                    snapshot_id, (451,), 5_000, domain=0, source="test"
+                ),
+                snapshot_id,
+            )
+            self.assertIsNotNone(ledger.claim(snapshot_id, "p2d-p:test"))
+            self.assertTrue(
+                ledger.publish_grants(
+                    snapshot_id,
+                    "p2d-p:test",
+                    [{"kind": "shared_host_extent"}],
+                )
+            )
+            self.assertTrue(ledger.ack_chunk(snapshot_id, "p2d-p:test", 0))
+            self.assertTrue(ledger.mark_host_ready(snapshot_id, "p2d-p:test", 1))
+
+            refresh_started = asyncio.Event()
+            allow_refresh = asyncio.Event()
+            remote = [
+                DecodeLoad("http://d2", 20_000, 100_000, 10, 0, 0, 0, 100),
+                DecodeLoad("http://d3", 25_000, 100_000, 11, 0, 0, 0, 100),
+            ]
+
+            async def loads(_session, *, force=False):
+                if force:
+                    refresh_started.set()
+                    await allow_refresh.wait()
+                    return [
+                        DecodeLoad("http://d0", 20_000, 100_000, 8, 0, 0, 0, 100),
+                        DecodeLoad("http://d1", 25_000, 100_000, 9, 0, 0, 0, 100),
+                        *remote,
+                    ]
+                return remote
+
+            router._all_decode_loads = loads
+            local_waiter = asyncio.create_task(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 1000}, (451,), 5_000, domain=0
+                )
+            )
+            await asyncio.wait_for(refresh_started.wait(), timeout=1)
+            self.assertFalse(router._selection_lock.locked())
+
+            remote_result = await asyncio.wait_for(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 1000}, (452,), 5_000, domain=1
+                ),
+                timeout=1,
+            )
+            self.assertIn(remote_result.url, {"http://d2", "http://d3"})
+
+            allow_refresh.set()
+            local_result = await asyncio.wait_for(local_waiter, timeout=1)
+            self.assertIn(local_result.url, {"http://d0", "http://d1"})
+
+    async def test_only_blocked_fifo_head_can_publish_p2d_host_offer(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.global_decode = True
+            router.numa_domains = False
+            router.p2d_host_spill_delay = 0.0
+            router._p2d_host_offered_snapshots = set()
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._all_decode_loads = AsyncMock(
+                return_value=[
+                    DecodeLoad("http://d0", 99_000, 100_000, 50, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", 99_000, 100_000, 50, 0, 0, 0, 100),
+                ]
+            )
+            first = asyncio.create_task(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 1000}, (406,), 5_000, domain=0
+                )
+            )
+            deadline = time.monotonic() + 1
+            while (
+                ledger.get(p2d_snapshot_id(406)) is None
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.001)
+
+            self.assertEqual(
+                ledger.get(p2d_snapshot_id(406))["state"],
+                HostStageState.OFFERED.value,
+            )
+            # Capacity pressure is local to the admission being selected.  It
+            # must not publish storage ownership for a later completed room.
+            self.assertIsNone(ledger.get(p2d_snapshot_id(407)))
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            await router.close()
+
     async def test_p2d_unclaimed_offer_is_cancelled_when_d_frees(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
             router = self.make_router(Path(directory))
             router.numa_domains = False
             router.global_decode = True
             router.p2d_host_spill_delay = 0.0
-            router.soft_reservation_delay = 100.0
-            router.soft_reservation_force_after = 100.0
             ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
             router.p2d_host_ledger = ledger
             attempts = 0
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 nonlocal attempts
                 attempts += 1
                 used = 99_000 if attempts == 1 else 20_000
@@ -1073,15 +2543,224 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 HostStageState.REJECTED.value,
             )
 
-    async def test_large_request_soft_reserves_future_capacity(self):
+    async def test_p2d_ledger_arbitration_never_holds_d_selection_lock(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._p2d_host_offered_snapshots = set()
+            snapshot_id = p2d_snapshot_id(499)
+            ledger.offer(
+                {
+                    "snapshot_id": snapshot_id,
+                    "token_count": 1_000,
+                    "prefill_domain": 0,
+                    "control_offer": True,
+                }
+            )
+            original_get = ledger.get
+            original_reject = ledger.reject_unclaimed_offer
+
+            def checked_get(snapshot):
+                self.assertFalse(router._selection_lock.locked())
+                return original_get(snapshot)
+
+            def checked_reject(snapshot, *, reason):
+                self.assertFalse(router._selection_lock.locked())
+                return original_reject(snapshot, reason=reason)
+
+            ledger.get = checked_get
+            ledger.reject_unclaimed_offer = checked_reject
+            router._all_decode_loads = AsyncMock(
+                return_value=[
+                    DecodeLoad(
+                        "http://d0", 0, 100_000, 0, 0, 0, 0, 128
+                    )
+                ]
+            )
+            selected = await router._select_and_reserve_decode(
+                None, {"max_tokens": 512}, (499,), 1_000, domain=0
+            )
+            self.assertEqual(selected.url, "http://d0")
+            self.assertEqual(
+                original_get(snapshot_id)["state"],
+                HostStageState.REJECTED.value,
+            )
+
+    async def test_cancel_between_host_finalize_and_credit_commit_rolls_back(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            router.p2d_host_ledger = None
+            router._all_decode_loads = AsyncMock(
+                return_value=[
+                    DecodeLoad(
+                        "http://d0", 0, 100_000, 0, 0, 0, 0, 128
+                    )
+                ]
+            )
+            finalize_started = threading.Event()
+            release_finalize = threading.Event()
+
+            def finalize(reservation, **_kwargs):
+                finalize_started.set()
+                release_finalize.wait(timeout=1)
+                return reservation
+
+            router._finalize_p2d_route = finalize
+            selector = asyncio.create_task(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 512}, (501,), 1_000, domain=0
+                )
+            )
+            while not finalize_started.is_set():
+                await asyncio.sleep(0.001)
+            await router._selection_lock.acquire()
+            release_finalize.set()
+            await asyncio.sleep(0.01)
+            selector.cancel()
+            router._selection_lock.release()
+            with self.assertRaises(asyncio.CancelledError):
+                await selector
+            self.assertFalse(router._reservations)
+
+    async def test_cancel_waits_for_late_host_offer_before_abort(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._p2d_host_offered_snapshots = set()
+            router._all_decode_loads = AsyncMock(
+                return_value=[
+                    DecodeLoad(
+                        "http://d0", 99_000, 100_000, 30, 0, 0, 0, 128
+                    )
+                ]
+            )
+            offer_started = threading.Event()
+            release_offer = threading.Event()
+            original_publish = router._publish_p2d_host_offer
+
+            def delayed_publish(*args, **kwargs):
+                offer_started.set()
+                release_offer.wait(timeout=1)
+                return original_publish(*args, **kwargs)
+
+            router._publish_p2d_host_offer = delayed_publish
+            selector = asyncio.create_task(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 512}, (502,), 5_000, domain=0
+                )
+            )
+            while not offer_started.is_set():
+                await asyncio.sleep(0.001)
+            selector.cancel()
+            await asyncio.sleep(0.01)
+            self.assertFalse(selector.done())
+            release_offer.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await selector
+            entry = ledger.get(p2d_snapshot_id(502))
+            self.assertIsNotNone(entry)
+            self.assertNotEqual(entry["state"], HostStageState.OFFERED.value)
+            self.assertFalse(router._reservations)
+
+    def test_p2d_failed_host_owner_cannot_fall_back_to_direct(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.p2d_host_ledger = SharedHostStagingLedger(
+                str(Path(directory) / "p2d.json")
+            )
+            snapshot_id = p2d_snapshot_id(420)
+            router.p2d_host_ledger.offer({"snapshot_id": snapshot_id})
+            router.p2d_host_ledger.transition(
+                snapshot_id, HostStageState.FAILED, reason="d2h_failed"
+            )
+            reservation = DecodeReservation(
+                "r-failed", "http://d0", 1024, 2048, 1, (420,), time.monotonic()
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "exclusive ownership"):
+                router._finalize_p2d_route(
+                    reservation,
+                    snapshot_id=snapshot_id,
+                    state=HostStageState.FAILED.value,
+                    domain=0,
+                )
+
+    async def test_p2d_failed_feasible_selector_leaves_no_capacity_credit(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = False
+            router.global_decode = True
+            router.p2d_host_ledger = SharedHostStagingLedger(
+                str(Path(directory) / "p2d.json")
+            )
+            snapshot_id = p2d_snapshot_id(423)
+            router.p2d_host_ledger.offer({"snapshot_id": snapshot_id})
+            router.p2d_host_ledger.transition(
+                snapshot_id, HostStageState.FAILED, reason="d2h_failed"
+            )
+
+            async def loads(_session, *, force=False):
+                return [
+                    DecodeLoad("http://d0", 10_000, 100_000, 8, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", 20_000, 100_000, 9, 0, 0, 0, 100),
+                ]
+
+            router._all_decode_loads = loads
+            with self.assertRaisesRegex(RuntimeError, "exclusive ownership"):
+                await router._select_and_reserve_decode(
+                    None, {"max_tokens": 1000}, (423,), 5_000, domain=0
+                )
+            self.assertEqual(router._reservations, {})
+
+    def test_p2d_consumed_stale_attempt_cannot_submit_again(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router.p2d_host_ledger = types.SimpleNamespace(get=lambda _snapshot: {})
+        reservation = DecodeReservation(
+            "r-consumed", "http://d0", 1024, 2048, 1, (421,), time.monotonic()
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "already consumed"):
+            router._finalize_p2d_route(
+                reservation,
+                snapshot_id=p2d_snapshot_id(421),
+                state=HostStageState.CONSUMED.value,
+                domain=0,
+            )
+
+    def test_p2d_aborting_host_owner_waits_instead_of_direct(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router.p2d_host_ledger = types.SimpleNamespace(get=lambda _snapshot: {})
+        reservation = DecodeReservation(
+            "r-aborting", "http://d0", 1024, 2048, 1, (422,), time.monotonic()
+        )
+
+        self.assertIsNone(
+            router._finalize_p2d_route(
+                reservation,
+                snapshot_id=p2d_snapshot_id(422),
+                state=HostStageState.ABORTING.value,
+                domain=0,
+            )
+        )
+
+    async def test_ordered_head_immediately_reserves_future_capacity(self):
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))
             attempts = 0
 
-            async def loads(_session):
+            async def loads(_session, *, force=False):
                 nonlocal attempts
                 attempts += 1
-                # Initially neither D can fit 31k.  Once a soft reservation is
+                # Initially neither D can fit 31k.  Once the ordered credit is
                 # installed on d0, Decode drain makes enough room there.
                 d0_used = 95_000 if attempts < 3 else 60_000
                 return [
