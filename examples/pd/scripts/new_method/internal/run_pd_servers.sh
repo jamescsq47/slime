@@ -571,6 +571,10 @@ for index in "${!prefill_gpu_groups[@]}"; do
   fi
 done
 
+prefill_numa_domains="$(IFS=';'; echo "${prefill_numa_vectors[*]}")"
+export SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT="${#prefill_gpu_groups[@]}"
+export SGLANG_AGENTIC_KV_PREFILL_TP_NUMA_DOMAINS="${prefill_numa_domains}"
+
 decode_pids=()
 for index in "${!decode_gpu_groups[@]}"; do
   decode_group="${decode_gpu_groups[$index]}"
@@ -629,6 +633,31 @@ fi
 for index in "${!local_ports[@]}"; do
   wait_http "local-${index}" "http://127.0.0.1:${local_ports[$index]}/health" "${local_pids[$index]}"
 done
+
+# Prefill's startup probe is a real disaggregated request and can leave a
+# room-0 P-ready marker before the late-binding Router exists.  That marker is
+# not workload traffic, but its ready_sequence would remain the oldest FIFO
+# entry forever.  Remove only markers whose payload identifies the built-in
+# health probe; ordinary request markers are never touched.
+if [[ "${PD_LATE_BINDING}" == "1" ]]; then
+  python - "${PD_P_READY_DIR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for ready in root.glob("*.ready"):
+    try:
+        payload = json.loads(ready.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        continue
+    if not str(payload.get("rid", "")).startswith("HEALTH_CHECK_"):
+        continue
+    stem = ready.name.removesuffix(".ready")
+    for suffix in ("ready", "accepted", "scheduled"):
+        (root / f"{stem}.{suffix}").unlink(missing_ok=True)
+PY
+fi
 
 router_decode_args=()
 router_prefill_args=()
