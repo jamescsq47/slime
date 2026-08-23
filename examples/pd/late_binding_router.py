@@ -321,6 +321,20 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self._prefill_pending_tokens = [0] * len(self.prefill_urls)
         self._prefill_pending_requests = [0] * len(self.prefill_urls)
         self._prefill_work_tiebreak = 0
+        self._prefill_pressure_task: Optional[asyncio.Task] = None
+        self._prefill_pressure_interval = _env_float(
+            "SGLANG_AGENTIC_KV_PREFILL_LOAD_INTERVAL_S", 0.20
+        )
+        pressure_path = os.getenv("SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH", "")
+        if not pressure_path:
+            pressure_path = str(
+                self.p_ready_dir / "early-claims" / "prefill-loads.json"
+            )
+        self._prefill_pressure_path = Path(pressure_path)
+        staging_path = os.getenv("SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH", "")
+        self._d2p_host_ledger = (
+            SharedHostStagingLedger(staging_path) if staging_path else None
+        )
         # One logical request-generation may outlive an HTTP client's timeout.
         # Keep the actual P->D dispatch detached from that client and let every
         # retry await the same task.  Without this fence, a retry can select a
@@ -473,6 +487,124 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 self._prefill_pending_requests[domain],
             )
             return reservation
+
+    async def _fetch_prefill_hbm_pressure(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> tuple[int, int, int]:
+        """Read one logical P without putting the query on its GPU loop."""
+
+        timeout = aiohttp.ClientTimeout(total=self.load_timeout)
+        async with session.get(f"{url}/get_load", timeout=timeout) as response:
+            response.raise_for_status()
+            rows = await response.json()
+        if isinstance(rows, dict):
+            rows = [rows]
+        used = sum(
+            int(row.get("num_physical_used_tokens", row.get("num_tokens", 0)))
+            for row in rows
+        )
+        capacity = sum(int(row.get("max_total_num_tokens", 0)) for row in rows)
+        waiting = sum(int(row.get("num_waiting_reqs", 0)) for row in rows)
+        return used, capacity, waiting
+
+    @staticmethod
+    def _write_prefill_pressure(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
+        temporary.write_bytes(orjson.dumps(payload))
+        os.replace(temporary, path)
+
+    def _prefill_arena_bytes(self) -> list[int]:
+        used = [0] * len(self.prefill_urls)
+        ledger = self._d2p_host_ledger
+        if ledger is None:
+            return used
+        live_states = {
+            HostStageState.HOST_RESERVED.value,
+            HostStageState.HOST_WRITING.value,
+            HostStageState.HOST_READY.value,
+            HostStageState.H2D_LOADING.value,
+            HostStageState.SPILLING.value,
+        }
+        for entry in ledger.snapshot_entries().values():
+            if entry.get("state") not in live_states:
+                continue
+            domain = int(entry.get("arena_domain", -1))
+            if 0 <= domain < len(used):
+                used[domain] += int(entry.get("byte_size", 0))
+        return used
+
+    async def _prefill_pressure_monitor_loop(self) -> None:
+        """Publish a nonblocking shared snapshot for D-rank0 slow routing."""
+
+        tp_size = max(1, int(os.getenv("SGLANG_AGENTIC_KV_TP_SIZE", "1")))
+        arena_capacity = int(
+            float(os.getenv("SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB", "128"))
+            * (1024**3)
+            * tp_size
+        )
+        async with aiohttp.ClientSession() as session:
+            while True:
+                fetched = await asyncio.gather(
+                    *(
+                        self._fetch_prefill_hbm_pressure(session, url)
+                        for url in self.prefill_urls
+                    ),
+                    return_exceptions=True,
+                )
+                async with self._prefill_work_lock:
+                    pending_tokens = list(self._prefill_pending_tokens)
+                    pending_requests = list(self._prefill_pending_requests)
+                arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
+                domains = []
+                for domain, result in enumerate(fetched):
+                    if isinstance(result, BaseException):
+                        used = capacity = waiting = 0
+                    else:
+                        used, capacity, waiting = result
+                    domains.append(
+                        {
+                            "domain": domain,
+                            "pending_tokens": pending_tokens[domain],
+                            "pending_requests": pending_requests[domain],
+                            "scheduler_waiting": waiting,
+                            "hbm_used_tokens": used,
+                            "hbm_capacity_tokens": capacity,
+                            "arena_used_bytes": arena_used[domain],
+                            "arena_capacity_bytes": arena_capacity,
+                        }
+                    )
+                payload = {
+                    "version": 1,
+                    "published_at": time.time(),
+                    "domains": domains,
+                }
+                try:
+                    await asyncio.to_thread(
+                        self._write_prefill_pressure,
+                        self._prefill_pressure_path,
+                        payload,
+                    )
+                except OSError:
+                    logger.exception("Failed to publish Prefill pressure snapshot")
+                await asyncio.sleep(self._prefill_pressure_interval)
+
+    def _ensure_prefill_pressure_monitor(self) -> None:
+        if not getattr(self, "dynamic_prefill_domains", False):
+            return
+        if not hasattr(self, "_prefill_pressure_interval"):
+            self._prefill_pressure_interval = 0.20
+        if not hasattr(self, "_prefill_pressure_path"):
+            self._prefill_pressure_path = (
+                self.p_ready_dir / "early-claims" / "prefill-loads.json"
+            )
+        if not hasattr(self, "_d2p_host_ledger"):
+            self._d2p_host_ledger = None
+        task = getattr(self, "_prefill_pressure_task", None)
+        if task is None or task.done():
+            self._prefill_pressure_task = asyncio.create_task(
+                self._prefill_pressure_monitor_loop()
+            )
 
     async def _move_prefill_work(
         self, reservation: _PrefillWorkReservation, domain: int
@@ -1269,9 +1401,22 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 else:
                     path = marker
                     payload = orjson.loads(path.read_bytes())
+                # SGLang startup probes use the reserved bootstrap room 0.
+                # Some probe variants carry a random rid instead of the
+                # HEALTH_CHECK_ prefix, so filtering only by rid can leave
+                # sequence zero permanently at the head of the business FIFO.
+                if path is not None and str(path.stem) == "0":
+                    continue
                 if getattr(self, "dynamic_prefill_domains", False) and int(
                     payload.get("prefill_domain", -1)
                 ) != domain:
+                    continue
+                # SGLang's startup/health probes are real Prefill requests and
+                # therefore publish normal P-ready markers.  They have no
+                # matching Router generation coroutine, so admitting them to
+                # the FIFO would make every workload request wait forever
+                # behind an unconsumable sequence number.
+                if str(payload.get("rid", "")).startswith("HEALTH_CHECK_"):
                     continue
                 sequence = payload.get("ready_sequence")
                 sequence = (
@@ -1741,8 +1886,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             # D capacity won the race.  Cancel the unclaimed
                             # Host offer atomically; if P claimed concurrently,
                             # retry and commit to the same-NUMA Host route.
-                            cancelled = self.p2d_host_ledger.transition(
-                                p2d_snapshot, HostStageState.REJECTED
+                            cancelled = self.p2d_host_ledger.reject_unclaimed_offer(
+                                p2d_snapshot,
+                                reason="decode_capacity_available",
                             )
                             if not cancelled:
                                 continue
@@ -1986,6 +2132,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         prefill_work: Optional[_PrefillWorkReservation] = None
         arrival_at: Optional[float] = None
         if getattr(self, "dynamic_prefill_domains", False):
+            self._ensure_prefill_pressure_monitor()
             # Notify D immediately that the tool result has returned.  The
             # marker starts untargeted; Router then charges its local shadow
             # queues and targets the lighter P for Direct.  A failed Direct is

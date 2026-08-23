@@ -411,6 +411,58 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(later, timeout=1)
             router._p_ready_fifo_lock.release()
 
+    async def test_p_ready_fifo_ignores_health_probe_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router._ready_path(0).write_bytes(
+                orjson.dumps(
+                    {
+                        "rid": "HEALTH_CHECK_123",
+                        "num_kv_tokens": 1,
+                        "ready_sequence": 2,
+                    }
+                )
+            )
+            router._ready_path(1).write_bytes(
+                orjson.dumps(
+                    {
+                        "rid": "workload-request",
+                        "num_kv_tokens": 10,
+                        "ready_sequence": 3,
+                    }
+                )
+            )
+
+            await asyncio.wait_for(
+                router._acquire_p_ready_fifo(3), timeout=1
+            )
+            router._p_ready_fifo_lock.release()
+
+    async def test_p_ready_fifo_ignores_room_zero_with_random_probe_rid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router._ready_path(0).write_bytes(
+                orjson.dumps(
+                    {
+                        "rid": "probe-with-random-id",
+                        "num_kv_tokens": 1,
+                        "ready_sequence": 0,
+                    }
+                )
+            )
+            router._ready_path(1).write_bytes(
+                orjson.dumps(
+                    {
+                        "rid": "workload-request",
+                        "num_kv_tokens": 10,
+                        "ready_sequence": 1,
+                    }
+                )
+            )
+
+            await asyncio.wait_for(router._acquire_p_ready_fifo(1), timeout=1)
+            router._p_ready_fifo_lock.release()
+
     async def test_d_admission_wait_does_not_hold_global_p_ready_fifo(self):
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))
