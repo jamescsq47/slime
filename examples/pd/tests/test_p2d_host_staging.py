@@ -1,5 +1,8 @@
+import os
+import queue
 import shutil
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 
@@ -126,7 +129,7 @@ def test_p2d_ledger_has_atomic_complete_snapshot_lifecycle(tmp_path):
             pass
 
 
-def test_d_loader_rejects_cross_numa_snapshot(tmp_path):
+def test_d_loader_accepts_cross_numa_snapshot(tmp_path):
     ledger_path = "/dev/shm/sglang-p2d-test-numa.json"
     try:
         ledger = SharedHostStagingLedger(ledger_path)
@@ -154,9 +157,214 @@ def test_d_loader_rejects_cross_numa_snapshot(tmp_path):
         )
         manager.ledger = ledger
         manager.numa_node = 0
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager._work = queue.SimpleQueue()
         receiver = AgenticPToDHostReceiver(manager, snapshot_id)
-        with pytest.raises(RuntimeError, match="crossed NUMA"):
-            manager.submit(receiver, list(range(8)))
+        manager.submit(receiver, list(range(8)))
+        assert receiver._submitted
+        assert receiver._cross_numa
+        queued_receiver, queued_indices = manager._work.get_nowait()
+        assert queued_receiver is receiver
+        assert queued_indices == list(range(8))
+        assert ledger.get(snapshot_id)["state"] == HostStageState.H2D_LOADING.value
+    finally:
+        import os
+
+        try:
+            os.unlink(ledger_path)
+        except FileNotFoundError:
+            pass
+
+
+def test_tp_host_load_failure_releases_source_only_after_all_ranks_drain():
+    ledger_path = f"/dev/shm/sglang-p2d-load-fence-{time.time_ns()}.json"
+    snapshot_id = p2d_snapshot_id(31)
+    owner = "p2d-p:tp-group"
+    released = []
+    try:
+        ledger = SharedHostStagingLedger(ledger_path)
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "tp_size": 2,
+                "tp_rank": 0,
+                "control_offer": True,
+            }
+        )
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=0, tp_size=2)
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=1, tp_size=2)
+        for rank in range(2):
+            assert ledger.publish_rank_grant(
+                snapshot_id,
+                owner,
+                {
+                    "kind": "shared_host_extent",
+                    "arena_path": f"/dev/shm/fake-rank-{rank}.kv",
+                    "token_count": 8,
+                    "byte_size": 1024,
+                    "arena_numa_node": rank,
+                },
+                tp_rank=rank,
+                tp_size=2,
+            )
+            assert ledger.complete_p2d_host_write_rank(
+                snapshot_id, owner, tp_rank=rank, tp_size=2
+            )
+        assert ledger.begin_host_load_rank(
+            snapshot_id, owner, tp_rank=0, tp_size=2
+        )
+        assert ledger.begin_host_load_rank(
+            snapshot_id, owner, tp_rank=1, tp_size=2
+        )
+
+        producer = AgenticPToDHostStagingManager.__new__(
+            AgenticPToDHostStagingManager
+        )
+        producer.ledger = ledger
+        producer._lock = threading.RLock()
+        producer._active = {}
+        producer._records = {snapshot_id: {"snapshot": "rank-extent"}}
+        producer.arena = SimpleNamespace(release=released.append)
+
+        assert ledger.request_host_load_failure(
+            snapshot_id, owner, reason="injected_rank0_failure"
+        )
+        assert ledger.mark_host_load_rank_drained(
+            snapshot_id, owner, tp_rank=0, tp_size=2
+        )
+        assert ledger.get(snapshot_id)["state"] == HostStageState.ABORTING.value
+        producer._cleanup_consumed()
+        assert released == []
+
+        assert ledger.mark_host_load_rank_drained(
+            snapshot_id, owner, tp_rank=1, tp_size=2
+        )
+        assert ledger.get(snapshot_id)["state"] == HostStageState.FAILED.value
+        producer._cleanup_consumed()
+        assert released == ["rank-extent"]
+    finally:
+        import os
+
+        try:
+            os.unlink(ledger_path)
+        except FileNotFoundError:
+            pass
+
+
+def test_tp_host_load_failure_does_not_count_unfenced_peer_as_drained():
+    ledger_path = f"/dev/shm/sglang-p2d-unfenced-{time.time_ns()}.json"
+    snapshot_id = p2d_snapshot_id(32)
+    owner = "p2d-p:tp-group"
+    try:
+        ledger = SharedHostStagingLedger(ledger_path)
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "tp_size": 2,
+                "tp_rank": 0,
+                "control_offer": True,
+            }
+        )
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=0, tp_size=2)
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=1, tp_size=2)
+        for rank in range(2):
+            assert ledger.publish_rank_grant(
+                snapshot_id,
+                owner,
+                {
+                    "kind": "shared_host_extent",
+                    "arena_path": f"/dev/shm/fake-rank-{rank}.kv",
+                    "token_count": 8,
+                    "byte_size": 1024,
+                    "arena_numa_node": rank,
+                },
+                tp_rank=rank,
+                tp_size=2,
+            )
+            assert ledger.complete_p2d_host_write_rank(
+                snapshot_id, owner, tp_rank=rank, tp_size=2
+            )
+        assert ledger.begin_host_load_rank(
+            snapshot_id, owner, tp_rank=0, tp_size=2
+        )
+        assert ledger.begin_host_load_rank(
+            snapshot_id, owner, tp_rank=1, tp_size=2
+        )
+        assert ledger.request_host_load_failure(
+            snapshot_id, owner, reason="lost_rank1_fence"
+        )
+        assert ledger.mark_host_load_rank_drained(
+            snapshot_id, owner, tp_rank=0, tp_size=2
+        )
+        entry = ledger.get(snapshot_id)
+        assert entry["state"] == HostStageState.ABORTING.value
+        assert entry["loader_drained_ranks"] == [0]
+    finally:
+        import os
+
+        try:
+            os.unlink(ledger_path)
+        except FileNotFoundError:
+            pass
+
+
+def test_tp_receiver_cancel_before_submit_is_group_fenced():
+    ledger_path = f"/dev/shm/sglang-p2d-cancel-fence-{time.time_ns()}.json"
+    snapshot_id = p2d_snapshot_id(33)
+    owner = "p2d-p:tp-group"
+    try:
+        ledger = SharedHostStagingLedger(ledger_path)
+        ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "tp_size": 2,
+                "tp_rank": 0,
+                "control_offer": True,
+            }
+        )
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=0, tp_size=2)
+        assert ledger.claim_rank(snapshot_id, owner, tp_rank=1, tp_size=2)
+        for rank in range(2):
+            assert ledger.publish_rank_grant(
+                snapshot_id,
+                owner,
+                {
+                    "kind": "shared_host_extent",
+                    "arena_path": f"/dev/shm/fake-rank-{rank}.kv",
+                    "token_count": 8,
+                    "byte_size": 1024,
+                    "arena_numa_node": rank,
+                },
+                tp_rank=rank,
+                tp_size=2,
+            )
+            assert ledger.complete_p2d_host_write_rank(
+                snapshot_id, owner, tp_rank=rank, tp_size=2
+            )
+
+        receivers = []
+        for rank in range(2):
+            manager = AgenticPToDHostLoadManager.__new__(
+                AgenticPToDHostLoadManager
+            )
+            manager.ledger = ledger
+            manager.tp_rank = rank
+            manager.tp_size = 2
+            manager._completion_lock = threading.RLock()
+            manager._group_pending = {}
+            manager._group_wakeup = threading.Event()
+            receivers.append(AgenticPToDHostReceiver(manager, snapshot_id))
+
+        receivers[0].abort()
+        entry = ledger.get(snapshot_id)
+        assert entry["state"] == HostStageState.ABORTING.value
+        assert entry["loader_drained_ranks"] == [0]
+
+        receivers[1].abort()
+        entry = ledger.get(snapshot_id)
+        assert entry["state"] == HostStageState.FAILED.value
+        assert entry["loader_drained_ranks"] == [0, 1]
     finally:
         import os
 
@@ -168,7 +376,7 @@ def test_d_loader_rejects_cross_numa_snapshot(tmp_path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_real_cuda_p2d_host_round_trip():
-    """P D2H -> tmpfs -> same-NUMA D H2D preserves every K/V element."""
+    """P D2H -> tmpfs -> D H2D preserves every K/V element."""
 
     root = tempfile.mkdtemp(prefix="sglang-p2d-cuda-", dir="/dev/shm")
     producer = None
@@ -239,7 +447,7 @@ def test_real_cuda_p2d_host_round_trip():
             device_pool=destination,
             page_size=1,
             decode_domain=0,
-            numa_node=0,
+            numa_node=int(os.getenv("SGLANG_TEST_P2D_DECODE_NUMA", "0")),
         )
         receiver = AgenticPToDHostReceiver(loader, snapshot_id)
         receiver.bind(destination_indices.clone())

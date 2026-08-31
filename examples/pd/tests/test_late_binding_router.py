@@ -2229,7 +2229,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(selected.url, "http://d0")
             self.assertGreaterEqual(attempts, 2)
 
-    async def test_p2d_host_claim_locks_restore_to_same_numa(self):
+    async def test_p2d_host_claim_can_restore_to_global_least_work_d(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
             router = self.make_router(Path(directory))
             router.prefill_urls = ["http://p0", "http://p1"]
@@ -2269,8 +2269,8 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 return [
                     DecodeLoad("http://d0", used, 100_000, 20, 0, 0, 0, 100),
                     DecodeLoad("http://d1", used, 100_000, 25, 0, 0, 0, 100),
-                    # Remote NUMA is deliberately less loaded.  A staged
-                    # snapshot must nevertheless stay with P0's local Ds.
+                    # Remote NUMA is deliberately less loaded.  Durable Host
+                    # ownership must not prevent global late binding.
                     DecodeLoad("http://d2", used, 100_000, 1, 0, 0, 0, 100),
                     DecodeLoad("http://d3", used, 100_000, 2, 0, 0, 0, 100),
                 ]
@@ -2279,7 +2279,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             selected = await router._select_and_reserve_decode(
                 None, {"max_tokens": 1000}, (401,), 5_000, domain=0
             )
-            self.assertEqual(selected.url, "http://d0")
+            self.assertEqual(selected.url, "http://d2")
             self.assertEqual(selected.p2d_host_snapshot_id, snapshot_id)
             self.assertEqual(selected.prefill_domain, 0)
 
@@ -2403,7 +2403,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 ledger.get(snapshot_id)["state"], HostStageState.FAILED.value
             )
-    async def test_missing_local_d_refresh_does_not_hold_global_selection_lock(self):
+    async def test_global_host_restore_does_not_wait_for_missing_local_load(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
             router = self.make_router(Path(directory))
             router.prefill_urls = ["http://p0", "http://p1"]
@@ -2436,44 +2436,25 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ledger.ack_chunk(snapshot_id, "p2d-p:test", 0))
             self.assertTrue(ledger.mark_host_ready(snapshot_id, "p2d-p:test", 1))
 
-            refresh_started = asyncio.Event()
-            allow_refresh = asyncio.Event()
             remote = [
                 DecodeLoad("http://d2", 20_000, 100_000, 10, 0, 0, 0, 100),
                 DecodeLoad("http://d3", 25_000, 100_000, 11, 0, 0, 0, 100),
             ]
 
             async def loads(_session, *, force=False):
-                if force:
-                    refresh_started.set()
-                    await allow_refresh.wait()
-                    return [
-                        DecodeLoad("http://d0", 20_000, 100_000, 8, 0, 0, 0, 100),
-                        DecodeLoad("http://d1", 25_000, 100_000, 9, 0, 0, 0, 100),
-                        *remote,
-                    ]
+                self.assertFalse(force)
                 return remote
 
             router._all_decode_loads = loads
-            local_waiter = asyncio.create_task(
+            result = await asyncio.wait_for(
                 router._select_and_reserve_decode(
                     None, {"max_tokens": 1000}, (451,), 5_000, domain=0
-                )
-            )
-            await asyncio.wait_for(refresh_started.wait(), timeout=1)
-            self.assertFalse(router._selection_lock.locked())
-
-            remote_result = await asyncio.wait_for(
-                router._select_and_reserve_decode(
-                    None, {"max_tokens": 1000}, (452,), 5_000, domain=1
                 ),
                 timeout=1,
             )
-            self.assertIn(remote_result.url, {"http://d2", "http://d3"})
-
-            allow_refresh.set()
-            local_result = await asyncio.wait_for(local_waiter, timeout=1)
-            self.assertIn(local_result.url, {"http://d0", "http://d1"})
+            self.assertEqual(result.url, "http://d2")
+            self.assertEqual(result.p2d_host_snapshot_id, snapshot_id)
+            self.assertFalse(router._selection_lock.locked())
 
     async def test_only_blocked_fifo_head_can_publish_p2d_host_offer(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
@@ -2542,6 +2523,96 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 ledger.get(p2d_snapshot_id(402))["state"],
                 HostStageState.REJECTED.value,
             )
+
+    async def test_p2d_host_spill_rechecks_a_causally_fresh_global_load(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = True
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._p2d_host_offered_snapshots = set()
+
+            full = [
+                DecodeLoad("http://d0", 99_000, 100_000, 50, 0, 0, 0, 100),
+                DecodeLoad("http://d1", 99_000, 100_000, 50, 0, 0, 0, 100),
+            ]
+            refreshed = [
+                DecodeLoad("http://d0", 99_000, 100_000, 50, 0, 0, 0, 100),
+                DecodeLoad("http://d1", 20_000, 100_000, 10, 0, 0, 0, 100),
+            ]
+            router._load_cache = full
+            router._last_loads = {load.url: load for load in full}
+            router._load_sample_started_at_by_url = {
+                load.url: 0.0 for load in full
+            }
+            loads_now = full
+
+            async def loads(_session, *, force=False):
+                return loads_now
+
+            async def observe(_session, *, urls, not_before):
+                nonlocal loads_now
+                loads_now = refreshed
+                router._load_cache = refreshed
+                router._load_sample_started_at_by_url = {
+                    url: not_before for url in urls
+                }
+                return True
+
+            router._all_decode_loads = loads
+            router._observe_decode_load_after = observe
+            selected = await router._select_and_reserve_decode(
+                None, {"max_tokens": 1000}, (403,), 5_000, domain=0
+            )
+
+            self.assertEqual(selected.url, "http://d1")
+            self.assertIsNone(selected.p2d_host_snapshot_id)
+            self.assertIsNone(ledger.get(p2d_snapshot_id(403)))
+            self.assertEqual(len(router._reservations), 1)
+            self.assertFalse(next(iter(router._reservations.values())).draining)
+
+    async def test_failed_fresh_load_check_still_allows_p2d_host_progress(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory))
+            router.numa_domains = True
+            router.global_decode = True
+            router.p2d_host_spill_delay = 0.0
+            ledger = SharedHostStagingLedger(str(Path(directory) / "p2d.json"))
+            router.p2d_host_ledger = ledger
+            router._p2d_host_offered_snapshots = set()
+            full = [
+                DecodeLoad("http://d0", 99_000, 100_000, 50, 0, 0, 0, 100),
+                DecodeLoad("http://d1", 99_000, 100_000, 50, 0, 0, 0, 100),
+            ]
+            router._load_cache = full
+            router._last_loads = {load.url: load for load in full}
+            router._load_sample_started_at_by_url = {
+                load.url: 0.0 for load in full
+            }
+            router._all_decode_loads = AsyncMock(return_value=full)
+            router._observe_decode_load_after = AsyncMock(return_value=False)
+
+            selector = asyncio.create_task(
+                router._select_and_reserve_decode(
+                    None, {"max_tokens": 1000}, (404,), 5_000, domain=0
+                )
+            )
+            deadline = time.monotonic() + 1
+            while (
+                ledger.get(p2d_snapshot_id(404)) is None
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.001)
+
+            self.assertEqual(
+                ledger.get(p2d_snapshot_id(404))["state"],
+                HostStageState.OFFERED.value,
+            )
+            selector.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await selector
 
     async def test_p2d_ledger_arbitration_never_holds_d_selection_lock(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
@@ -2775,6 +2846,70 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(selected.url, "http://d0")
             self.assertTrue(selected.draining)
             self.assertGreaterEqual(attempts, 3)
+
+    async def test_draining_credit_reselects_when_old_d_exceeds_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.target_decode_kv_fraction = 0.90
+            attempts = 0
+
+            async def loads(_session, *, force=False):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    # Both are infeasible, and the lower projected fill makes
+                    # d0 the initial draining hint.
+                    used = (92_000, 95_000)
+                else:
+                    # The old d0 draining hint still hard-fits 31k, but its
+                    # projected 91% exceeds the configured 90% target.  d1 is
+                    # the only feasible destination.
+                    used = (60_000, 10_000)
+                return [
+                    DecodeLoad("http://d0", used[0], 100_000, 50, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", used[1], 100_000, 10, 0, 0, 0, 100),
+                ]
+
+            router._all_decode_loads = loads
+            selected = await router._select_and_reserve_decode(
+                None, {"max_tokens": 1000}, (501,), 30_000
+            )
+
+            self.assertEqual(selected.url, "http://d1")
+            self.assertFalse(selected.draining)
+            self.assertEqual(len(router._reservations), 1)
+            self.assertIs(router._reservations[selected.reservation_id], selected)
+
+    async def test_draining_credit_reselects_to_least_work_feasible_d(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            attempts = 0
+
+            async def loads(_session, *, force=False):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    used = (99_000, 99_000)
+                else:
+                    # Both workers now fit this 6k admission, but d1 has much
+                    # less work.  The old all-full d0 hint must not pin it.
+                    used = (60_000, 10_000)
+                return [
+                    DecodeLoad("http://d0", used[0], 100_000, 50, 0, 0, 0, 100),
+                    DecodeLoad("http://d1", used[1], 100_000, 10, 0, 0, 0, 100),
+                ]
+
+            router._all_decode_loads = loads
+            selected = await router._select_and_reserve_decode(
+                None, {"max_tokens": 1000}, (502,), 5_000
+            )
+
+            self.assertEqual(selected.url, "http://d1")
+            self.assertEqual(len(router._reservations), 1)
+            self.assertEqual(
+                next(iter(router._reservations.values())).reservation_id,
+                selected.reservation_id,
+            )
 
 
 if __name__ == "__main__":

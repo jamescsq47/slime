@@ -942,14 +942,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         width = len(self.decode_urls) // len(self.prefill_urls)
         return set(self.decode_urls[domain * width : (domain + 1) * width])
 
-    def _local_domain_decode_urls(self, domain: int) -> set[str]:
-        """Return the physical NUMA-local D partition, ignoring fast routing."""
-
-        if not getattr(self, "numa_domains", False):
-            return set(self.decode_urls)
-        width = len(self.decode_urls) // len(self.prefill_urls)
-        return set(self.decode_urls[domain * width : (domain + 1) * width])
-
     @staticmethod
     def _set_p2d_host_metadata(
         request: dict[str, Any], snapshot_id: str, prefill_domain: int
@@ -2824,6 +2816,55 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
 
         return await self._refresh_decode_loads(load_session)
 
+    def _decode_loads_are_fresh_since(
+        self, urls: set[str], not_before: float
+    ) -> bool:
+        """Return whether every candidate D was sampled after ``not_before``.
+
+        P->D Host spill costs an extra Host round trip even though recovery can
+        now target any D domain.  Do not choose that path from a cached
+        all-full observation that predates the P-ready snapshot itself.
+        """
+
+        epochs = getattr(self, "_load_sample_started_at_by_url", {})
+        return bool(urls) and all(
+            float(epochs.get(url, 0.0)) >= not_before for url in urls
+        )
+
+    async def _observe_decode_load_after(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        urls: set[str],
+        not_before: float,
+    ) -> bool:
+        """Single-flight one causal D-load observation before Host spill.
+
+        The ordinary stale-while-revalidate path already starts a shared
+        refresh.  Await that task first; if it began too early, start exactly
+        one newer shared refresh.  Failure returns ``False`` so Host spill can
+        still guarantee progress instead of retaining P HBM indefinitely.
+        """
+
+        for _ in range(2):
+            if self._decode_loads_are_fresh_since(urls, not_before):
+                return True
+            task = self._load_refresh_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._refresh_decode_loads(self._load_http_session())
+                )
+                self._load_refresh_task = task
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                logger.warning(
+                    "Fresh D load observation failed before P->D Host spill",
+                    exc_info=True,
+                )
+                return False
+        return self._decode_loads_are_fresh_since(urls, not_before)
+
     def _reserved_for(
         self, url: str, *, exclude_id: Optional[str] = None
     ) -> tuple[int, int, int]:
@@ -2954,6 +2995,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             and p2d_snapshot
             in getattr(self, "_p2d_host_offered_snapshots", set())
         )
+        host_freshness_attempted = False
         force_load_refresh = False
 
         try:
@@ -2995,6 +3037,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     tuple[DecodeLoad, float, float, int, float]
                 ] = None
                 publish_host_offer = False
+                refresh_before_host_offer = False
+                refresh_urls: set[str] = set()
                 missing_loads = False
                 stale_ownership = False
 
@@ -3012,11 +3056,15 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         stale_ownership = True
                         loads: list[DecodeLoad] = []
                     else:
-                        allowed_urls = (
-                            self._local_domain_decode_urls(domain)
-                            if p2d_claimed
-                            else self._domain_decode_urls(domain)
-                        )
+                        # Host ownership describes where the durable bytes
+                        # live, not which Decode domain must consume them.
+                        # Keep late binding global after spill as well: a D on
+                        # another NUMA node can read the shared tmpfs extent
+                        # through its independent Host->HBM worker.  The Host
+                        # owner is released only after the group-level H2D
+                        # completion, so this does not change ownership or TP
+                        # atomicity.
+                        allowed_urls = self._domain_decode_urls(domain)
                         loads = [
                             load
                             for load in loads_snapshot
@@ -3026,43 +3074,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
 
                     if not stale_ownership and loads:
                         if draining_reservation is not None:
-                            selected = next(
-                                (
-                                    load
-                                    for load in loads
-                                    if load.url == draining_reservation.url
-                                ),
-                                None,
-                            )
-                            if selected is None:
+                            if not any(
+                                load.url == draining_reservation.url
+                                for load in loads
+                            ):
                                 self._reservations.pop(
                                     draining_reservation.reservation_id, None
                                 )
                                 draining_reservation = None
-                            else:
-                                _, reserved_admission, _ = self._reserved_for(
-                                    selected.url,
-                                    exclude_id=draining_reservation.reservation_id,
-                                )
-                                free_after_others = (
-                                    selected.capacity_tokens
-                                    - selected.used_tokens
-                                    - reserved_admission
-                                )
-                                if free_after_others >= admission_tokens:
-                                    candidate = draining_reservation
-                                    candidate_stats = (
-                                        selected,
-                                        0.0,
-                                        (
-                                            selected.used_tokens
-                                            + reserved_admission
-                                            + admission_tokens
-                                        )
-                                        / selected.capacity_tokens,
-                                        selected.running + len(rooms),
-                                        self._average_running_context(loads),
-                                    )
 
                         average_context = self._average_running_context(loads)
                         transfer_weight = max(
@@ -3073,11 +3092,23 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             tuple[bool, float, float, int, DecodeLoad]
                         ] = []
                         for load in loads:
+                            # A draining reservation is only a future-capacity
+                            # hint.  Re-score every D without counting that
+                            # hint so an observation made while all D workers
+                            # were full cannot pin this request to a now-heavier
+                            # destination.
+                            draining_id = (
+                                draining_reservation.reservation_id
+                                if draining_reservation is not None
+                                else None
+                            )
                             (
                                 reserved_prompt,
                                 reserved_admission,
                                 reserved_reqs,
-                            ) = self._reserved_for(load.url)
+                            ) = self._reserved_for(
+                                load.url, exclude_id=draining_id
+                            )
                             free_after_pending = (
                                 load.capacity_tokens
                                 - load.used_tokens
@@ -3129,7 +3160,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         feasible = [item for item in scored if not item[0]]
                         if (
                             candidate is None
-                            and draining_reservation is None
                             and not (p2d_claimed and not p2d_ready)
                             and (feasible or not self.wait_for_feasible_decode)
                         ):
@@ -3144,17 +3174,38 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             _, work_score, projected_kv, projected_reqs, selected = (
                                 choice
                             )
-                            candidate = DecodeReservation(
-                                reservation_id=uuid.uuid4().hex,
-                                url=selected.url,
-                                prompt_tokens=prompt_tokens,
-                                admission_tokens=admission_tokens,
-                                request_count=len(rooms),
-                                rooms=rooms,
-                                created_at=time.monotonic(),
-                            )
-                            candidate_is_new = True
-                            self._reservations[candidate.reservation_id] = candidate
+                            if (
+                                draining_reservation is not None
+                                and selected.url == draining_reservation.url
+                            ):
+                                candidate = draining_reservation
+                            else:
+                                if draining_reservation is not None:
+                                    old_url = draining_reservation.url
+                                    self._reservations.pop(
+                                        draining_reservation.reservation_id, None
+                                    )
+                                    draining_reservation = None
+                                    logger.info(
+                                        "PD_LATE_BIND_DRAIN_RESELECT rooms=%s "
+                                        "old_D=%s new_D=%s reason=least_work",
+                                        rooms,
+                                        old_url,
+                                        selected.url,
+                                    )
+                                candidate = DecodeReservation(
+                                    reservation_id=uuid.uuid4().hex,
+                                    url=selected.url,
+                                    prompt_tokens=prompt_tokens,
+                                    admission_tokens=admission_tokens,
+                                    request_count=len(rooms),
+                                    rooms=rooms,
+                                    created_at=time.monotonic(),
+                                )
+                                candidate_is_new = True
+                                self._reservations[
+                                    candidate.reservation_id
+                                ] = candidate
                             candidate_stats = (
                                 selected,
                                 work_score,
@@ -3219,11 +3270,25 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                         projected_kv,
                                         work_score,
                                     )
-                            publish_host_offer = bool(
+                            wants_host_offer = bool(
                                 p2d_snapshot is not None
                                 and not p2d_offer_published
                                 and waited >= self.p2d_host_spill_delay
                             )
+                            if wants_host_offer:
+                                refresh_urls = self._domain_decode_urls(domain)
+                                # In production ``_all_decode_loads`` owns the
+                                # authoritative cache.  Lightweight tests may
+                                # inject loads directly without causal epochs.
+                                causal_tracking = bool(self._load_cache)
+                                refresh_before_host_offer = bool(
+                                    causal_tracking
+                                    and not host_freshness_attempted
+                                    and not self._decode_loads_are_fresh_since(
+                                        refresh_urls, wait_started
+                                    )
+                                )
+                                publish_host_offer = not refresh_before_host_offer
 
                 if stale_ownership:
                     continue
@@ -3244,6 +3309,18 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     self._load_cache_at = 0.0
                     force_load_refresh = True
                     await asyncio.sleep(self.no_capacity_poll_interval)
+                    continue
+
+                if refresh_before_host_offer:
+                    host_freshness_attempted = True
+                    await self._observe_decode_load_after(
+                        session,
+                        urls=refresh_urls,
+                        not_before=wait_started,
+                    )
+                    # Re-run global feasibility against the causally fresh
+                    # snapshot.  Only a still-full result may become the
+                    # NUMA-local P->D Host owner.
                     continue
 
                 if candidate is not None:
@@ -3305,7 +3382,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     if finalized.p2d_host_snapshot_id is not None:
                         logger.info(
                             "PD_P2D_HOST_BIND snapshot=%s rooms=%s P=%d D=%s "
-                            "policy=same_numa_feasible_least_work",
+                            "policy=global_host_feasible_least_work",
                             p2d_snapshot,
                             rooms,
                             domain,
