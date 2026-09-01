@@ -27,6 +27,13 @@ export PRESERVE_SOURCE_ORDER=true
 export SCHEDULE_FILE="${SCHEDULE_FILE:-${PD_DIR}/configs/workloads/fixed_browsecomp_source_order_n680.json}"
 export REQUESTS="${REQUESTS:-680}"
 export MAX_INFLIGHT="${MAX_INFLIGHT:-192}"
+# This launcher profiles steady-state serving.  Keep the validated closed-loop
+# workload explicit here instead of inheriting run_pd_servers.sh's low-rate
+# open-loop smoke defaults.
+export CLOSED_LOOP="${CLOSED_LOOP:-1}"
+export ARRIVAL_RATE="${ARRIVAL_RATE:-100}"
+export ARRIVAL_DISTRIBUTION="${ARRIVAL_DISTRIBUTION:-fixed}"
+export WARMUP_REQUESTS="${WARMUP_REQUESTS:-0}"
 export TEMPERATURE=0
 export TOP_P=1
 export TOP_K=-1
@@ -44,7 +51,6 @@ export SGLANG_AGENTIC_KV_P2D_HOST_STAGING=true
 export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB=32
 export FAST_TOOL_THRESHOLD_SECONDS="${FAST_TOOL_THRESHOLD_SECONDS:-2}"
 export DIRECT_WAIT_SECONDS="${DIRECT_WAIT_SECONDS:-2}"
-export P_DIRECT_RESERVE_TOKENS="${P_DIRECT_RESERVE_TOKENS:-40000}"
 export PD_INFERENCE_RETURN_LOGPROB=false
 # A valid request may remain in P's tokenizer/scheduler pipeline while older
 # work drains.  Do not turn that normal backpressure into an HTTP 500.
@@ -53,14 +59,7 @@ export PD_LATE_BIND_NUMA_DOMAINS=0
 export SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS=0
 export SGLANG_PD_LATE_BIND_GLOBAL_DECODE=1
 
-# Keep listeners below Linux's ephemeral TCP range.  Mooncake opens several
-# outgoing sockets during bootstrap, so using 59xxx can race one of its own
-# transient source ports even when the listener was free immediately before.
-export MOONCAKE_MASTER_PORT="${MOONCAKE_MASTER_PORT:-29351}"
-export MOONCAKE_CLIENT_PORT="${MOONCAKE_CLIENT_PORT:-29352}"
-export MOONCAKE_METADATA_PORT="${MOONCAKE_METADATA_PORT:-29380}"
-export MOONCAKE_METRICS_PORT="${MOONCAKE_METRICS_PORT:-29303}"
-export MOONCAKE_CLIENT_HTTP_PORT="${MOONCAKE_CLIENT_HTTP_PORT:-29390}"
+# Keep the validated listener range for reproducible launches.
 export RUN_DIR="${RUN_DIR:-${PD_DIR}/runs-host/new-method/formal-qwen3-32b-tp2-browsecomp-2p6d-bidir-c192-w300-m1200-20260817-r4}"
 
 exec bash "${SCRIPT_DIR}/run_2p6d_numa_case.sh"

@@ -16,22 +16,34 @@ WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-}"
 MODEL_GPUS="${MODEL_GPUS:-0 1 2 3 4 5}"
 MODEL_GPU_GROUPS="${MODEL_GPU_GROUPS:-}"
 MODEL_TP_SIZE="${MODEL_TP_SIZE:-1}"
+MODEL_CONTEXT_LENGTH="${MODEL_CONTEXT_LENGTH:-40960}"
+MODEL_MAX_RESPONSE_LENGTH="${MODEL_MAX_RESPONSE_LENGTH:-36864}"
+MODEL_PAGE_SIZE="${MODEL_PAGE_SIZE:-64}"
+MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-}"
+MODEL_TOOL_CALL_PARSER="${MODEL_TOOL_CALL_PARSER:-}"
 MODEL_PORTS="${MODEL_PORTS:-27200 27201 27202 27203 27204 27205}"
 ROUTER_PORT="${ROUTER_PORT:-27210}"
 SEARCH_GPU="${SEARCH_GPU:-6}"
 SEARCH_PORT="${SEARCH_PORT:-8720}"
+START_SEARCH_SERVER="${START_SEARCH_SERVER:-true}"
 RUN_DIR="${RUN_DIR:-${PD_DIR}/runs-host/baseline-colocated-6gpu-c384}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-384}"
 REQUESTS="${REQUESTS:-4096}"
 SEED="${SEED:-2026}"
+TEMPERATURE="${TEMPERATURE:-0}"
+TOP_P="${TOP_P:-1}"
+TOP_K="${TOP_K:--1}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-300}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-1200}"
+CLOSED_LOOP="${CLOSED_LOOP:-true}"
 SCHEDULE_FILE="${SCHEDULE_FILE:-${PD_DIR}/configs/workloads/fixed_random_s2026_n4096.json}"
+DISPATCH_POLICY="${DISPATCH_POLICY:-fixed}"
 MATH_RATIO="${MATH_RATIO:-0.5}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 MODEL_MEM_FRACTION_STATICS="${MODEL_MEM_FRACTION_STATICS:-}"
 PRESERVE_SOURCE_ORDER="${PRESERVE_SOURCE_ORDER:-false}"
 SEARCH_START_AFTER_MODELS="${SEARCH_START_AFTER_MODELS:-false}"
+POST_ANALYZER="${POST_ANALYZER:-pd_offload}"
 
 if [[ -n "${MODEL_GPU_GROUPS}" ]]; then
   IFS=';' read -r -a model_gpu_groups <<<"${MODEL_GPU_GROUPS}"
@@ -76,12 +88,20 @@ unset SGLANG_AGENTIC_KV_LIFECYCLE SGLANG_AGENTIC_KV_HOST_STAGING \
   --expect baseline --output "${RUN_DIR}/environment.json"
 
 declare -A checked_gpus=()
-for gpu in "${model_gpus[@]}" "${SEARCH_GPU}"; do
+gpus_to_check=("${model_gpus[@]}")
+if [[ "${START_SEARCH_SERVER}" == "true" ]]; then
+  gpus_to_check+=("${SEARCH_GPU}")
+fi
+for gpu in "${gpus_to_check[@]}"; do
   [[ -n "${checked_gpus[${gpu}]:-}" ]] && continue
   pd_check_gpu_idle "${gpu}"
   checked_gpus[${gpu}]=1
 done
-for port in "${model_ports[@]}" "${ROUTER_PORT}" "${SEARCH_PORT}"; do pd_check_port_free "${port}"; done
+ports_to_check=("${model_ports[@]}" "${ROUTER_PORT}")
+if [[ "${START_SEARCH_SERVER}" == "true" ]]; then
+  ports_to_check+=("${SEARCH_PORT}")
+fi
+for port in "${ports_to_check[@]}"; do pd_check_port_free "${port}"; done
 
 start_search_server() {
   setsid env CUDA_VISIBLE_DEVICES="${SEARCH_GPU}" SEARCH_SERVER_GPU_IDS=0 \
@@ -93,7 +113,7 @@ start_search_server() {
   pd_wait_http search "http://127.0.0.1:${SEARCH_PORT}/health" "${search_pid}" 1200
 }
 
-if [[ "${SEARCH_START_AFTER_MODELS}" != "true" ]]; then
+if [[ "${START_SEARCH_SERVER}" == "true" && "${SEARCH_START_AFTER_MODELS}" != "true" ]]; then
   start_search_server
 fi
 
@@ -107,16 +127,24 @@ gpu_numa_node() {
 for index in "${!model_gpu_groups[@]}"; do
   IFS=',' read -r -a group_gpus <<<"${model_gpu_groups[index]}"
   model_tp_args=()
+  model_parser_args=()
   if (( MODEL_TP_SIZE > 1 )); then
     group_numas=()
     for gpu in "${group_gpus[@]}"; do group_numas+=("$(gpu_numa_node "${gpu}")"); done
     model_tp_args+=(--tp-size "${MODEL_TP_SIZE}" --numa-node "${group_numas[@]}")
   fi
+  if [[ -n "${MODEL_REASONING_PARSER}" ]]; then
+    model_parser_args+=(--reasoning-parser "${MODEL_REASONING_PARSER}")
+  fi
+  if [[ -n "${MODEL_TOOL_CALL_PARSER}" ]]; then
+    model_parser_args+=(--tool-call-parser "${MODEL_TOOL_CALL_PARSER}")
+  fi
   setsid env CUDA_VISIBLE_DEVICES="${model_gpu_groups[index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
     "${PD_ENV_BIN}/python" -m sglang.launch_server --model-path "${MODEL_PATH}" \
-    --host 0.0.0.0 --port "${model_ports[index]}" --context-length 40960 \
+    --host 0.0.0.0 --port "${model_ports[index]}" --context-length "${MODEL_CONTEXT_LENGTH}" \
     "${model_tp_args[@]}" \
-    --page-size 64 --mem-fraction-static "${model_mem_fraction_statics[index]}" --enable-metrics \
+    "${model_parser_args[@]}" \
+    --page-size "${MODEL_PAGE_SIZE}" --mem-fraction-static "${model_mem_fraction_statics[index]}" --enable-metrics \
     --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
     >"${RUN_DIR}/logs/model-${index}.log" 2>&1 &
   model_pid=$!; pd_track_group "${model_pid}"
@@ -124,7 +152,7 @@ for index in "${!model_gpu_groups[@]}"; do
   worker_args+=("http://127.0.0.1:${model_ports[index]}")
 done
 
-if [[ "${SEARCH_START_AFTER_MODELS}" == "true" ]]; then
+if [[ "${START_SEARCH_SERVER}" == "true" && "${SEARCH_START_AFTER_MODELS}" == "true" ]]; then
   start_search_server
 fi
 
@@ -146,20 +174,51 @@ if [[ -n "${WORKLOAD_CONFIG}" ]]; then
 else
   workload_args+=(--math-data "${MATH_DATA}" --qa-data "${QA_DATA}" --math-ratio "${MATH_RATIO}")
 fi
+dispatch_args=(--dispatch-policy "${DISPATCH_POLICY}")
+if [[ "${DISPATCH_POLICY}" == "fixed" || "${DISPATCH_POLICY}" == "profile_balanced" ]]; then
+  dispatch_args+=(--schedule-file "${SCHEDULE_FILE}")
+fi
+loop_args=()
+if [[ "${CLOSED_LOOP}" == "true" ]]; then
+  loop_args+=(
+    --closed-loop
+    --closed-loop-warmup-min-seconds "${WARMUP_SECONDS}"
+    --closed-loop-warmup-completions 0
+    --closed-loop-recent-seconds 120
+    --closed-loop-max-warmup-seconds "$((WARMUP_SECONDS + 120))"
+    --closed-loop-measurement-seconds "${MEASURE_SECONDS}"
+  )
+elif [[ "${CLOSED_LOOP}" != "false" ]]; then
+  echo "CLOSED_LOOP must be true or false" >&2
+  exit 2
+fi
 SLIME_HTTP_READ_TIMEOUT_SECONDS="${SLIME_HTTP_READ_TIMEOUT_SECONDS:-3600}" \
 "${PD_ENV_BIN}/python" inference.py --model "${MODEL_PATH}" \
   "${workload_args[@]}" --router-port "${ROUTER_PORT}" \
   --prefill-port "${model_ports[0]}" --prefill-ports "${ports_csv}" \
   --decode-port "${model_ports[0]}" --decode-ports "${ports_csv}" \
   --requests "${REQUESTS}" --warmup-requests 0 \
-  --dispatch-policy fixed --schedule-file "${SCHEDULE_FILE}" \
+  "${dispatch_args[@]}" \
   --request-rate 100 --arrival-distribution fixed --max-inflight "${MAX_INFLIGHT}" \
-  --metrics-interval 2 --seed "${SEED}" --temperature 0 --top-p 1 --top-k -1 \
-  --closed-loop --closed-loop-warmup-min-seconds "${WARMUP_SECONDS}" \
-  --closed-loop-warmup-completions 0 --closed-loop-recent-seconds 120 \
-  --closed-loop-max-warmup-seconds "$((WARMUP_SECONDS + 120))" \
-  --closed-loop-measurement-seconds "${MEASURE_SECONDS}" --output-dir "${RUN_DIR}" \
+  --metrics-interval 2 --seed "${SEED}" \
+  --temperature "${TEMPERATURE}" --top-p "${TOP_P}" --top-k "${TOP_K}" \
+  --max-context-length "${MODEL_CONTEXT_LENGTH}" \
+  --max-response-length "${MODEL_MAX_RESPONSE_LENGTH}" \
+  "${loop_args[@]}" --output-dir "${RUN_DIR}" \
   "${inference_order_args[@]}" \
   >"${RUN_DIR}/inference.log" 2>&1
-"${PD_ENV_BIN}/python" "${SCRIPT_DIR}/../tools/analyze_pd_offload.py" --run-dir "${RUN_DIR}"
+case "${POST_ANALYZER}" in
+  pd_offload)
+    "${PD_ENV_BIN}/python" "${SCRIPT_DIR}/../tools/analyze_pd_offload.py" --run-dir "${RUN_DIR}"
+    ;;
+  swe_bench)
+    "${PD_ENV_BIN}/python" "${SCRIPT_DIR}/../tools/analyze_swe_bench_run.py" "${RUN_DIR}"
+    ;;
+  none)
+    ;;
+  *)
+    echo "unsupported POST_ANALYZER=${POST_ANALYZER}" >&2
+    exit 2
+    ;;
+esac
 echo "baseline colocated case complete: ${RUN_DIR}"

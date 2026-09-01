@@ -3,14 +3,15 @@ schema_version: 1
 datasets:
   - id: terminal
     harness: terminal_bench
-    path: ${PD_DATA_ROOT}/tbench2_train.jsonl
+    # Fixed on this serving node so formal runs do not depend on a shell export.
+    path: /homes/siqic/data/tbench2_train.jsonl
     weight: 1
     options:
       # Start the OpenEnv TB2 Docker service manually, then set this endpoint.
       environment_url: http://127.0.0.1:8003
       environment_timeout_seconds: 4200
       max_turns: 64
-      max_tokens_per_turn: 2048
+      max_tokens_per_turn: 8192
       max_response_tokens: 36864
 
 sampling:

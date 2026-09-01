@@ -493,6 +493,63 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             )
             await router._release_prefill_work(selected)
 
+    async def test_evicted_host_route_charges_full_prompt_without_timeout(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            router = self.make_router(Path(directory) / "ready")
+            router.numa_domains = True
+            router.early_claim_store = AgenticEarlyClaimStore(
+                str(Path(directory) / "claims")
+            )
+            ledger_path = str(Path(directory) / "host-ledger.json")
+            router._d2p_host_ledger = SharedHostStagingLedger(ledger_path)
+            metadata = AgenticRequestMetadata(
+                request_id="host-evicted", generation=1, parent_generation=0
+            )
+            request = {
+                "bootstrap_room": 11,
+                "input_ids": list(range(9000)),
+                "sampling_params": {
+                    "custom_params": {
+                        "agentic_request_id": "host-evicted",
+                        "agentic_generation": 1,
+                        "agentic_parent_generation": 0,
+                    }
+                },
+            }
+            parent = RequestGeneration("host-evicted", 0)
+
+            def publish_evicted(entries):
+                entries[parent.snapshot_id] = {
+                    "snapshot_id": parent.snapshot_id,
+                    "state": HostStageState.RECOMPUTE_REQUIRED.value,
+                    "p_owner": "p0",
+                    "tp_size": 1,
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                }
+                return True, True
+
+            router._d2p_host_ledger._mutate(
+                publish_evicted, event_snapshot_id=parent.snapshot_id
+            )
+            router.early_claim_store.publish_route(
+                parent,
+                route="host_ready",
+                prefill_domain=0,
+                arena_numa_node=0,
+                snapshot_tokens=8000,
+            )
+
+            selected = await router._resolve_dynamic_prefill_work(
+                request, metadata, time.time()
+            )
+
+            self.assertEqual(selected.tokens, 9000)
+            self.assertEqual(
+                router.early_claim_store.read_route(parent)["route"], "recompute"
+            )
+            await router._release_prefill_work(selected)
+
     async def test_dynamic_prefill_fifo_is_independent_per_p(self):
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Baseline cases intentionally retain stock SGLang HiCache/Mooncake behavior.
+unset SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PD_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/../common/runtime.sh"

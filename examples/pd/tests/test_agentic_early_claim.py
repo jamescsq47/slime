@@ -46,6 +46,7 @@ def test_router_publishes_parent_arrival_before_scheduler_dispatch():
         assert marker["snapshot_id"] == "trajectory-a:1"
         assert marker["request_id"] == "trajectory-a"
         assert marker["generation"] == 1
+        assert marker["prompt_token_count"] == 1
         arrivals = router.early_claim_store.iter_arrivals(max_age_seconds=5.0)
         assert [(item.snapshot_id, payload["kind"]) for item, payload in arrivals] == [
             ("trajectory-a:1", "arrival")
@@ -65,9 +66,11 @@ def test_targeted_arrival_and_route_are_generation_scoped():
         arrival = store.publish_arrival(
             current,
             target_prefill_domain=1,
+            prompt_token_count=12288,
             arrived_at=original_arrival,
         )
         assert arrival["target_prefill_domain"] == 1
+        assert arrival["prompt_token_count"] == 12288
         assert arrival["arrived_at"] == original_arrival
         assert store.read_arrival(
             current, not_before=0.0, max_age_seconds=5.0

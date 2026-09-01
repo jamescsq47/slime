@@ -5,6 +5,7 @@ import threading
 import time
 import types
 from collections import deque
+from pathlib import Path
 
 import torch
 
@@ -18,7 +19,6 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     token_ids_digest,
 )
 from sglang.srt.managers.scheduler import (
-    AgenticDirectPageCreditPool,
     AgenticEarlyDirectReceive,
     Scheduler,
 )
@@ -32,6 +32,17 @@ class _Req:
         self.rid = rid
         if queue_class is not None:
             self._agentic_kv_queue_class = queue_class
+
+
+def test_new_method_forces_custom_storage_only_and_baseline_clears_it():
+    pd_root = Path(__file__).resolve().parents[1]
+    pipeline = (
+        pd_root / "scripts/new_method/internal/run_agentic_pipeline.sh"
+    ).read_text()
+    baseline = (pd_root / "scripts/baseline/run_pd_case.sh").read_text()
+
+    assert "export SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY=true" in pipeline
+    assert "unset SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY" in baseline
 
 
 def test_hiradix_write_back_falls_back_when_host_has_no_capacity():
@@ -59,6 +70,84 @@ def test_hiradix_write_back_falls_back_when_host_has_no_capacity():
 
     assert result.num_tokens_evicted == 64
     assert regular == [node]
+
+
+def test_custom_storage_only_evicts_without_native_host_backup():
+    """Custom slow paths own Host storage; generic Radix eviction drops GPU KV."""
+
+    cache = HiRadixCache.__new__(HiRadixCache)
+
+    class Node:
+        lock_ref = 0
+        backuped = False
+        evicted = False
+
+    node = Node()
+    node.parent = types.SimpleNamespace(children={"leaf": node})
+    cache.agentic_custom_storage_only = True
+    cache.evictable_leaves = {node}
+    cache.eviction_strategy = types.SimpleNamespace(get_priority=lambda _node: 0)
+    cache.cache_controller = types.SimpleNamespace(write_policy="write_back")
+    cache.write_backup = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("native HiCache backup must stay disabled")
+    )
+    regular = []
+    cache._evict_regular = lambda victim: regular.append(victim) or 64
+    cache.writing_check = lambda write_back=False: (_ for _ in ()).throw(
+        AssertionError("native write-back drain must stay disabled")
+    )
+    cache.update_eviction_metrics = lambda *_args: None
+
+    result = cache.evict(EvictParams(num_tokens=64))
+
+    assert result.num_tokens_evicted == 64
+    assert regular == [node]
+
+
+def test_custom_storage_only_skips_ordinary_storage_prefetch():
+    cache = HiRadixCache.__new__(HiRadixCache)
+    cache.agentic_custom_storage_only = True
+    cache.enable_storage = True
+    cache.is_eagle = False
+    cache.page_size = 1
+    cache.cache_controller = types.SimpleNamespace(
+        prefetch_rate_limited=lambda: (_ for _ in ()).throw(
+            AssertionError("ordinary requests must not reach Mooncake prefetch")
+        )
+    )
+
+    assert (
+        cache.prefetch_from_storage(
+            "ordinary-request",
+            types.SimpleNamespace(),
+            [1, 2, 3, 4],
+        )
+        is None
+    )
+
+
+def test_custom_storage_only_keeps_agentic_mooncake_prefetch_available():
+    cache = HiRadixCache.__new__(HiRadixCache)
+    cache.agentic_custom_storage_only = True
+    cache.enable_storage = True
+    cache.is_eagle = False
+    cache.page_size = 1
+    calls = []
+    cache.cache_controller = types.SimpleNamespace(
+        prefetch_rate_limited=lambda: calls.append("checked") or True
+    )
+
+    cache.prefetch_from_storage(
+        "agentic-request",
+        types.SimpleNamespace(),
+        [1, 2, 3, 4],
+        agentic_expected_tokens=4,
+        agentic_extra_key="agentic-v1:snapshot:g1",
+    )
+
+    assert calls == ["checked"]
+
+
 def test_p_agentic_transient_backup_stays_out_of_generic_storage():
     cache = HiRadixCache.__new__(HiRadixCache)
     cache.ongoing_backup = {}
@@ -74,65 +163,6 @@ def test_p_agentic_transient_backup_stays_out_of_generic_storage():
     cache.write_backup_storage(node)
 
     assert cache.ongoing_backup == {}
-
-
-def test_direct_page_credit_reserves_and_recycles_by_tokens():
-    class Allocator:
-        def __init__(self):
-            self.freed = []
-
-        def alloc(self, count):
-            return torch.arange(64, 64 + count, dtype=torch.int64)
-
-        def free(self, indices):
-            self.freed.append(indices.clone())
-
-    allocator = Allocator()
-    pool = AgenticDirectPageCreditPool(
-        allocator, capacity_tokens=256, page_size=64
-    )
-    first = pool.allocate(128)
-    second = pool.allocate(64)
-    assert first is not None and second is not None
-    assert pool.free_tokens == 64
-    assert first.page_indices.tolist() == [1, 2]
-    assert pool.device_view(first).tolist() == list(range(64, 192))
-
-    pool.release(first)
-    replacement = pool.allocate(128)
-    assert replacement is not None
-    assert replacement.page_indices.tolist() == [1, 2]
-    assert allocator.freed == []
-
-    pool.mark_bound(replacement)
-    assert pool.unaccounted_tokens == 128
-    reclaimed = pool.reclaim_node_indices(pool.device_view(replacement), allocator)
-    assert reclaimed == 128
-    assert pool.free_tokens == 192
-    assert pool.unaccounted_tokens == 256
-
-
-def test_direct_page_credit_ownership_swap_replenishes_transit_buffer():
-    class Allocator:
-        def alloc(self, count):
-            return torch.arange(64, 64 + count, dtype=torch.int64)
-
-        def free(self, _indices):
-            raise AssertionError("ownership swap must not free either page set")
-
-    pool = AgenticDirectPageCreditPool(
-        Allocator(), capacity_tokens=128, page_size=64
-    )
-    allocation = pool.allocate(128)
-    assert allocation is not None
-    received_indices = pool.device_view(allocation).clone()
-    replacement = torch.arange(640, 768, dtype=torch.int64)
-
-    pool.promote_to_ordinary(allocation, replacement)
-
-    assert pool.free_tokens == 128
-    assert pool.device_indices.tolist() == replacement.tolist()
-    assert received_indices.tolist() == list(range(64, 192))
 
 
 def test_early_direct_transport_progresses_off_scheduler_thread(monkeypatch):
@@ -407,6 +437,9 @@ def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
     scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
     scheduler.agentic_early_direct_terminal = {}
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_direct_ordinary_reserved_tokens = int(
+        ordinary_replacement.numel()
+    )
     inserted = []
     scheduler.tree_cache = types.SimpleNamespace(
         insert=lambda params: (
@@ -515,6 +548,7 @@ def test_inotify_arrivals_are_deduplicated_then_admitted_from_fifo(monkeypatch):
     scheduler.agentic_early_direct_receives = {}
     scheduler.agentic_early_direct_terminal = {}
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
+    scheduler.agentic_direct_ordinary_reserved_tokens = 0
     allocation = types.SimpleNamespace(allocated_tokens=1024)
     scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
         allocate=lambda tokens: allocation if tokens == 1024 else None,

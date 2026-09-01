@@ -11,6 +11,8 @@ cd "${PD_DIR}"
 # Use the node-local, byte-identical model replica by default.  Keeping model
 # reads off /homes avoids the shared NFS thundering herd when 1P+3D start.
 MODEL_PATH="${MODEL_PATH:-/dataset/model/qwen3/Qwen3-8B}"
+MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-}"
+MODEL_TOOL_CALL_PARSER="${MODEL_TOOL_CALL_PARSER:-}"
 MATH_DATA="${MATH_DATA:-${WORKSPACE_ROOT}/data/dapo-math-17k/dapo-math-17k.jsonl}"
 QA_DATA="${QA_DATA:-${WORKSPACE_ROOT}/data/browsecomp/bc_train.jsonl}"
 WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-}"
@@ -96,6 +98,18 @@ PD_LATE_BIND_SOFT_RESERVATION_FORCE_AFTER_S="${PD_LATE_BIND_SOFT_RESERVATION_FOR
 # contains physical plus queued token demand, so use it until that bug is fixed.
 PD_LATE_BIND_FORCE_LEGACY_LOADS="${PD_LATE_BIND_FORCE_LEGACY_LOADS:-1}"
 PD_HICACHE_STORAGE_BACKEND="${PD_HICACHE_STORAGE_BACKEND:-}"
+if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
+  echo "new_method does not use a native HiCache/Mooncake storage backend" >&2
+  exit 2
+fi
+case "${SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY:-}" in
+  1|true|TRUE|yes|YES|on|ON) ;;
+  *)
+    echo "new_method refuses stock HiCache/Mooncake policy; " \
+      "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY must be true" >&2
+    exit 2
+    ;;
+esac
 PD_ENABLE_DECODE_OFFLOAD_KVCACHE="${PD_ENABLE_DECODE_OFFLOAD_KVCACHE:-0}"
 PD_HICACHE_SIZE_GB="${PD_HICACHE_SIZE_GB:-0}"
 PD_PREFILL_HICACHE_SIZE_GB="${PD_PREFILL_HICACHE_SIZE_GB:-${PD_HICACHE_SIZE_GB}}"
@@ -111,9 +125,8 @@ PD_CORRECTNESS_CAPTURE_LABEL="${PD_CORRECTNESS_CAPTURE_LABEL:-pd-capture}"
 PD_SERVE_ONLY="${PD_SERVE_ONLY:-0}"
 PD_DETERMINISTIC_INFERENCE="${PD_DETERMINISTIC_INFERENCE:-0}"
 PD_SERVER_RANDOM_SEED="${PD_SERVER_RANDOM_SEED:-2026}"
-# Keep reverse NIXL listeners out of Linux's usual ephemeral range
-# (32768-60999).  An outgoing Mooncake/UCX connection can otherwise occupy a
-# derived 4xxxx/5xxxx port after preflight but before the D listener binds.
+MAMBA_TRACK_INTERVAL="${MAMBA_TRACK_INTERVAL:-}"
+# Keep reverse NIXL listeners out of Linux's usual ephemeral range.
 # The legacy offset remains available when explicitly supplied.
 AGENTIC_DIRECT_BASE_PORT="${AGENTIC_DIRECT_BASE_PORT:-61000}"
 AGENTIC_DIRECT_PORT_OFFSET="${AGENTIC_DIRECT_PORT_OFFSET:-}"
@@ -132,9 +145,13 @@ if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
 fi
 export PYTHONPATH="${PD_DIR}:${REPO_ROOT}:${PYTHONPATH:-}"
 export LOCAL_SEARCH_URL="http://127.0.0.1:${SEARCH_PORT}"
+# Router backend connections are pooled.  Keep SGLang's server-side lifetime
+# comfortably above the Router's 30-second client idle lifetime so a saturated
+# Router never reuses a socket that Uvicorn has already reaped.
+export SGLANG_TIMEOUT_KEEP_ALIVE="${SGLANG_TIMEOUT_KEEP_ALIVE:-120}"
 
-if [[ "${PD_ENABLE_DECODE_OFFLOAD_KVCACHE}" == "1" && -z "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
-  echo "PD_ENABLE_DECODE_OFFLOAD_KVCACHE=1 requires PD_HICACHE_STORAGE_BACKEND" >&2
+if [[ "${PD_ENABLE_DECODE_OFFLOAD_KVCACHE}" == "1" ]]; then
+  echo "new_method permanently forbids native Decode KV offload" >&2
   exit 1
 fi
 if [[ "${PD_LATE_BINDING}" == "1" && -z "${PD_P_READY_DIR}" ]]; then
@@ -145,12 +162,23 @@ fi
 prefill_hicache_args=()
 decode_hicache_args=()
 deterministic_args=()
+mamba_args=()
+model_parser_args=()
 if [[ "${PD_DETERMINISTIC_INFERENCE}" == "1" ]]; then
   deterministic_args+=(
     --enable-deterministic-inference
     --attention-backend triton
     --random-seed "${PD_SERVER_RANDOM_SEED}"
   )
+fi
+if [[ -n "${MAMBA_TRACK_INTERVAL}" ]]; then
+  mamba_args+=(--mamba-track-interval "${MAMBA_TRACK_INTERVAL}")
+fi
+if [[ -n "${MODEL_REASONING_PARSER}" ]]; then
+  model_parser_args+=(--reasoning-parser "${MODEL_REASONING_PARSER}")
+fi
+if [[ -n "${MODEL_TOOL_CALL_PARSER}" ]]; then
+  model_parser_args+=(--tool-call-parser "${MODEL_TOOL_CALL_PARSER}")
 fi
 storage_extra_config="${PD_HICACHE_STORAGE_EXTRA_CONFIG}"
 if [[ -z "${storage_extra_config}" && "${PD_HICACHE_STORAGE_BACKEND}" == "file" ]]; then
@@ -164,11 +192,8 @@ hicache_metadata_args=(
 )
 if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
   prefill_hicache_args+=(
-    --enable-hierarchical-cache
-    --hicache-write-policy "${PD_PREFILL_HICACHE_WRITE_POLICY}"
     --hicache-mem-layout "${PD_HICACHE_MEM_LAYOUT}"
     --hicache-storage-backend "${PD_HICACHE_STORAGE_BACKEND}"
-    --hicache-storage-prefetch-policy "${PD_HICACHE_STORAGE_PREFETCH_POLICY}"
   )
   if [[ -n "${storage_extra_config}" ]]; then
     prefill_hicache_args+=(--hicache-storage-backend-extra-config "${storage_extra_config}")
@@ -177,19 +202,14 @@ if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
     prefill_hicache_args+=(--hicache-size "${PD_PREFILL_HICACHE_SIZE_GB}")
   fi
 fi
-if [[ "${PD_ENABLE_DECODE_OFFLOAD_KVCACHE}" == "1" ]]; then
+if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
   decode_hicache_args+=(
-    --disaggregation-decode-enable-offload-kvcache
     --hicache-mem-layout "${PD_HICACHE_MEM_LAYOUT}"
     --hicache-storage-backend "${PD_HICACHE_STORAGE_BACKEND}"
   )
   if [[ -n "${storage_extra_config}" ]]; then
     decode_hicache_args+=(--hicache-storage-backend-extra-config "${storage_extra_config}")
   fi
-  if (( PD_DECODE_HICACHE_SIZE_GB > 0 )); then
-    decode_hicache_args+=(--hicache-size "${PD_DECODE_HICACHE_SIZE_GB}")
-  fi
-  hicache_metadata_args+=(--pd-enable-decode-offload-kvcache)
 fi
 
 pids=()
@@ -314,8 +334,25 @@ check_gpu_idle() {
 
 gpu_numa_node() {
   local gpu="$1"
+  local bus
   local node
-  node="$(nvidia-smi topo -m | awk -v row="GPU${gpu}" '$1 == row {print $(NF-1); exit}')"
+  # Query this GPU's PCI function directly instead of parsing the complete
+  # topology matrix.  On large NVSwitch hosts ``nvidia-smi topo -m`` can block
+  # indefinitely while the ordinary per-GPU NVML query and sysfs remain
+  # healthy.  NUMA affinity is a PCI-device property, so sysfs is also the
+  # authoritative and cheaper source here.
+  bus="$(
+    timeout 5s nvidia-smi --id="${gpu}" --query-gpu=pci.bus_id \
+      --format=csv,noheader,nounits 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' '
+  )" || true
+  # NVML commonly prints an eight-digit PCI domain, while Linux sysfs uses
+  # four digits for the same function (00000000:07:00.0 -> 0000:07:00.0).
+  bus="${bus#0000}"
+  if [[ -n "${bus}" && -r "/sys/bus/pci/devices/${bus}/numa_node" ]]; then
+    node="$(<"/sys/bus/pci/devices/${bus}/numa_node")"
+  else
+    node=""
+  fi
   if [[ "${node}" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "${node}"
   else
@@ -548,8 +585,11 @@ for index in "${!prefill_gpu_groups[@]}"; do
       --tp-size "${PREFILL_TP_SIZE}" --numa-node "${prefill_group_numas[@]}" \
       --context-length "${MAX_CONTEXT_LENGTH}" --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" --enable-metrics \
+      --skip-server-warmup \
       --chunked-prefill-size "${PREFILL_CHUNKED_PREFILL_SIZE}" \
       --max-prefill-tokens "${PREFILL_MAX_PREFILL_TOKENS}" \
+      "${mamba_args[@]}" \
+      "${model_parser_args[@]}" \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
       --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
@@ -559,7 +599,11 @@ for index in "${!prefill_gpu_groups[@]}"; do
   prefill_pid="$!"
   prefill_pids+=("${prefill_pid}")
   pids+=("${prefill_pid}")
-  wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/health" "${prefill_pids[$index]}"
+  # A disaggregated P's /health probe performs a real Prefill and waits for a
+  # Decode consumer.  During bootstrap no D or Router exists yet, so using it
+  # here serializes startup behind an impossible transfer.  /model_info proves
+  # the HTTP/model process is ready without creating a P-ready generation.
+  wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/model_info" "${prefill_pids[$index]}"
   # The HTTP server can become healthy even when its auxiliary KV bootstrap
   # listener failed to bind.  That produces a deceptive half-alive P: every
   # later P->D handshake retries forever behind the first FIFO generation.
@@ -614,7 +658,9 @@ for index in "${!decode_gpu_groups[@]}"; do
       --context-length "${MAX_CONTEXT_LENGTH}" \
       --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${decode_mem_fraction_statics[$index]}" \
-      --enable-metrics \
+      "${mamba_args[@]}" \
+      "${model_parser_args[@]}" \
+      --enable-metrics --skip-server-warmup \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
       --disaggregation-mode decode \
@@ -623,7 +669,10 @@ for index in "${!decode_gpu_groups[@]}"; do
     >"${RUN_DIR}/logs/decode-${index}.log" 2>&1 &
   decode_pids+=("$!")
   pids+=("$!")
-  wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/health" "${decode_pids[$index]}"
+  # Keep model bootstrap non-generative for the same reason as Prefill.  The
+  # Router health check below validates the complete P/D serving topology once
+  # every worker is present.
+  wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/model_info" "${decode_pids[$index]}"
 done
 
 if [[ "${PD_SKIP_SEARCH}" != "1" && "${SEARCH_START_AFTER_MODELS}" == "true" ]]; then

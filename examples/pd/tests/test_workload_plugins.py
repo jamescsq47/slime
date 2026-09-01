@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from slime.utils.types import Sample
 
 from data.api import LoadContext
@@ -89,6 +91,78 @@ sampling:
     assert workload.sampling.shuffle_algorithm == "legacy_two_stage_v1"
     assert workload.datasets[0].path == str((tmp_path / "sources/math.jsonl").resolve())
     assert exact_counts(10, workload) == {"easy_math": 7, "web_qa": 3}
+
+
+def test_pure_browsecomp_requires_canonical_source_order_schedule(tmp_path):
+    path = tmp_path / "workload.yaml"
+    path.write_text(
+        """
+schema_version: 1
+datasets:
+  - id: qa
+    harness: browsecomp
+    path: /qa.jsonl
+sampling:
+  policy: random
+  preserve_source_order: false
+  shuffle_algorithm: legacy_two_stage_v1
+"""
+    )
+
+    with pytest.raises(ValueError, match="source-order n680"):
+        load_workload(path)
+
+
+def test_pure_browsecomp_accepts_canonical_source_order_schedule(tmp_path):
+    schedule = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "workloads"
+        / "fixed_browsecomp_source_order_n680.json"
+    )
+    path = tmp_path / "workload.yaml"
+    path.write_text(
+        f"""
+schema_version: 1
+datasets:
+  - id: qa
+    harness: browsecomp
+    path: /qa.jsonl
+sampling:
+  policy: fixed
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1
+  schedule_file: {schedule}
+"""
+    )
+
+    workload = load_workload(path)
+
+    assert workload.sampling.preserve_source_order is True
+    assert workload.sampling.schedule_file == str(schedule.resolve())
+
+
+def test_legacy_pure_browsecomp_forces_canonical_source_order_schedule():
+    workload = legacy_workload(
+        math_path="/math.jsonl",
+        qa_path="/qa.jsonl",
+        math_ratio=0.0,
+        policy="random",
+        seed=7,
+        preserve_source_order=False,
+        schedule_file=None,
+    )
+
+    assert workload.sampling.policy == "fixed"
+    assert workload.sampling.preserve_source_order is True
+    assert workload.sampling.shuffle_algorithm == "source_order"
+    assert workload.sampling.pool_reuse_algorithm == "cycle_as_needed_v1"
+    assert Path(workload.sampling.schedule_file).name == (
+        "fixed_browsecomp_source_order_n680.json"
+    )
 
 
 def test_generic_dispatch_reproduces_the_legacy_two_stage_shuffle():
@@ -347,6 +421,92 @@ def test_terminal_harness_runs_shell_then_evaluates(monkeypatch):
     assert clients[0].commands == ["echo hello"]
     assert clients[0].closed is True
     assert all(payload["return_logprob"] is False for payload in payloads)
+
+
+def test_terminal_harness_retries_openenv_capacity_without_finishing_sample(
+    monkeypatch,
+):
+    tokenizer = CharTokenizer()
+    clients = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.index = len(clients)
+            self.closed = False
+            clients.append(self)
+
+        async def connect(self):
+            pass
+
+        async def reset(self, task_id):
+            if self.index == 0:
+                raise terminal_harness.TerminalEnvironmentError(
+                    "Server at capacity", "CAPACITY_REACHED"
+                )
+            if self.index == 1:
+                raise terminal_harness.TerminalEnvironmentError(
+                    "received 1000 (OK)", "RESET_CONNECTION_CLOSED_OK"
+                )
+            return SimpleNamespace(
+                instruction="finish",
+                info={"working_directory": "/app"},
+            )
+
+        async def evaluate(self):
+            return SimpleNamespace(reward=1.0)
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_post(url, payload):
+        text = "TASK_COMPLETE"
+        return {
+            "text": text,
+            "output_ids": tokenizer.encode(text),
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": len(payload["input_ids"]),
+                "completion_tokens": len(text),
+            },
+        }
+
+    async def no_wait(_seconds):
+        pass
+
+    monkeypatch.setattr(terminal_harness, "Tbench2Client", FakeClient)
+    monkeypatch.setattr(
+        terminal_harness, "GenerateState", lambda args: SimpleNamespace(tokenizer=tokenizer)
+    )
+    monkeypatch.setattr(terminal_harness, "post", fake_post)
+    monkeypatch.setattr(terminal_harness, "dashboard_span", fake_span)
+    monkeypatch.setattr(terminal_harness, "sglang_meta_attrs", lambda meta: {})
+    monkeypatch.setattr(terminal_harness, "lifecycle_enabled", lambda: False)
+    monkeypatch.setattr(terminal_harness.asyncio, "sleep", no_wait)
+    sample = Sample(
+        prompt=[],
+        metadata={"task_id": "headless-terminal", "dataset_id": "terminal"},
+    )
+    args = SimpleNamespace(
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30002,
+        max_seq_len=40960,
+        pd_p_ready_dir="",
+        workload_dataset_options={
+            "terminal": {
+                "environment_url": "http://127.0.0.1:8003",
+                "max_turns": 2,
+                "max_tokens_per_turn": 512,
+            }
+        },
+    )
+
+    result = asyncio.run(
+        terminal_harness.generate(args, sample, {"max_new_tokens": 512})
+    )
+
+    assert result.status is Sample.Status.COMPLETED
+    assert len(clients) == 3
+    assert all(client.closed for client in clients)
 
 
 def test_retool_harness_finishes_without_training_payload(monkeypatch):

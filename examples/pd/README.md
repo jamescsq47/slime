@@ -10,11 +10,13 @@ keep existing experiment imports working.
 ```text
 examples/pd/
 ├── configs/                 environment and fixed workload schedules
-│   └── experiments/         dataset mixtures and reproducible sampling rules
+│   ├── experiments/         dataset mixtures and reproducible sampling rules
+│   └── profiles/            effective serving/topology defaults for reruns
 ├── data/                    dataset loaders and inference-only harness plugins
 │   ├── retool/
 │   ├── browsecomp/
-│   └── terminal_bench/
+│   ├── terminal_bench/
+│   └── swe_bench/
 ├── docs/                    design and validation notes
 ├── patches/                 SGLang patch kept for reproducibility
 ├── requirement.txt          PD runtime, transport and analysis dependencies
@@ -130,10 +132,152 @@ shuffle as before. Every run records the resolved config and exact sample
 order, so a new mixture can be replayed rather than randomly regenerated.
 See `data/README.md` for the plugin contract and extension instructions.
 
+Serving parameters that change the meaning or capacity of an experiment belong
+in a checked profile rather than an ad-hoc shell command.  For example, the
+Qwen3-8B BrowseComp 4P:4D profile records the topology, model limits, sampling,
+closed-loop duration, exact-workset admission, D admission target, and both
+Host arenas:
+
+```bash
+RUN_DIR=/path/to/result \
+  bash examples/pd/scripts/new_method/run_qwen3_8b_tp1_browsecomp_4p4d.sh
+```
+
+The launcher reads
+`configs/profiles/browsecomp_qwen3_8b_tp1_4p4d.yaml`, prints every effective
+value before starting a GPU process, and marks caller-provided values as
+`[override]`.  The same effective data-plane values are saved under
+`serving_runtime` in the result's `config.json`.
+
 BrowseComp retrieval and Terminal-Bench OpenEnv are deliberately external
-services. A harness only connects to the configured endpoint; it never starts
-a GPU search worker or a task container itself. Existing launchers may still
-manage BrowseComp search as an explicit service lifecycle step.
+services. Those harnesses only connect to configured endpoints; they never
+start a GPU search worker or Terminal-Bench task container themselves. Existing
+launchers may still manage BrowseComp search as an explicit service lifecycle
+step. SWE-bench is different: each trajectory owns an official per-instance
+Docker environment, so its harness creates and cleans that isolated container.
+
+SWE-bench uses the official mini-SWE-agent control loop, official per-instance
+environments, and the Miles/Harbor verifier contract.  The launcher pins
+mini-SWE-agent v2.4.6 at commit
+`25941c89cfbc91eb40b3f8756348c91d9977d57e`; it reads the upstream
+`config/benchmarks/swebench.yaml` directly instead of maintaining a local copy
+of the prompts or state machine.  Prepare that source checkout with:
+
+```bash
+bash examples/pd/scripts/tools/prepare_miniswe_agent.sh
+```
+
+Install the verifier dependencies in every environment that launches
+`inference.py` (normally `pd`; also `pd_baseline` when evaluating a baseline):
+
+```bash
+python -m pip install -r examples/pd/requirements-swe-bench.txt
+```
+
+Export SWE-bench Verified into the harness format and prefetch the corresponding
+images:
+
+```bash
+python examples/pd/scripts/tools/prepare_swe_bench.py \
+  --dataset princeton-nlp/SWE-bench_Verified --split test \
+  --output "${PD_DATA_ROOT}/swe-bench-verified/test.jsonl"
+
+# Replace INSTANCE with e.g. astropy__astropy-12907. Repeat or parallelize for
+# every instance selected for an experiment.
+INSTANCE=astropy__astropy-12907
+IMAGE_ID="${INSTANCE/__/_1776_}"
+docker pull "swebench/sweb.eval.x86_64.${IMAGE_ID,,}:latest"
+```
+
+Use `configs/experiments/swe_bench_verified_eval.yaml` for correctness runs.
+After the model stops, it validates the official repository baseline, captures
+committed/staged/unstaged/untracked changes, injects the hidden official test
+script, and records `swe_bench_verifier.resolved` plus `sample.reward`. Hidden
+`test_patch` contents never enter the model prompt.
+
+The verifier has three modes. `inline` runs hidden tests and produces a score;
+`capture` only preserves the complete patch; `disabled` is intended for pure
+serving-throughput profiles so CPU verification time does not occupy a
+closed-loop slot. `verifier_max_concurrent` limits simultaneous CPU test suites
+(default 4). The sandbox backend is independent: `docker` is the local
+default, while `daytona` uses the same agent and verifier code through the
+optional SDK:
+
+```bash
+python -m pip install -r examples/pd/requirements-swe-bench-daytona.txt
+export DAYTONA_API_KEY=...
+# Set sandbox_backend: daytona in the workload YAML.
+```
+
+The serving-only Lite workload remains in
+`configs/experiments/swe_bench_lite.yaml`.  The maintained Qwen3-32B TP=2
+colocated evaluation is:
+
+```bash
+bash examples/pd/scripts/baseline/run_qwen3_32b_tp2_swe_bench_colocated.sh
+```
+
+It runs four collocated TP=2 replicas on eight GPUs, 500 SWE-bench Verified
+tasks with at most 128 active task containers, temperature 0, top-p 1, top-k
+-1, an 8,192-token per-turn generation cap, and a 40,960-token model context.
+The official agent keeps its 250-step limit and 60-second shell timeout; the
+local evaluation disables the API cost limit and applies a one-hour wall-clock
+limit per task.  The harness preserves repository state across shell turns,
+disables container networking by default, runs the official verifier inline,
+and removes the task container even when the load generator cancels an in-flight
+trajectory.  Results are first written below `/tmp/pd-runs` so NFS cannot
+perturb serving, then copied to `runs-host/baseline` after all 500 trajectories
+finish.  Each result records the complete official trajectory plus per-turn
+token/model timing, Docker start/exec/close timing, patch, and verifier fields.
+
+The local and Daytona paths use the same agent and `resolved` grading
+implementation; only sandbox provisioning and file transfer differ.
+
+### OpenEnv-style SWE-bench harness (default for new evaluations)
+
+New SWE-bench measurements should use the separate `swe_bench_openenv`
+plugin. It ports the direct episode contract from Miles PR #51 while retaining
+this repository's SGLang and sandbox instrumentation:
+
+```text
+official issue + pristine task image
+  -> policy emits exactly one fenced shell command per turn
+  -> repository state persists across turns
+  -> policy stops / reaches max_turns
+  -> capture the complete tracked + untracked patch
+  -> inject the hidden official verifier
+  -> record resolved, trajectory, model/tool/Docker/verifier timing
+```
+
+Unlike the historical mini-SWE-agent adapter, grading is not conditional on a
+special submission marker. A patch left in the durable workspace is evaluated
+after any normal episode termination. The hidden verifier remains unavailable
+to the model. `sandbox_backend: docker` is the local default; the existing
+Daytona transport remains selectable without changing the policy loop.
+
+Qwen3.5-27B is the maintained SWE-bench model:
+
+```bash
+hf download Qwen/Qwen3.5-27B --local-dir /homes/siqic/Qwen3.5-27B
+bash examples/pd/scripts/baseline/run_qwen35_27b_tp2_swe_bench_openenv_colocated.sh
+```
+
+The launcher uses four TP=2 replicas, c128, 131,072-token serving context,
+8,192 tokens per model turn, temperature 0.6, top-p 0.95, top-k 20, min-p 0,
+and inline canonical verification. Qwen3.5's hybrid Mamba radix cache requires
+`page_size=1`; the reusable launcher keeps `page_size=64` for older Qwen3
+models unless the model-specific launcher overrides it.
+
+Before a model run, validate one official image with both expected outcomes:
+
+```bash
+python examples/pd/scripts/tools/smoke_swe_bench_verifier.py \
+  --dataset "${PD_DATA_ROOT}/swe-bench-verified/test.jsonl" \
+  --instance-id astropy__astropy-12907 --patch empty
+python examples/pd/scripts/tools/smoke_swe_bench_verifier.py \
+  --dataset "${PD_DATA_ROOT}/swe-bench-verified/test.jsonl" \
+  --instance-id astropy__astropy-12907 --patch oracle
+```
 
 ## SGLang source checkouts
 
@@ -289,11 +433,13 @@ Before using Terminal-Bench, start its OpenEnv service manually, set
 config in the same way.
 
 ```bash
-cd /path/to/openenv/envs/tbench2_env
-TB2_MODE=docker \
-TB2_TASKS_DIR=/path/to/terminal-bench-2 \
-python -m tbench2_env.server.app --port 8003
+OPENENV_ROOT=/path/to/openenv \
+bash /homes/siqic/slime/examples/pd/scripts/tools/start_terminal_bench_env.sh
 ```
+
+The service launcher defaults `MAX_CONCURRENT_ENVS` to 256 through
+`configs/services/terminal_bench.env`, matching the formal c256 workload.  An
+explicit environment value may override it for a different concurrency sweep.
 
 Run the four-GPU colocated/1P:3D baseline comparison:
 

@@ -8,6 +8,7 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import random
 import time
 from argparse import Namespace
@@ -1130,6 +1131,32 @@ async def async_main(cli: argparse.Namespace) -> None:
     config = vars(cli) | {"output_dir": str(cli.output_dir)}
     config["workload_config"] = str(cli.workload_config) if cli.workload_config else None
     config["schedule_file"] = str(cli.schedule_file) if cli.schedule_file else None
+    # Persist the effective serving/data-plane settings next to every result.
+    # These values used to live only in transient shell exports, which made a
+    # later rerun look identical in config.json even when Direct reserve or D
+    # admission differed materially.
+    runtime_keys = (
+        "EXPERIMENT_CONFIG",
+        "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY",
+        "SGLANG_PD_LATE_BIND_TARGET_KV_FRACTION",
+        "SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD",
+        "SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT",
+        "SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB",
+        "SGLANG_AGENTIC_KV_P2D_HOST_STAGING",
+        "SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB",
+        "SGLANG_PD_LATE_BIND_MAX_PREFILL_INFLIGHT",
+        "SGLANG_PREFILL_TRANSFER_CONSUMERS",
+        "PD_INFERENCE_RETURN_LOGPROB",
+        "MIN_P",
+        "PREFILL_GPUS",
+        "DECODE_GPUS",
+        "PREFILL_TP_SIZE",
+        "DECODE_TP_SIZE",
+        "DECODE_MEM_FRACTION_STATICS",
+    )
+    config["serving_runtime"] = {
+        key: os.environ[key] for key in runtime_keys if key in os.environ
+    }
     write_json(cli.output_dir / "config.json", config)
     write_json(cli.output_dir / "resolved_workload.json", workload.to_dict())
     if cli.dry_run:

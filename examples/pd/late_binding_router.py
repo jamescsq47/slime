@@ -48,6 +48,14 @@ from sglang_router.mini_lb import (
 
 logger = logging.getLogger(__name__)
 
+# Complete-snapshot Host eviction is optional.  The Router must also run
+# against environments that implement the core staging lifecycle but predate
+# the EVICTING/RECOMPUTE_REQUIRED extension.
+_HOST_STAGE_EVICTING = getattr(HostStageState, "EVICTING", None)
+_HOST_STAGE_RECOMPUTE_REQUIRED = getattr(
+    HostStageState, "RECOMPUTE_REQUIRED", None
+)
+
 
 def _sync_json_get(url: str, timeout: float) -> Any:
     """Fetch one tiny control-plane JSON document outside the ASGI loop."""
@@ -724,11 +732,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             HostStageState.HOST_WRITING.value,
             HostStageState.HOST_READY.value,
             HostStageState.H2D_LOADING.value,
-            # ABORTING still owns its Shared-Arena extent until D has
-            # quiesced and P releases the record.  There is no EVICTING state
-            # in the request-generation Host lifecycle.
+            # ABORTING likewise owns its extent until D is quiescent.
             HostStageState.ABORTING.value,
         }
+        # EVICTING still owns its TP-local extents; RECOMPUTE_REQUIRED does
+        # not.  Add the former only when this environment exposes it.
+        if _HOST_STAGE_EVICTING is not None:
+            live_states.add(_HOST_STAGE_EVICTING.value)
         for entry in ledger.snapshot_entries().values():
             if entry.get("state") not in live_states:
                 continue
@@ -1136,6 +1146,39 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         reservation.route_pending = True
                         return reservation
                     elif mode in {"direct_complete", "host_writing", "host_ready"}:
+                        if mode in {"host_writing", "host_ready"}:
+                            host_ledger = getattr(self, "_d2p_host_ledger", None)
+                            host_entry = (
+                                None
+                                if host_ledger is None
+                                else await asyncio.to_thread(
+                                    host_ledger.get, parent.snapshot_id
+                                )
+                            )
+                            host_state = (
+                                None if host_entry is None else host_entry.get("state")
+                            )
+                            if (
+                                _HOST_STAGE_EVICTING is not None
+                                and host_state == _HOST_STAGE_EVICTING.value
+                            ):
+                                await asyncio.sleep(self.ready_poll_interval)
+                                continue
+                            if (
+                                _HOST_STAGE_RECOMPUTE_REQUIRED is not None
+                                and host_state
+                                == _HOST_STAGE_RECOMPUTE_REQUIRED.value
+                            ):
+                                store.publish_route(
+                                    parent,
+                                    route="recompute",
+                                    prefill_domain=int(route["prefill_domain"]),
+                                )
+                                store.remove_arrival(parent)
+                                await self._release_prefill_work(reservation)
+                                return await self._reserve_prefill_work(
+                                    self._request_input_tokens(request)
+                                )
                         domain = int(route["prefill_domain"])
                         if not 0 <= domain < len(self.prefill_urls):
                             raise RuntimeError(f"invalid Prefill domain {domain}")
@@ -1215,6 +1258,40 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             if route is not None:
                 mode = route.get("route")
                 if mode in {"direct_complete", "host_writing", "host_ready"}:
+                    if mode in {"host_writing", "host_ready"}:
+                        host_ledger = getattr(self, "_d2p_host_ledger", None)
+                        host_entry = (
+                            None
+                            if host_ledger is None
+                            else await asyncio.to_thread(
+                                host_ledger.get, parent.snapshot_id
+                            )
+                        )
+                        host_state = (
+                            None if host_entry is None else host_entry.get("state")
+                        )
+                        if (
+                            _HOST_STAGE_EVICTING is not None
+                            and host_state == _HOST_STAGE_EVICTING.value
+                        ):
+                            await asyncio.sleep(self.ready_poll_interval)
+                            continue
+                        if (
+                            _HOST_STAGE_RECOMPUTE_REQUIRED is not None
+                            and host_state
+                            == _HOST_STAGE_RECOMPUTE_REQUIRED.value
+                        ):
+                            store.publish_route(
+                                parent,
+                                route="recompute",
+                                prefill_domain=int(route["prefill_domain"]),
+                            )
+                            store.remove_arrival(parent)
+                            await self._settle_direct_workset(reservation)
+                            await self._resize_prefill_work(
+                                reservation, self._request_input_tokens(request)
+                            )
+                            return {"action": "recompute", "route": "host_evicted"}
                     domain = int(route["prefill_domain"])
                     if not 0 <= domain < len(self.prefill_urls):
                         raise RuntimeError(f"invalid Prefill domain {domain}")

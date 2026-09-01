@@ -12,8 +12,9 @@ Supported entry points:
 - `run_4p4d_numa_case.sh`: four-P-domain 4P:4D configuration.  Each D uses
   the Host/slow-path arena of its same-NUMA paired P, while completed Prefill
   KV may still be late-bound to any feasible D.
-- `internal/`: Mooncake, lifecycle and model-service implementation used by
-  the entry points.  Do not launch these files directly.
+- `internal/`: lifecycle and model-service implementation used by the entry
+  points.  KV payloads use Direct or Shared Host Arenas; lifecycle metadata is
+  kept in the run-scoped `/dev/shm` directory.  Do not launch these directly.
 
 The current policy uses a 2-second fast-tool threshold, a 2-second Direct
 handshake bound, exact-size Direct receive pages, Direct > slow recovery > new

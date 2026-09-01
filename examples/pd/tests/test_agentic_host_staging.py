@@ -70,6 +70,386 @@ def test_host_ready_requires_every_d2h_chunk_ack():
         os.unlink(path)
 
 
+def test_host_eviction_is_tp_atomic_and_load_claims_are_ineligible():
+    ledger, path = _ledger()
+    try:
+        offer = _offer("evict-group:0")
+        offer.update(tp_size=2)
+
+        def publish_ready(entries):
+            entries[offer["snapshot_id"]] = dict(
+                offer,
+                state=HostStageState.HOST_READY.value,
+                p_owner="p-group",
+                created_at=1.0,
+                updated_at=1.0,
+                h2d_prepared_ranks=[1],
+                loading_ranks=[],
+                loader_acks=[],
+                binder_acks=[],
+            )
+            return True, True
+
+        ledger._mutate(publish_ready, event_snapshot_id=offer["snapshot_id"])
+        assert not ledger.begin_host_eviction(
+            offer["snapshot_id"],
+            "p-group",
+            tp_size=2,
+            reason="pressure",
+        )
+
+        def clear_load_claim(entries):
+            entries[offer["snapshot_id"]]["h2d_prepared_ranks"] = []
+            return True, True
+
+        ledger._mutate(clear_load_claim, event_snapshot_id=offer["snapshot_id"])
+        assert ledger.begin_host_eviction(
+            offer["snapshot_id"],
+            "p-group",
+            tp_size=2,
+            reason="pressure",
+        )
+        assert ledger.get(offer["snapshot_id"])["state"] == HostStageState.EVICTING.value
+        assert ledger.complete_host_eviction_rank(
+            offer["snapshot_id"], "p-group", tp_rank=0, tp_size=2
+        )
+        assert ledger.get(offer["snapshot_id"])["state"] == HostStageState.EVICTING.value
+        assert ledger.complete_host_eviction_rank(
+            offer["snapshot_id"], "p-group", tp_rank=1, tp_size=2
+        )
+        assert (
+            ledger.get(offer["snapshot_id"])["state"]
+            == HostStageState.RECOMPUTE_REQUIRED.value
+        )
+    finally:
+        os.unlink(path)
+
+
+def test_host_eviction_and_load_prepare_are_one_atomic_choice():
+    ledger, path = _ledger()
+    try:
+        for generation in range(32):
+            offer = _offer(f"evict-load-race:{generation}")
+            offer.update(tp_size=1)
+
+            def publish_ready(entries, value=offer):
+                entries[value["snapshot_id"]] = dict(
+                    value,
+                    state=HostStageState.HOST_READY.value,
+                    p_owner="p0",
+                    loading_ranks=[],
+                    h2d_prepared_ranks=[],
+                    loader_acks=[],
+                    binder_acks=[],
+                )
+                return True, True
+
+            ledger._mutate(publish_ready, event_snapshot_id=offer["snapshot_id"])
+            barrier = threading.Barrier(3)
+            results = {}
+
+            def evict():
+                barrier.wait()
+                results["evict"] = ledger.begin_host_eviction(
+                    offer["snapshot_id"],
+                    "p0",
+                    tp_size=1,
+                    reason="pressure",
+                )
+
+            def prepare():
+                barrier.wait()
+                results["prepare"] = ledger.prepare_tp_host_load_rank(
+                    offer["snapshot_id"],
+                    "p0",
+                    tp_rank=0,
+                    tp_size=1,
+                )
+
+            threads = [threading.Thread(target=evict), threading.Thread(target=prepare)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+
+            # The shared ledger mutation is the sole ownership decision: a
+            # generation may become EVICTING or H2D_LOADING, never both.
+            assert results["evict"] != results["prepare"]
+            entry = ledger.get(offer["snapshot_id"])
+            if results["evict"]:
+                assert entry["state"] == HostStageState.EVICTING.value
+                assert entry.get("h2d_prepared_ranks", []) == []
+            else:
+                assert entry["state"] == HostStageState.H2D_LOADING.value
+                assert entry["h2d_prepared_ranks"] == [0]
+    finally:
+        os.unlink(path)
+
+
+def test_shared_host_pressure_evicts_shortest_then_oldest_to_low_watermark():
+    trace = []
+
+    class Arena:
+        capacity_bytes = 1000
+        used_bytes = 950
+
+        def usage(self):
+            return self.used_bytes / self.capacity_bytes
+
+        def release(self, snapshot):
+            trace.append(snapshot.name)
+            self.used_bytes -= snapshot.allocation_bytes
+            return True
+
+        def can_reserve(self, byte_size, hard_watermark):
+            return self.used_bytes + byte_size <= self.capacity_bytes * hard_watermark
+
+    ledger, path = _ledger()
+    try:
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = "p0"
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.arena = Arena()
+        manager.storage_spill_enabled = False
+        manager.high_watermark = 0.90
+        manager.low_watermark = 0.75
+        manager._host_eviction_pressure = False
+        manager._host_eviction_required_bytes = 0
+        manager._host_eviction_count = 0
+        manager._host_eviction_tokens = 0
+        manager._host_eviction_bytes = 0
+        manager._host_eviction_local_released = set()
+        manager._last_host_eviction_blocked_log = 0.0
+        manager._scheduler_events = queue.SimpleQueue()
+        manager.active = {}
+        manager.loads = {}
+        manager.host_ready = {}
+
+        for snapshot_id, tokens, ready_at, allocation in (
+            ("short-old:0", 64, 1.0, 100),
+            ("short-new:0", 64, 2.0, 100),
+            ("long:0", 256, 0.0, 300),
+        ):
+            offer = _offer(snapshot_id)
+            offer.update(token_count=tokens, byte_size=allocation)
+
+            def publish_ready(entries, value=offer):
+                entries[value["snapshot_id"]] = dict(
+                    value,
+                    state=HostStageState.HOST_READY.value,
+                    p_owner="p0",
+                    tp_size=1,
+                    created_at=ready_at,
+                    updated_at=ready_at,
+                    loading_ranks=[],
+                    h2d_prepared_ranks=[],
+                    loader_acks=[],
+                    binder_acks=[],
+                )
+                return True, True
+
+            ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+            manager.host_ready[snapshot_id] = {
+                "offer": offer,
+                "snapshot": types.SimpleNamespace(
+                    name=snapshot_id, allocation_bytes=allocation
+                ),
+                "loading": False,
+                "ready_at": ready_at,
+            }
+
+        manager._maybe_evict_shared_host()
+
+        assert trace == ["short-old:0", "short-new:0"]
+        assert manager.arena.used_bytes == 750
+        assert set(manager.host_ready) == {"long:0"}
+        assert (
+            ledger.get("short-old:0")["state"]
+            == HostStageState.RECOMPUTE_REQUIRED.value
+        )
+        assert (
+            ledger.get("short-new:0")["state"]
+            == HostStageState.RECOMPUTE_REQUIRED.value
+        )
+        assert ledger.get("long:0")["state"] == HostStageState.HOST_READY.value
+    finally:
+        os.unlink(path)
+
+
+def test_capacity_block_below_low_watermark_evicts_until_extent_fits():
+    trace = []
+
+    class FragmentedArena:
+        capacity_bytes = 1000
+        used_bytes = 700
+        largest_free = 50
+
+        def usage(self):
+            return self.used_bytes / self.capacity_bytes
+
+        def can_reserve(self, byte_size, hard_watermark):
+            return (
+                self.used_bytes + byte_size
+                <= self.capacity_bytes * hard_watermark
+                and self.largest_free >= byte_size
+            )
+
+        def release(self, snapshot):
+            trace.append(snapshot.name)
+            self.used_bytes -= snapshot.allocation_bytes
+            self.largest_free += snapshot.allocation_bytes
+            return True
+
+    ledger, path = _ledger()
+    try:
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = "p0"
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.arena = FragmentedArena()
+        manager.storage_spill_enabled = False
+        manager.high_watermark = 0.90
+        manager.low_watermark = 0.75
+        manager.hard_watermark = 0.95
+        manager._host_eviction_pressure = True
+        manager._host_eviction_required_bytes = 200
+        manager._host_eviction_count = 0
+        manager._host_eviction_tokens = 0
+        manager._host_eviction_bytes = 0
+        manager._host_eviction_local_released = set()
+        manager._last_host_eviction_blocked_log = 0.0
+        manager._scheduler_events = queue.SimpleQueue()
+        manager.active = {}
+        manager.loads = {}
+        manager.host_ready = {}
+
+        for snapshot_id, ready_at in (("old:0", 1.0), ("new:0", 2.0)):
+            offer = _offer(snapshot_id)
+            offer.update(token_count=64, byte_size=100)
+
+            def publish_ready(entries, value=offer):
+                entries[value["snapshot_id"]] = dict(
+                    value,
+                    state=HostStageState.HOST_READY.value,
+                    p_owner="p0",
+                    tp_size=1,
+                    loading_ranks=[],
+                    h2d_prepared_ranks=[],
+                    loader_acks=[],
+                    binder_acks=[],
+                )
+                return True, True
+
+            ledger._mutate(publish_ready, event_snapshot_id=snapshot_id)
+            manager.host_ready[snapshot_id] = {
+                "offer": offer,
+                "snapshot": types.SimpleNamespace(
+                    name=snapshot_id, allocation_bytes=100
+                ),
+                "loading": False,
+                "ready_at": ready_at,
+            }
+
+        manager._maybe_evict_shared_host()
+
+        assert trace == ["old:0", "new:0"]
+        assert manager.arena.can_reserve(200, 0.95)
+        assert manager._host_eviction_pressure is False
+        assert manager._host_eviction_required_bytes == 0
+    finally:
+        os.unlink(path)
+
+
+def test_host_release_failure_never_acks_eviction():
+    class RetryArena:
+        def __init__(self):
+            self.attempts = 0
+
+        def release(self, _snapshot):
+            self.attempts += 1
+            return self.attempts > 1
+
+    ledger, path = _ledger()
+    try:
+        offer = _offer("release-retry:0")
+
+        def publish_evicting(entries):
+            entries[offer["snapshot_id"]] = dict(
+                offer,
+                state=HostStageState.EVICTING.value,
+                p_owner="p0",
+                tp_size=1,
+                eviction_acks=[],
+                eviction_reason="pressure",
+            )
+            return True, True
+
+        ledger._mutate(publish_evicting, event_snapshot_id=offer["snapshot_id"])
+        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+        manager._state_lock = threading.RLock()
+        manager.owner = "p0"
+        manager.tp_rank = 0
+        manager.tp_size = 1
+        manager.ledger = ledger
+        manager.arena = RetryArena()
+        manager._host_eviction_local_released = set()
+        manager._host_eviction_count = 0
+        manager._host_eviction_tokens = 0
+        manager._host_eviction_bytes = 0
+        manager._scheduler_events = queue.SimpleQueue()
+        manager.active = {}
+        manager.host_ready = {
+            offer["snapshot_id"]: {
+                "offer": offer,
+                "snapshot": types.SimpleNamespace(allocation_bytes=300),
+                "loading": False,
+            }
+        }
+
+        entry = ledger.get(offer["snapshot_id"])
+        assert not manager._release_evicted_host_rank(offer["snapshot_id"], entry)
+        assert ledger.get(offer["snapshot_id"])["state"] == HostStageState.EVICTING.value
+        assert offer["snapshot_id"] in manager.host_ready
+
+        assert manager._release_evicted_host_rank(offer["snapshot_id"], entry)
+        assert (
+            ledger.get(offer["snapshot_id"])["state"]
+            == HostStageState.RECOMPUTE_REQUIRED.value
+        )
+        assert offer["snapshot_id"] not in manager.host_ready
+    finally:
+        os.unlink(path)
+
+
+def test_evicted_host_snapshot_falls_back_without_ready_timeout():
+    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
+    manager._state_lock = threading.RLock()
+    manager.host_ready = {}
+    manager.active = {}
+    manager.aborting = {}
+    manager.loads = {}
+    manager._h2d_lane_reservations = {}
+    manager._ledger_entries_cache = {
+        "evicted:0": {"state": HostStageState.RECOMPUTE_REQUIRED.value}
+    }
+    manager.ledger = types.SimpleNamespace(
+        get=lambda _snapshot_id: {
+            "state": HostStageState.RECOMPUTE_REQUIRED.value
+        }
+    )
+    req = types.SimpleNamespace(rid="evicted-child")
+
+    assert manager.gate_request(req, RequestGeneration("evicted", 0)) is False
+    assert req._agentic_kv_gate_complete is True
+    assert req._agentic_kv_fallback == "shared_host_evicted"
+
+
 def test_claim_is_atomic_across_competing_p_threads():
     ledger, path = _ledger()
     try:
@@ -271,6 +651,7 @@ def test_p_keeps_capacity_blocked_offer_pending():
 
     assert manager._admit_one({"capacity-wait:0": offer}) is False
     assert claimed == []
+    assert manager._host_eviction_pressure is True
 
 
 def test_p_rejects_expired_capacity_blocked_offer_for_d_fail_open():
@@ -626,6 +1007,8 @@ def test_d_accepts_every_state_after_complete_host_copy_as_release_ack():
     for state in (
         HostStageState.HOST_READY,
         HostStageState.H2D_LOADING,
+        HostStageState.EVICTING,
+        HostStageState.RECOMPUTE_REQUIRED,
         HostStageState.SPILLING,
         HostStageState.MOONCAKE_READY,
         HostStageState.CONSUMED,

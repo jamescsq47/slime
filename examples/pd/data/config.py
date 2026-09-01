@@ -13,6 +13,12 @@ import yaml
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_BROWSECOMP_SOURCE_ORDER_SCHEDULE = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "workloads"
+    / "fixed_browsecomp_source_order_n680.json"
+).resolve()
 
 
 @dataclass(frozen=True)
@@ -147,6 +153,28 @@ def _validate(payload: dict[str, Any], *, source: Path | None) -> WorkloadSpec:
     }:
         raise ValueError(f"unsupported pool_reuse_algorithm: {pool_reuse_algorithm}")
 
+    # Pure BrowseComp measurements use one canonical replay order.  Enforce it
+    # here, rather than relying on shell defaults, so an environment override
+    # cannot silently turn a comparable source-order run into a shuffled run.
+    if len(datasets) == 1 and datasets[0].harness == "browsecomp":
+        canonical = (
+            policy == "fixed"
+            and preserve_source_order
+            and shuffle_algorithm == "source_order"
+            and count_algorithm == "largest_remainder_v1"
+            and pool_reuse_algorithm == "cycle_as_needed_v1"
+            and schedule_file is not None
+            and Path(schedule_file).resolve() == _BROWSECOMP_SOURCE_ORDER_SCHEDULE
+        )
+        if not canonical:
+            raise ValueError(
+                "pure BrowseComp workloads must replay source-order n680: "
+                "policy=fixed, preserve_source_order=true, "
+                "shuffle_algorithm=source_order, "
+                "pool_reuse_algorithm=cycle_as_needed_v1, schedule_file="
+                f"{_BROWSECOMP_SOURCE_ORDER_SCHEDULE.name}"
+            )
+
     return WorkloadSpec(
         datasets=tuple(datasets),
         sampling=SamplingSpec(
@@ -215,6 +243,12 @@ def legacy_workload(
                 },
             }
         )
+    pure_browsecomp = len(datasets) == 1 and datasets[0]["harness"] == "browsecomp"
+    if pure_browsecomp:
+        policy = "fixed"
+        preserve_source_order = True
+        schedule_file = str(_BROWSECOMP_SOURCE_ORDER_SCHEDULE)
+
     return _validate(
         {
             "schema_version": 1,
@@ -231,7 +265,11 @@ def legacy_workload(
                     if len(datasets) == 2
                     else "largest_remainder_v1"
                 ),
-                "pool_reuse_algorithm": "cover_all_cycle_v1",
+                "pool_reuse_algorithm": (
+                    "cycle_as_needed_v1"
+                    if pure_browsecomp
+                    else "cover_all_cycle_v1"
+                ),
                 "schedule_file": schedule_file,
             },
         },

@@ -109,6 +109,8 @@ class _ProgressQueue:
     def __init__(self):
         self.queue = []
         self.calls = 0
+        self.metadata_calls = 0
+        self._async_metadata_pending_count = 0
 
     def enable_async_progress(self):
         pass
@@ -116,34 +118,51 @@ class _ProgressQueue:
     def background_progress(self):
         self.calls += 1
 
+    def background_control_progress(self):
+        self.calls += 1
+
+    def background_metadata_progress(self):
+        self.metadata_calls += 1
+
 
 def test_blocked_agentic_control_does_not_stop_transfer_progress():
     manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
     manager._decode_io_async_enabled = True
     manager._decode_io_threads = {}
     manager._decode_io_wakeups = {
-        name: threading.Event() for name in ("transfer", "prealloc", "agentic")
+        name: threading.Event()
+        for name in (
+            "transfer",
+            "prealloc",
+            "prealloc_metadata",
+            "agentic_direct",
+            "agentic_slow",
+        )
     }
     manager._decode_io_stop = threading.Event()
     manager._decode_io_intervals = {
         "transfer": 0.001,
         "prealloc": 0.005,
-        "agentic": 0.001,
+        "prealloc_metadata": 0.005,
+        "agentic_direct": 0.001,
+        "agentic_slow": 0.001,
     }
     manager._decode_io_cuda_device = None
     manager._decode_io_error_count = 0
     manager._decode_io_last_error = None
     manager._decode_io_events = None
     manager.agentic_direct_candidates = {}
+    manager._agentic_candidates_lock = threading.RLock()
     manager.agentic_relay_worker = None
 
     prealloc = _ProgressQueue()
     transfer = _ProgressQueue()
     agentic_release = threading.Event()
 
-    def blocked_agentic(*, progress_relay):
+    def blocked_agentic(*, progress_relay, progress_class):
         assert progress_relay is False
-        agentic_release.wait(0.25)
+        if progress_class == "direct":
+            agentic_release.wait(0.25)
 
     manager._check_agentic_direct_progress = blocked_agentic
     manager.start_decode_io_progress_worker(prealloc, transfer)
@@ -165,13 +184,23 @@ def test_blocked_isolated_relay_does_not_stop_p_to_d_progress():
     manager._decode_io_async_enabled = True
     manager._decode_io_threads = {}
     manager._decode_io_wakeups = {
-        name: threading.Event() for name in ("transfer", "prealloc", "agentic", "relay")
+        name: threading.Event()
+        for name in (
+            "transfer",
+            "prealloc",
+            "prealloc_metadata",
+            "agentic_direct",
+            "agentic_slow",
+            "relay",
+        )
     }
     manager._decode_io_stop = threading.Event()
     manager._decode_io_intervals = {
         "transfer": 0.001,
         "prealloc": 0.005,
-        "agentic": 0.005,
+        "prealloc_metadata": 0.005,
+        "agentic_direct": 0.005,
+        "agentic_slow": 0.005,
         "relay": 0.001,
     }
     manager._decode_io_cuda_device = None
@@ -179,6 +208,7 @@ def test_blocked_isolated_relay_does_not_stop_p_to_d_progress():
     manager._decode_io_last_error = None
     manager._decode_io_events = None
     manager.agentic_direct_candidates = {}
+    manager._agentic_candidates_lock = threading.RLock()
     manager._agentic_relay_progress_isolated = True
 
     relay_release = threading.Event()
@@ -192,7 +222,9 @@ def test_blocked_isolated_relay_does_not_stop_p_to_d_progress():
         poll=blocked_relay,
         active=None,
     )
-    manager._check_agentic_direct_progress = lambda *, progress_relay: None
+    manager._check_agentic_direct_progress = (
+        lambda *, progress_relay, progress_class: None
+    )
     prealloc = _ProgressQueue()
     transfer = _ProgressQueue()
 
@@ -642,39 +674,60 @@ def test_explicit_tool_continuation_can_publish_reverse_kv():
     assert len(published) == 1
 
 
-def test_unconfirmed_tool_candidate_fails_without_becoming_final():
-    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+def test_unconfirmed_tool_candidate_preserves_parent_via_host_fallback():
     snapshot_id = "repair-parent:0"
     manifest = types.SimpleNamespace(
         snapshot_id=snapshot_id,
         state=SnapshotState.DIRECT_READY,
+        token_count=1024,
     )
-    failed = []
-    manager.agentic_snapshot_store = types.SimpleNamespace(
-        fail_direct_offer=lambda item, owner_id, reason: (
-            failed.append((item, reason)) or item
-        )
-    )
-    released = []
-    manager._enqueue_agentic_release = lambda req, delay: released.append((req, delay))
-    manager._cleanup_agentic_direct_sender = lambda _candidate: None
-    manager._agentic_release_early_claim = lambda _candidate, reason: released.append(
-        ("claim", reason)
-    )
-    manager._agentic_release_final_confirmation = lambda _candidate: None
-    manager.agentic_direct_candidates = {snapshot_id: object()}
     candidate = {
         "req": object(),
         "manifest": manifest,
-        "created_at": 10.0,
+        "metadata": types.SimpleNamespace(current=types.SimpleNamespace()),
+        "sender": types.SimpleNamespace(poll=lambda: KVPoll.WaitingForInput),
+        "created_at": time.monotonic() - 3.0,
+        "claimed_at": None,
         "staging": False,
         "sent": False,
-        "metadata": types.SimpleNamespace(
-            current=types.SimpleNamespace(storage_id="repair-parent:0")
-        ),
+        "fallback_retry_at": 0.0,
+        "io_lock": threading.RLock(),
     }
+    started = []
+    routes = []
 
-    assert manager._agentic_fail_unconfirmed_tool_candidate(candidate, manifest, 12.0)
-    assert failed == [(manifest, "application_tool_unconfirmed")]
-    assert snapshot_id not in manager.agentic_direct_candidates
-    assert ("claim", "unconfirmed_tool") in released
+    def start_host(value, current):
+        value["staging"] = True
+        started.append((value, current))
+        return True
+
+    manager = types.SimpleNamespace(
+        tp_world_size=1,
+        tp_rank=0,
+        agentic_fast_threshold=2.0,
+        agentic_early_claim_post_timeout=2.0,
+        agentic_relay_worker=None,
+        agentic_early_claim_store=object(),
+        agentic_host_staging_client=object(),
+        _agentic_candidate_items=lambda: ((snapshot_id, candidate),),
+        _agentic_try_final_confirmation=lambda _candidate: False,
+        _agentic_candidate_is_live_locked=lambda sid, value: (
+            sid == snapshot_id and value is candidate
+        ),
+        _agentic_try_early_claim=lambda _candidate, _now: "absent",
+        _agentic_direct_manifest=lambda *_args, **_kwargs: manifest,
+        _agentic_try_tool_confirmation=lambda _candidate: False,
+        _agentic_release_early_claim=lambda *_args: None,
+        _agentic_direct_kv_usage=lambda: 0.5,
+        _start_agentic_host_staging=start_host,
+        _publish_agentic_route=lambda *_args, **_kwargs: (
+            routes.append((_args, _kwargs)) or True
+        ),
+    )
+
+    DecodeKVCacheOffloadManager._check_agentic_direct_progress(
+        manager, progress_relay=False
+    )
+
+    assert started == [(candidate, manifest)]
+    assert routes and routes[0][1]["route"] == "host_writing"
