@@ -1,0 +1,43 @@
+{
+  "direct": {
+    "fallbacks": 7234,
+    "hit_rate_per_offer": 0.0,
+    "hits": 0,
+    "mean_fallback_seconds": 0.0005515548797345867,
+    "mean_send_complete_seconds": null,
+    "offers": 7236,
+    "pending_at_log_end": 2
+  },
+  "events": {
+    "app_final_release": 2,
+    "d_generation_release": 8726,
+    "d_release_after_p_host": 7219,
+    "decode_radix_reuse": 8793,
+    "direct_fallback": 7234,
+    "direct_offer": 7236,
+    "fast_arrival": 6,
+    "fast_arrival_released": 5,
+    "fast_arrival_seen": 5,
+    "final_skip": 1505,
+    "host_staging_offer": 7233,
+    "p_to_d_release": 9012,
+    "request_seen": 8741,
+    "shared_host_d2h_complete": 7219,
+    "shared_host_d2h_start": 7232,
+    "shared_host_evict_release": 3476,
+    "shared_host_extent_ready": 7232,
+    "shared_host_h2d_complete": 3696,
+    "shared_host_h2d_release": 3696,
+    "shared_host_h2d_start": 3697,
+    "shared_host_materialize_complete": 3700,
+    "shared_host_ready": 7219,
+    "slow_prefill_select": 7149,
+    "slow_prefill_select_fallback": 85
+  },
+  "mooncake": {
+    "consumed_snapshots": 0,
+    "mean_ready_seconds": null,
+    "mean_snapshot_gib": null,
+    "ready_snapshots": 0
+  }
+}

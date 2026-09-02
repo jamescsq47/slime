@@ -15,13 +15,29 @@ All rows use the same serving workload and differ only in the named ablation.
 | Request source | `fixed_random_s2026_n8192.json` |
 | Native HiCache/Mooncake | disabled |
 
+## Lifecycle/router fixes in this paired rerun
+
+- D→P Slow recovery now owns the Host pin, recovery phase and exact P workset
+  lease in one request-generation lifecycle. Eviction selects only unclaimed
+  `HOST_READY` snapshots; `io_inflight` snapshots are never evicted. A cancelled
+  pre-H2D recovery releases its exact lease before the Host extent is freed.
+- Fail-stop invariants reject any `active`, `io_inflight` or `handed` lease that
+  points to an evicted snapshot. TP group abort/drain uses the same ownership
+  state machine.
+- D→P P selection now accounts for Prefill pending/queue/HBM, D→P Host pressure,
+  P→D inflight, P→D Host backlog and downstream D delivery pressure. Selection
+  and token/request reservation are one locked operation, with a short TTL
+  bridge until the physical pressure becomes visible.
+- P→D Host recovery is globally late-bound: a staged snapshot is no longer tied
+  to its source P/NUMA and is restored to the currently feasible least-loaded D.
+
 ## Primary results
 
 | Variant | D→P Direct | D→P Host | P→D Host | P/D routing | Decode token/s | Decode token/s/D | Agent/s | Status |
 |---|---:|---:|---:|---|---:|---:|---:|---|
-| Full method (obsolete) | on | on | on | incomplete P pressure / source-local P→D Host | 8,781.7 | 1,463.6 | 2.167 | **invalid; do not compare** |
+| Full method | on | on | on | complete pressure / global P→D Host | 9,417.9 | 1,569.7 | 2.420 | complete |
 | D→P Direct only | on | off | on | load-aware | 9,445.5 | 1,574.2 | 2.380 | complete |
-| D→P Slow only | off | on | on | load-aware | 683.8 | 114.0 | 0.224 | measured, unhealthy |
+| D→P Slow only | off | on | on | complete pressure / global P→D Host | 4,500.5 | 750.1 | 1.198 | complete; Host-capacity limited |
 | Random P/D routing | on | on | on | random among capacity-feasible workers | 9,702.6 | 1,617.1 | 2.417 | complete |
 | P→D Direct only | on | on | off | load-aware | 9,817.0 | 1,636.2 | 2.450 | complete |
 
@@ -32,9 +48,9 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Direct | Slow | Direct/Slow 比例 |
 |---|---:|---:|---:|
-| Full method (obsolete) | 8,595 | 458 | invalid old routing semantics |
+| Full method | 9,900 | 318 | 96.89% / 3.11%（按完成路径） |
 | D→P Direct only | 10,224 | 0 | 100% / 0% (另有 61 次 Direct 失败后完整重算) |
-| D→P Slow only | 0 | 1,158 | 0% / 100% (624 Host→P complete, 533 Host evictions) |
+| D→P Slow only | 0 | 5,793 | 0% / 100%（2,936 Host→P complete，2,847 Host evictions） |
 | Random P/D routing | 10,392 | 134 | 98.73% / 1.27% |
 | P→D Direct only | 10,622 | 88 | 99.18% / 0.82% |
 
@@ -42,9 +58,9 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Prefill token/s | Actual Prefill/Agent | Decode/Agent | Parent KV reuse | P Forward/card | D Forward/card | P KV | P queue | P inflight | D KV | D running | D prealloc | D transfer |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Full method (obsolete) | 15,660.0 | 7,215.9 | 4,046.5 | 100% | 84.2% | 99.6% | 73.8% | 30.1 | 28.1 | 66.2% | 57.0 | 0.80 | 0.21 |
+| Full method | 18,371.6 | 7,584.8 | 3,888.2 | 100% | 95.4% | 99.7% | 63.2% | 52.7 | 7.00 | 73.6% | 61.0 | 0.18 | 0.20 |
 | D→P Direct only | 18,946.7 | 7,930.2 | 3,953.4 | 98.17% | 96.9% | 99.9% | 48.2% | 61.6 | 6.67 | 68.8% | 59.4 | 0.16 | 0.20 |
-| D→P Slow only | 4,247.4 | 18,908.1 | 3,043.9 | 67.46% | 19.3% | 27.4% | 94.6% | 224.9 | 5.04 | 8.3% | 2.6 | 0.01 | 0.01 |
+| D→P Slow only | 22,159.5 | 18,442.5 | 3,745.6 | 62.21% | 98.8% | 94.4% | 22.4% | 183.5 | 3.14 | 26.7% | 14.7 | 0.03 | 0.03 |
 | Random P/D routing | 18,214.0 | 7,525.0 | 4,008.6 | 100% | 94.5% | 99.8% | 52.1% | 38.6 | 7.10 | 75.6% | 65.7 | 0.15 | 0.25 |
 | P→D Direct only | 18,548.4 | 7,554.6 | 3,998.4 | 99.94% | 96.2% | 99.8% | 50.8% | 29.2 | 9.16 | 80.2% | 69.1 | 0.18 | 0.16 |
 
@@ -52,16 +68,17 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Run directory | D→P Direct/Slow | P→D Direct/Slow | Host ownership conservation |
 |---|---|---|---|---|
-| Full method (obsolete) | `current/qwen3-8b-tp1-mixed1to1-c512-w300-m1200/new-method-agentic-pd` | 94.94% / 5.06% | see retained logs | invalid: P→D Host was not globally late-bound and P pressure omitted downstream delivery |
+| Full method | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/full` | 9,900 Direct / 318 Host D2H complete | 1,336 Host D2H/H2D/release | 311 D→P H2D releases；0 eviction/invariant error |
 | D→P Direct only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/d2p-direct-only` | 10,224 Direct / 0 Slow / 61 recompute | 13,285 Direct / 1,217 Host | D→P Host disabled；P→D Host complete=release=1,217；无 CAS ownership failure |
-| D→P Slow only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/d2p-slow-only` | 0 Direct / 1,158 Host D2H | 1,282 P→D releases | D2H complete=release=1,158；624 H2D complete；533 complete-snapshot evictions |
+| D→P Slow only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/d2p-slow-only` | 0 Direct / 5,793 Host D2H complete | 7,069 P→D releases / 0 Host | 2,936 H2D complete；2,937 H2D releases；2,847 safe evictions；0 invariant error |
 | Random P/D routing | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/random-routing` | 10,392 Direct / 134 Slow | 13,693 P→D releases；3,035 Host D2H / 3,016 Host H2D | D→P Slow D2H=release=H2D=134；0 Host eviction |
 | P→D Direct only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/p2d-direct-only` | 10,622 Direct / 88 Slow | 13,658 Direct releases / 0 Host | 87 D→P Host H2D complete；0 Host eviction；P→D Host disabled |
 
-The old 8,781.7-token/s full-method row is retained only as an audit artifact.
-It is invalid for paired comparison because that run did not use global P→D
-Host recovery and used an incomplete D→P P-pressure model. It will be replaced
-by a same-checkpoint rerun after the lifecycle/router fixes pass audit.
+The old 8,781.7-token/s full-method result is an audit artifact and has been
+removed from the comparison table. It is invalid because P→D Host recovery was
+source-local and the D→P router omitted downstream delivery pressure. The valid
+Full and Slow-only rows above were produced from the same SGLang commit
+`c549c0e005`, Slime commit `95fc685`, fixed schedule, and runtime parameters.
 
 ## D→P Direct-only阶段性结论
 
@@ -81,17 +98,26 @@ by a same-checkpoint rerun after the lifecycle/router fixes pass audit.
 注意：8,781.7 的 Full method 不仅不是同 checkpoint paired run，而且使用了
 错误的 P→D Host/压力路由语义，已经正式作废。上述相对差值全部不再用于结论。
 
-## D→P Slow-only 阶段性结论
+## Lifecycle/router fix paired rerun
 
-- 完整跑过 300 秒预热和 1,200 秒测量，但服务活性不合格：仅完成
-  269 agents，Decode 为 683.8 token/s，后半窗口出现 486 次 Router
-  HTTP 500，其中约 468 次是 P-ready 等待超过 600 秒。
-- 正式窗口内 1,158 个 snapshot 完成 D→Host 并释放 D KV；624 个完成
-  Host→P 恢复，533 个在 Host 高水位下被按短 snapshot 优先驱逐。这与
-  67.46% 的父 KV 复用率相互印证，不是路径统计遗漏。
-- P 平均 KV 为 94.6%、queue 为 224.9，而 D KV 仅 8.3%、running 仅
-  2.6；因此损失不是 D 算力不足，而是强制所有反向 KV 经 Host 后，P
-  恢复和随后 P→D 交付无法跟上到达速率，最终让 D 长期断供。
+- Full 完成 2,904 agents（Math 1,423 / QA 1,481），Decode 为 9,417.9
+  token/s，D Forward 为 99.74%，page-aligned parent KV reuse 为 100%。
+  P0/P1 的平均 KV 为 63.5%/62.9%，平均 queue 为 50.7/54.6，说明新压力
+  模型与原子 reservation 没有把多张 D 固定挤向同一张 P。
+- Slow-only 完成 1,438 agents（Math 730 / QA 708），Decode 为 4,500.5
+  token/s。相对旧故障结果 683.8 token/s 提高约 6.58 倍，D Forward 从
+  27.4% 恢复到 94.4%。P0/P1 平均 queue 为 183.1/183.8、KV 为
+  21.9%/22.9%，同样没有陈旧压力快照造成的单边 herd。
+- Slow-only 正式窗口发生 2,847 次完整 request-generation 驱逐。恢复期间
+  每张 P 采样到的 active 数最大为 20，而非旧版几百个孤儿 workset；
+  所有 async-control `errors` 和 eviction invariants 都为 0。测量窗口后
+  出现的 Router 500 均发生在服务器清理之后，不计入测量，正式窗口
+  request failures 为 0。
+- Slow-only 的剩余性能损失现在是容量/数据通路本身，而不是 lease 泄漏：
+  强制所有父 KV 通过总计 256 GiB D→P Arena，Host 到达率超过恢复率，
+  shortest-first 驱逐使 parent KV reuse 降至 62.21%，实际 Prefill 增至
+  18,442.5 tokens/agent，D 平均 running 只有 14.7。这个结果是有效的
+  Slow-only 消融，说明 Direct 是该负载保持高吞吐的必要路径。
 
 ## Random-routing 阶段性结论
 
