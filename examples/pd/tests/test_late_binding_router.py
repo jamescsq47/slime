@@ -1,4 +1,5 @@
 import asyncio
+import random
 import tempfile
 import threading
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 import orjson
 import late_binding_router as late_binding_router_module
+from agentic_kv_request import build_agentic_extra_key
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
@@ -18,11 +20,15 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     SharedHostStagingLedger,
 )
 from sglang.srt.disaggregation.p2d_host_staging import p2d_snapshot_id
+from sglang.srt.disaggregation.agentic_prefill_pressure import (
+    SharedPrefillPressureReservations,
+)
 
 from late_binding_router import (
     DecodeLoad,
     DecodeReservation,
     LateBindingMiniLoadBalancer,
+    _PReadyAdmission,
     _PrefillAdmissionGate,
     _PrefillAdmissionWaiter,
 )
@@ -76,11 +82,155 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router._prefill_pending_requests = [0, 0]
         router._prefill_direct_pending_tokens = [0, 0]
         router._prefill_work_tiebreak = 0
+        router.ablation_random_routing = False
+        router._routing_rng = random.Random(2026)
         router._prefill_pressure_domains = []
         router._prefill_pressure_at = 0.0
         router._prefill_pressure_sample_started_at = 0.0
         router._prefill_pressure_interval = 0.2
         return router
+
+    async def test_random_routing_ablation_ignores_load_but_keeps_feasibility(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router.ablation_random_routing = True
+        router._routing_rng = random.Random(2026)
+        router._prefill_pending_tokens = [0, 1_000_000]
+
+        selected = [
+            (await router._reserve_prefill_work(1)).domain for _ in range(4)
+        ]
+
+        # The seeded random policy selects the heavily loaded P1 as well;
+        # load-aware routing would select only P0 for this setup.
+        self.assertEqual(selected, [0, 1, 0, 0])
+
+        loads = [
+            (False, 1.0, 0.1, 1, types.SimpleNamespace(url="http://d0")),
+            (False, 10_000.0, 0.8, 100, types.SimpleNamespace(url="http://d1")),
+        ]
+        router._routing_rng = random.Random(2026)
+        chosen = [router._choose_decode_score(loads)[4].url for _ in range(4)]
+        self.assertEqual(
+            chosen,
+            ["http://d0", "http://d1", "http://d0", "http://d0"],
+        )
+
+    async def test_prefill_selection_accounts_for_p2d_delivery_backlog(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router._prefill_pressure_at = time.monotonic()
+        router._prefill_pressure_domains = [
+            {
+                "domain": 0,
+                "hbm_capacity_tokens": 100_000,
+                "hbm_used_tokens": 10_000,
+                "arena_capacity_bytes": 100,
+                "arena_used_bytes": 0,
+                "p2d_arena_capacity_bytes": 100,
+                "p2d_inflight_tokens": 80_000,
+                "p2d_inflight_requests": 40,
+                "p2d_host_tokens": 20_000,
+                "p2d_host_requests": 10,
+                "p2d_host_bytes": 80,
+            },
+            {
+                "domain": 1,
+                "hbm_capacity_tokens": 100_000,
+                "hbm_used_tokens": 20_000,
+                "arena_capacity_bytes": 100,
+                "arena_used_bytes": 0,
+                "p2d_arena_capacity_bytes": 100,
+                "p2d_inflight_tokens": 0,
+                "p2d_inflight_requests": 0,
+                "p2d_host_tokens": 0,
+                "p2d_host_requests": 0,
+                "p2d_host_bytes": 0,
+            },
+        ]
+
+        reservation = await router._reserve_prefill_work(1000)
+        self.assertEqual(reservation.domain, 1)
+
+    async def test_p2d_pressure_counts_offered_and_durable_owner_once(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        room = 73
+        snapshot_id = p2d_snapshot_id(room)
+        admission = _PReadyAdmission(
+            domain=0,
+            sequence=1,
+            submitted_key="p2d-pressure",
+            enqueued_at=time.monotonic(),
+            dispatch=AsyncMock(),
+            future=asyncio.get_running_loop().create_future(),
+            finished=asyncio.Event(),
+            rooms=(room,),
+            prompt_tokens=12_000,
+        )
+        router._p_ready_fifo_active = {0: {1: admission}}
+        entry = {
+            "state": HostStageState.OFFERED.value,
+            "prefill_domain": 0,
+            "token_count": 12_000,
+            "byte_size": 100,
+        }
+        router.p2d_host_ledger = types.SimpleNamespace(
+            snapshot_entries=lambda: {snapshot_id: dict(entry)}
+        )
+
+        offered = router._p2d_pressure_by_domain()[0]
+        self.assertEqual(offered["p2d_inflight_tokens"], 12_000)
+        self.assertEqual(offered["p2d_host_tokens"], 0)
+
+        entry["state"] = HostStageState.HOST_RESERVED.value
+        durable = router._p2d_pressure_by_domain()[0]
+        self.assertEqual(durable["p2d_inflight_tokens"], 0)
+        self.assertEqual(durable["p2d_host_tokens"], 12_000)
+
+        entry["state"] = HostStageState.REJECTED.value
+        rejected = router._p2d_pressure_by_domain()[0]
+        self.assertEqual(rejected["p2d_inflight_tokens"], 12_000)
+        self.assertEqual(rejected["p2d_host_tokens"], 0)
+
+        router.p2d_host_ledger = types.SimpleNamespace(
+            snapshot_entries=lambda: self.fail(
+                "pre-fetched ledger rows must stay off the event loop"
+            )
+        )
+        prefetched = router._p2d_pressure_by_domain(
+            {
+                snapshot_id: {
+                    **entry,
+                    "state": HostStageState.HOST_READY.value,
+                }
+            }
+        )[0]
+        self.assertEqual(prefetched["p2d_host_tokens"], 12_000)
+
+    def test_cross_process_prefill_reservation_prevents_stale_herd(self):
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            ledger = SharedPrefillPressureReservations(
+                str(Path(directory) / "pressure-reservations.json"),
+                ttl_seconds=10.0,
+            )
+            domains = [
+                {
+                    "domain": 0,
+                    "hbm_capacity_tokens": 100,
+                    "hbm_used_tokens": 0,
+                    "arena_capacity_bytes": 100,
+                    "arena_used_bytes": 0,
+                },
+                {
+                    "domain": 1,
+                    "hbm_capacity_tokens": 100,
+                    "hbm_used_tokens": 0,
+                    "arena_capacity_bytes": 100,
+                    "arena_used_bytes": 0,
+                },
+            ]
+            first = ledger.select_and_reserve("snapshot-a", 90, domains)
+            second = ledger.select_and_reserve("snapshot-b", 90, domains)
+            self.assertEqual((first, second), (0, 1))
+            self.assertEqual(ledger.select_and_reserve("snapshot-a", 90, domains), 0)
 
     async def test_backend_http_session_is_one_shared_pool(self):
         router = self.make_router(Path("/dev/shm/test-ready"))
@@ -1551,15 +1701,20 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             )
             request = {
                 "bootstrap_room": 99,
-                "input_ids": list(range(9000)),
-                "sampling_params": {
-                    "custom_params": {
-                        "agentic_request_id": "redirect",
-                        "agentic_generation": 1,
-                        "agentic_parent_generation": 0,
-                    }
+                # Chat Completions does not carry lifecycle metadata under
+                # sampling_params.  The Router must recover it from the same
+                # extra_key envelope that survives the HTTP request schema.
+                "sampling_params": {},
+                "custom_params": {
+                    "agentic_request_id": "redirect",
+                    "agentic_generation": 1,
+                    "agentic_parent_generation": 0,
+                    "agentic_prompt_token_count": 9000,
                 },
             }
+            request["extra_key"] = build_agentic_extra_key(
+                "redirect", {"custom_params": request["custom_params"]}
+            )
 
             accepted_calls = 0
 

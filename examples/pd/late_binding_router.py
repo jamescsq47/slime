@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import random
 import time
 import urllib.parse
 import urllib.request
@@ -39,6 +40,9 @@ from sglang.srt.disaggregation.p2d_host_staging import (
     P2D_CUSTOM_PREFILL_DOMAIN,
     P2D_CUSTOM_SNAPSHOT_ID,
     p2d_snapshot_id,
+)
+from sglang.srt.disaggregation.agentic_prefill_pressure import (
+    SharedPrefillPressureReservations,
 )
 from sglang_router.mini_lb import (
     AIOHTTP_STREAM_READ_CHUNK_SIZE,
@@ -389,6 +393,15 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             else set()
         )
         self._prefill_index = 0
+        # Ablation-only policy: preserve all capacity/ownership checks, but
+        # replace both load-aware P and D choices with deterministic random
+        # choices among the currently feasible workers.
+        self.ablation_random_routing = _env_bool(
+            "SGLANG_PD_ABLATION_RANDOM_ROUTING"
+        )
+        self._routing_rng = random.Random(
+            _env_int("SGLANG_PD_ABLATION_RANDOM_SEED", 2026)
+        )
         # Router-owned shadow queues model Prefill compute work.  A cached P
         # pressure snapshot additionally prevents Direct from targeting a P
         # that cannot fit the complete parent+suffix workset.  Selection never
@@ -417,6 +430,20 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 self.p_ready_dir / "early-claims" / "prefill-loads.json"
             )
         self._prefill_pressure_path = Path(pressure_path)
+        reservation_path = os.getenv(
+            "SGLANG_AGENTIC_KV_PREFILL_RESERVATION_PATH",
+            f"{pressure_path}.reservations",
+        )
+        self._prefill_pressure_reservations = (
+            SharedPrefillPressureReservations(
+                reservation_path,
+                ttl_seconds=_env_float(
+                    "SGLANG_AGENTIC_KV_PREFILL_RESERVATION_TTL_S", 5.0
+                ),
+            )
+            if reservation_path
+            else None
+        )
         staging_path = os.getenv("SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH", "")
         self._d2p_host_ledger = (
             SharedHostStagingLedger(staging_path) if staging_path else None
@@ -506,12 +533,34 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         """Select only P here; the endpoint passes the D placeholder to us."""
         if not self.prefill_urls:
             raise RuntimeError("No prefill servers available")
-        index = self._prefill_index % len(self.prefill_urls)
+        if getattr(self, "ablation_random_routing", False):
+            index = self._routing_rng.randrange(len(self.prefill_urls))
+        else:
+            index = self._prefill_index % len(self.prefill_urls)
         self._prefill_index += 1
         return (
             self.prefill_urls[index],
             self.prefill_bootstrap_ports[index],
             None,
+        )
+
+    def _choose_decode_score(self, candidates, *, drain: bool = False):
+        """Choose one capacity-accounted D score for normal or ablation runs."""
+
+        if getattr(self, "ablation_random_routing", False):
+            # Sort first so a fixed ablation seed is independent of response
+            # arrival order from the asynchronous load probes.
+            return self._routing_rng.choice(
+                sorted(candidates, key=lambda item: item[4].url)
+            )
+        if drain:
+            return min(
+                candidates,
+                key=lambda item: (item[2], item[1], item[4].url),
+            )
+        return min(
+            candidates,
+            key=lambda item: (item[1], item[2], item[4].url),
         )
 
     @staticmethod
@@ -538,6 +587,21 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     def _request_input_tokens(request: dict[str, Any]) -> int:
         input_ids = request.get("input_ids")
         if not isinstance(input_ids, list):
+            custom_params = request.get("custom_params")
+            hint = (
+                custom_params.get("agentic_prompt_token_count")
+                if isinstance(custom_params, dict)
+                else None
+            )
+            # This is only shadow admission accounting.  Bound the hint to a
+            # generous finite range; the model server remains authoritative
+            # for actual tokenization and context-length validation.
+            if (
+                isinstance(hint, int)
+                and not isinstance(hint, bool)
+                and 0 < hint <= 10_000_000
+            ):
+                return hint
             return 1
         if not input_ids:
             return 1
@@ -601,14 +665,26 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             feasible.append(candidate)
                     if feasible:
                         candidates = feasible
-                domain = min(
-                    candidates,
-                    key=lambda candidate: (
-                        self._prefill_pending_tokens[candidate],
-                        self._prefill_pending_requests[candidate],
-                        (candidate - start) % count,
-                    ),
-                )
+                if getattr(self, "ablation_random_routing", False):
+                    domain = self._routing_rng.choice(sorted(candidates))
+                else:
+                    domain = min(
+                        candidates,
+                        key=lambda candidate: (
+                            self._prefill_pressure_score(
+                                pressure_by_domain.get(candidate, {}),
+                                pending_tokens=self._prefill_pending_tokens[
+                                    candidate
+                                ],
+                                pending_requests=self._prefill_pending_requests[
+                                    candidate
+                                ],
+                            )
+                            if pressure_by_domain.get(candidate) is not None
+                            else float(self._prefill_pending_tokens[candidate]),
+                            (candidate - start) % count,
+                        ),
+                    )
                 self._prefill_work_tiebreak = (domain + 1) % count
             if not 0 <= domain < len(self.prefill_urls):
                 raise RuntimeError(f"invalid Prefill domain {domain}")
@@ -747,6 +823,141 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 used[domain] += int(entry.get("byte_size", 0))
         return used
 
+    def _p2d_pressure_by_domain(
+        self, ledger_entries: Optional[dict[str, dict[str, Any]]] = None
+    ) -> list[dict[str, int]]:
+        """Snapshot P->D delivery work that ordinary P load omits.
+
+        Completed Prefill requests disappear from ``pending_tokens`` before
+        their KV has necessarily reached D.  Count Router inflight/queued work
+        and durable P->D Host ownership separately so D->P routing cannot
+        mistake a delivery-blocked P for an idle one.
+        """
+
+        count = len(self.prefill_urls)
+        rows = [
+            {
+                "p2d_inflight_tokens": 0,
+                "p2d_inflight_requests": 0,
+                "p2d_host_tokens": 0,
+                "p2d_host_requests": 0,
+                "p2d_host_bytes": 0,
+            }
+            for _ in range(count)
+        ]
+        durable_host_snapshots: set[str] = set()
+        ledger = getattr(self, "p2d_host_ledger", None)
+        if ledger_entries is None:
+            ledger_entries = (
+                {} if ledger is None else ledger.snapshot_entries()
+            )
+        if ledger_entries:
+            live_states = {
+                HostStageState.HOST_RESERVED.value,
+                HostStageState.HOST_WRITING.value,
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+            }
+            for snapshot_id, entry in ledger_entries.items():
+                if entry.get("state") not in live_states:
+                    continue
+                domain = int(entry.get("prefill_domain", -1))
+                if not 0 <= domain < count:
+                    continue
+                durable_host_snapshots.add(str(snapshot_id))
+                rows[domain]["p2d_host_tokens"] += max(
+                    0, int(entry.get("token_count", 0))
+                )
+                rows[domain]["p2d_host_requests"] += 1
+                rows[domain]["p2d_host_bytes"] += max(
+                    0, int(entry.get("byte_size", 0))
+                )
+
+        seen: set[tuple[int, int]] = set()
+        for containers in (
+            getattr(self, "_p_ready_fifo_waiters", {}),
+            getattr(self, "_p_ready_fifo_active", {}),
+        ):
+            for domain, admissions in containers.items():
+                if not 0 <= int(domain) < count:
+                    continue
+                for admission in admissions.values():
+                    # Once a D reservation or durable P->D Host owner exists,
+                    # that generation is accounted below by its authoritative
+                    # delivery state.  Counting the queue record as well would
+                    # charge one blocked generation twice and distort P choice.
+                    if admission.initial_reservation is not None:
+                        continue
+                    p2d_snapshot = self._p2d_snapshot_for_rooms(admission.rooms)
+                    if (
+                        p2d_snapshot is not None
+                        and p2d_snapshot in durable_host_snapshots
+                    ):
+                        continue
+                    key = (int(domain), int(admission.sequence))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows[int(domain)]["p2d_inflight_tokens"] += max(
+                        0, int(admission.prompt_tokens)
+                    )
+                    rows[int(domain)]["p2d_inflight_requests"] += max(
+                        1, len(admission.rooms)
+                    )
+        for reservation in getattr(self, "_reservations", {}).values():
+            domain = reservation.prefill_domain
+            if domain is None or not 0 <= int(domain) < count:
+                continue
+            p2d_snapshot = reservation.p2d_host_snapshot_id
+            if p2d_snapshot is None:
+                p2d_snapshot = self._p2d_snapshot_for_rooms(reservation.rooms)
+            if p2d_snapshot in durable_host_snapshots:
+                continue
+            rows[int(domain)]["p2d_inflight_tokens"] += max(
+                0, int(reservation.prompt_tokens)
+            )
+            rows[int(domain)]["p2d_inflight_requests"] += max(
+                1, int(reservation.request_count)
+            )
+        return rows
+
+    @staticmethod
+    def _prefill_pressure_score(
+        row: dict[str, Any],
+        *,
+        pending_tokens: int,
+        pending_requests: int,
+    ) -> float:
+        capacity = max(1, int(row.get("hbm_capacity_tokens", 0)))
+        arena_capacity = max(1, int(row.get("arena_capacity_bytes", 0)))
+        p2d_capacity = max(
+            1, int(row.get("p2d_arena_capacity_bytes", arena_capacity))
+        )
+        return (
+            (
+                max(0, int(pending_tokens))
+                + max(0, int(row.get("p2d_inflight_tokens", 0)))
+                + max(0, int(row.get("p2d_host_tokens", 0)))
+                + max(0, int(row.get("d_slow_reserved_tokens", 0)))
+            )
+            / capacity
+            + max(0, int(row.get("hbm_used_tokens", 0))) / capacity
+            + 2.0
+            * max(0, int(row.get("arena_used_bytes", 0)))
+            / arena_capacity
+            + 2.0
+            * max(0, int(row.get("p2d_host_bytes", 0)))
+            / p2d_capacity
+            + 0.01
+            * (
+                max(0, int(pending_requests))
+                + max(0, int(row.get("scheduler_waiting", 0)))
+                + max(0, int(row.get("p2d_inflight_requests", 0)))
+                + max(0, int(row.get("p2d_host_requests", 0)))
+                + max(0, int(row.get("d_slow_reserved_requests", 0)))
+            )
+        )
+
     async def _prefill_pressure_monitor_loop(self) -> None:
         """Publish a nonblocking shared snapshot for D-rank0 slow routing."""
 
@@ -770,12 +981,39 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     pending_tokens = list(self._prefill_pending_tokens)
                     pending_requests = list(self._prefill_pending_requests)
                 arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
+                p2d_ledger = getattr(self, "p2d_host_ledger", None)
+                p2d_entries = (
+                    {}
+                    if p2d_ledger is None
+                    else await asyncio.to_thread(p2d_ledger.snapshot_entries)
+                )
+                p2d_pressure = self._p2d_pressure_by_domain(p2d_entries)
+                reservation_totals = (
+                    {}
+                    if self._prefill_pressure_reservations is None
+                    else await asyncio.to_thread(
+                        self._prefill_pressure_reservations.totals
+                    )
+                )
+                p2d_arena_capacity = int(
+                    float(
+                        os.getenv(
+                            "SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB",
+                            "32",
+                        )
+                    )
+                    * (1024**3)
+                    * tp_size
+                )
                 domains = []
                 for domain, result in enumerate(fetched):
                     if isinstance(result, BaseException):
                         used = capacity = waiting = 0
                     else:
                         used, capacity, waiting = result
+                    reserved_tokens, reserved_requests = reservation_totals.get(
+                        domain, (0, 0)
+                    )
                     domains.append(
                         {
                             "domain": domain,
@@ -786,6 +1024,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             "hbm_capacity_tokens": capacity,
                             "arena_used_bytes": arena_used[domain],
                             "arena_capacity_bytes": arena_capacity,
+                            "p2d_arena_capacity_bytes": p2d_arena_capacity,
+                            **p2d_pressure[domain],
+                            "d_slow_reserved_tokens": reserved_tokens,
+                            "d_slow_reserved_requests": reserved_requests,
                         }
                     )
                 payload = {
@@ -2249,8 +2491,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         if not feasible and self.wait_for_feasible_decode:
             return None
         candidates = feasible or scored
-        _, work_score, projected_kv, projected_decode_reqs, selected = min(
-            candidates, key=lambda item: (item[1], item[2], item[4].url)
+        _, work_score, projected_kv, projected_decode_reqs, selected = (
+            self._choose_decode_score(candidates)
         )
         reservation = DecodeReservation(
             reservation_id=uuid.uuid4().hex,
@@ -2260,6 +2502,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             request_count=len(admission.rooms),
             rooms=admission.rooms,
             created_at=time.monotonic(),
+            prefill_domain=admission.domain,
         )
         self._reservations[reservation.reservation_id] = reservation
         logger.info(
@@ -3240,14 +3483,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             and not (p2d_claimed and not p2d_ready)
                             and (feasible or not self.wait_for_feasible_decode)
                         ):
-                            choice = min(
-                                feasible or scored,
-                                key=lambda item: (
-                                    item[1],
-                                    item[2],
-                                    item[4].url,
-                                ),
-                            )
+                            choice = self._choose_decode_score(feasible or scored)
                             _, work_score, projected_kv, projected_reqs, selected = (
                                 choice
                             )
@@ -3305,13 +3541,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                     if item[4].url not in draining_urls
                                 ]
                                 if drain_choices:
-                                    choice = min(
-                                        drain_choices,
-                                        key=lambda item: (
-                                            item[2],
-                                            item[1],
-                                            item[4].url,
-                                        ),
+                                    choice = self._choose_decode_score(
+                                        drain_choices, drain=True
                                     )
                                     (
                                         _,
@@ -3550,6 +3781,19 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         custom_params = sampling.get("custom_params") if isinstance(sampling, dict) else None
         try:
             metadata = AgenticRequestMetadata.from_custom_params(custom_params)
+            # Chat Completions carries lifecycle metadata at the request top
+            # level and in the router-safe extra_key envelope, rather than in
+            # Generate's sampling_params.  All later route watching depends on
+            # recognizing the parent here; otherwise Router chooses an
+            # arbitrary P while D may publish the Slow snapshot to a different
+            # NUMA-local P, leaving both sides waiting forever.
+            if metadata is None:
+                envelope = unpack_agentic_extra_key(modified_request.get("extra_key"))
+                if envelope is not None:
+                    _, envelope_params = envelope
+                    metadata = AgenticRequestMetadata.from_custom_params(
+                        envelope_params
+                    )
         except (TypeError, ValueError):
             metadata = None
         parent_turn = metadata is not None and metadata.parent is not None
