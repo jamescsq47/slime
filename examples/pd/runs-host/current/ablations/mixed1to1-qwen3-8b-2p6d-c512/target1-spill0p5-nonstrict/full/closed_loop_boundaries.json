@@ -1,0 +1,23 @@
+{
+  "status": "steady_churn",
+  "origin_wall": 1788366580.1855,
+  "warmup_seconds": 300.2282448997721,
+  "measurement_start_wall": 1788366880.4137454,
+  "measurement_end_wall": 1788368080.414452,
+  "measurement_seconds": 1200.0007056593895,
+  "state_at_measurement_start": {
+    "next_id": 1094,
+    "active": 512,
+    "successes": 582,
+    "failures": 0
+  },
+  "state_at_measurement_end": {
+    "next_id": 4008,
+    "active": 512,
+    "successes": 3496,
+    "failures": 0
+  },
+  "recent_window_seconds": 120.0,
+  "recent_prefill_compute_tokens_at_boundary": 2144448.0,
+  "recent_decode_tokens_at_boundary": 1204992.0
+}

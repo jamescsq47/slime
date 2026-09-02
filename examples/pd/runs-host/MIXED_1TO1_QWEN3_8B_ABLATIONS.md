@@ -30,12 +30,17 @@ All rows use the same serving workload and differ only in the named ablation.
   bridge until the physical pressure becomes visible.
 - P→D Host recovery is globally late-bound: a staged snapshot is no longer tied
   to its source P/NUMA and is restored to the currently feasible least-loaded D.
+- P→D admission no longer treats completion order as a hard cross-request FIFO
+  dependency. The centralized broker scans in completion order for fairness,
+  but capacity-feasible snapshots may enter D ahead of an infeasible/Host-staged
+  predecessor. Each snapshot independently waits a 0.5-second Direct grace,
+  performs one causally fresh D-load recheck, and only then enters Host.
 
 ## Primary results
 
 | Variant | D→P Direct | D→P Host | P→D Host | P/D routing | Decode token/s | Decode token/s/D | Agent/s | Status |
 |---|---:|---:|---:|---|---:|---:|---:|---|
-| Full method | on | on | on | complete pressure / global P→D Host | 9,417.9 | 1,569.7 | 2.420 | complete |
+| Full method（P→D可行请求先行） | on | on | on | complete pressure / global P→D Host | 9,799.5 | 1,633.3 | 2.428 | complete |
 | D→P Direct only | on | off | on | load-aware | 9,445.5 | 1,574.2 | 2.380 | complete |
 | D→P Slow only | off | on | on | complete pressure / global P→D Host | 4,500.5 | 750.1 | 1.198 | complete; Host-capacity limited |
 | Random P/D routing | on | on | on | random among capacity-feasible workers | 9,702.6 | 1,617.1 | 2.417 | complete |
@@ -48,7 +53,7 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Direct | Slow | Direct/Slow 比例 |
 |---|---:|---:|---:|
-| Full method | 9,900 | 318 | 96.89% / 3.11%（按完成路径） |
+| Full method（P→D可行请求先行） | 10,715 | 84 | 99.22% / 0.78%（按完成路径） |
 | D→P Direct only | 10,224 | 0 | 100% / 0% (另有 61 次 Direct 失败后完整重算) |
 | D→P Slow only | 0 | 5,793 | 0% / 100%（2,936 Host→P complete，2,847 Host evictions） |
 | Random P/D routing | 10,392 | 134 | 98.73% / 1.27% |
@@ -58,7 +63,7 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Prefill token/s | Actual Prefill/Agent | Decode/Agent | Parent KV reuse | P Forward/card | D Forward/card | P KV | P queue | P inflight | D KV | D running | D prealloc | D transfer |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Full method | 18,371.6 | 7,584.8 | 3,888.2 | 100% | 95.4% | 99.7% | 63.2% | 52.7 | 7.00 | 73.6% | 61.0 | 0.18 | 0.20 |
+| Full method（P→D可行请求先行） | 18,215.5 | 7,485.8 | 4,027.2 | 100% | 94.2% | 99.7% | 56.3% | 24.0 | 10.56 | 81.0% | 69.7 | 1.42 | 0.22 |
 | D→P Direct only | 18,946.7 | 7,930.2 | 3,953.4 | 98.17% | 96.9% | 99.9% | 48.2% | 61.6 | 6.67 | 68.8% | 59.4 | 0.16 | 0.20 |
 | D→P Slow only | 22,159.5 | 18,442.5 | 3,745.6 | 62.21% | 98.8% | 94.4% | 22.4% | 183.5 | 3.14 | 26.7% | 14.7 | 0.03 | 0.03 |
 | Random P/D routing | 18,214.0 | 7,525.0 | 4,008.6 | 100% | 94.5% | 99.8% | 52.1% | 38.6 | 7.10 | 75.6% | 65.7 | 0.15 | 0.25 |
@@ -68,7 +73,7 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Run directory | D→P Direct/Slow | P→D Direct/Slow | Host ownership conservation |
 |---|---|---|---|---|
-| Full method | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/full` | 9,900 Direct / 318 Host D2H complete | 1,336 Host D2H/H2D/release | 311 D→P H2D releases；0 eviction/invariant error |
+| Full method（P→D可行请求先行） | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/target1-spill0p5-nonstrict/full` | 10,715 Direct / 84 Host D2H complete（正式窗口） | 1,317 Host D2H / 1,314 Host H2D/release（正式窗口） | Parent KV page-aligned 100%；0 eviction/invariant error |
 | D→P Direct only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/d2p-direct-only` | 10,224 Direct / 0 Slow / 61 recompute | 13,285 Direct / 1,217 Host | D→P Host disabled；P→D Host complete=release=1,217；无 CAS ownership failure |
 | D→P Slow only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/d2p-slow-only` | 0 Direct / 5,793 Host D2H complete | 7,069 P→D releases / 0 Host | 2,936 H2D complete；2,937 H2D releases；2,847 safe evictions；0 invariant error |
 | Random P/D routing | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/random-routing` | 10,392 Direct / 134 Slow | 13,693 P→D releases；3,035 Host D2H / 3,016 Host H2D | D→P Slow D2H=release=H2D=134；0 Host eviction |
@@ -76,9 +81,25 @@ All rows use the same serving workload and differ only in the named ablation.
 
 The old 8,781.7-token/s full-method result is an audit artifact and has been
 removed from the comparison table. It is invalid because P→D Host recovery was
-source-local and the D→P router omitted downstream delivery pressure. The valid
-Full and Slow-only rows above were produced from the same SGLang commit
-`c549c0e005`, Slime commit `95fc685`, fixed schedule, and runtime parameters.
+source-local and the D→P router omitted downstream delivery pressure. The
+historical strict-FIFO Full result (9,417.9 token/s) and Slow-only result were
+the paired rerun produced from SGLang commit `c549c0e005` and Slime commit
+`95fc685`; the current Full row is the later non-strict admission checkpoint.
+
+## P→D非严格FIFO正式结果
+
+- 新 Full method 完整通过 300 秒预热和 1,200 秒测量，完成 2,914 agents；
+  Decode 为 9,799.5 token/s，单 D 为 1,633.3 token/s，D Forward 为
+  99.69%，page-aligned Parent KV reuse 为 100%。
+- 相比严格 FIFO Full 参考，D running 从 61.0 提高到 69.7/卡，D KV 从
+  73.6% 提高到 81.0%，P queue 从 52.7 降到 24.0/卡。严格 FIFO 不再把
+  一个不可行或已进入 Host 的队首放大成整条 P 队列的阻塞。
+- 全运行共完成 1,322 个 P→D Host 恢复；Host offer 到 D H2D 完成的等待
+  中位数为 2.26 秒，P90 5.78 秒，P99 11.46 秒，最长 18.35 秒，没有超过
+  30 秒的 snapshot，未观察到长请求饥饿。
+- 本轮与下列旧 ablation 不在同一代码 checkpoint；原始 Decode TPS 可用于
+  阶段性比较，但不把差异全部归因于单一开关。若未来更极端长度分布出现饥饿，
+  应增加有界 aging，而不是恢复跨请求严格 FIFO。
 
 ## D→P Direct-only阶段性结论
 

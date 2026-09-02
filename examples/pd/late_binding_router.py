@@ -319,7 +319,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             "SGLANG_PD_LATE_BIND_WAIT_FOR_FEASIBLE", True
         )
         self.target_decode_kv_fraction = _env_float(
-            "SGLANG_PD_LATE_BIND_TARGET_KV_FRACTION", 0.90
+            "SGLANG_PD_LATE_BIND_TARGET_KV_FRACTION", 1.0
         )
         if not (0.0 < self.target_decode_kv_fraction <= 1.0):
             raise ValueError(
@@ -333,10 +333,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         )
         self._selection_lock = asyncio.Lock()
         # Request coroutines only publish immutable P-ready admissions.  One
-        # broker owns D-capacity accounting for every P, admits one FIFO head
-        # per P in each batch, and pipelines multiple already-reserved heads.
-        # This removes per-request selection lock contention while preserving
-        # strict commit order within each logical P.
+        # broker owns D-capacity accounting for every P, scans in completion
+        # order, and pipelines multiple capacity-feasible generations.  The
+        # sequence is a fairness hint: one Host-staged generation must not
+        # block an unrelated generation that can enter D immediately.
         self._p_ready_submitted_sequences: set[Any] = set()
         self._p_ready_fifo_waiters: dict[
             int, dict[int, _PReadyAdmission]
@@ -483,7 +483,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             "SGLANG_AGENTIC_KV_P2D_HOST_STAGING"
         )
         self.p2d_host_spill_delay = _env_float(
-            "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS", 0.05
+            "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS", 0.5
         )
         self.p2d_host_ledger = None
         self._p2d_host_offered_snapshots: set[str] = set()
@@ -1198,11 +1198,25 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     def _set_p2d_host_metadata(
         request: dict[str, Any], snapshot_id: str, prefill_domain: int
     ) -> None:
-        sampling = request.setdefault("sampling_params", {})
-        custom = dict(sampling.get("custom_params") or {})
-        custom[P2D_CUSTOM_SNAPSHOT_ID] = str(snapshot_id)
-        custom[P2D_CUSTOM_PREFILL_DOMAIN] = int(prefill_domain)
-        sampling["custom_params"] = custom
+        values = {
+            P2D_CUSTOM_SNAPSHOT_ID: str(snapshot_id),
+            P2D_CUSTOM_PREFILL_DOMAIN: int(prefill_domain),
+        }
+        # /generate carries custom metadata inside sampling_params, whereas
+        # /v1/chat/completions carries it at the request top level.  Do not
+        # manufacture the other protocol's container: unknown nested fields
+        # can be silently discarded by the Chat schema, which previously made
+        # D construct a native NIXL receiver for a snapshot already released
+        # by P into the Host arena.
+        sampling = request.get("sampling_params")
+        if isinstance(sampling, dict):
+            custom = dict(sampling.get("custom_params") or {})
+            custom.update(values)
+            sampling["custom_params"] = custom
+            return
+        custom = dict(request.get("custom_params") or {})
+        custom.update(values)
+        request["custom_params"] = custom
 
     def _p2d_snapshot_for_rooms(self, rooms: tuple[int, ...]) -> Optional[str]:
         """Return the P->D Host identity supported by the current request."""
@@ -1271,8 +1285,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         snapshot_id = self._p2d_snapshot_for_rooms(rooms)
         if snapshot_id is None:
             return False
-        if self.p2d_host_spill_delay > 0:
-            await asyncio.sleep(self.p2d_host_spill_delay)
         await self._finish_physical_control_operation(
             asyncio.to_thread(
                 self._publish_p2d_host_offer,
@@ -1316,6 +1328,29 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     f"{snapshot_id}"
                 )
             await asyncio.sleep(self.ready_poll_interval)
+
+    async def _retry_p_ready_direct_after_grace(
+        self, admission: _PReadyAdmission, *, not_before: float
+    ) -> Optional[DecodeReservation]:
+        """Retry one P-ready generation against a causally fresh D snapshot.
+
+        The P->D grace period is useful only if capacity released during that
+        interval can win before Host ownership is published.  Keep this retry
+        outside the physical staging lane and charge any winning reservation
+        under the same selection lock as the initial broker admission.
+        """
+
+        urls = self._domain_decode_urls(admission.domain)
+        if not await self._observe_decode_load_after(
+            self._load_http_session(), urls=urls, not_before=not_before
+        ):
+            return None
+        loads = list(self._load_cache)
+        async with self._selection_lock:
+            if admission.cancel_requested:
+                return None
+            self._prune_accounted_reservations()
+            return self._try_reserve_direct_ready_locked(admission, loads)
 
     def _abort_unsubmitted_p2d(self, snapshot_id: Optional[str], reason: str) -> None:
         """Return attempt-owned P->D storage to its physical owner safely."""
@@ -1714,6 +1749,49 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         await self._dispose_response_task(prefill_task)
         return aborted
 
+    async def _abort_decode_attempt(
+        self,
+        session: aiohttp.ClientSession,
+        decode_server: str,
+        request: dict[str, Any],
+    ) -> bool:
+        """Cancel one submitted D attempt before releasing Router ownership.
+
+        Cancelling the aiohttp response task alone only closes the HTTP client;
+        it does not guarantee that SGLang removes a request which is still in
+        Decode prealloc or transfer.  Explicitly abort every TP request id so
+        D can fence/clear its receiver and return any destination allocation.
+        """
+
+        rids = request.get("rid")
+        if not isinstance(rids, list):
+            rids = [] if rids is None else [rids]
+        aborted = bool(rids)
+        for rid in rids:
+            try:
+                response = await session.post(
+                    f"{decode_server}/abort_request", json={"rid": rid}
+                )
+                if response.status >= 400:
+                    aborted = False
+                    logger.warning(
+                        "PD_DECODE_ABORT failed D=%s rid=%s status=%d",
+                        decode_server,
+                        rid,
+                        response.status,
+                    )
+                release = getattr(response, "release", None)
+                if release is not None:
+                    release()
+            except Exception:
+                aborted = False
+                logger.exception(
+                    "PD_DECODE_ABORT request failed D=%s rid=%s",
+                    decode_server,
+                    rid,
+                )
+        return aborted
+
     @staticmethod
     async def _dispose_response_task(task: Optional[asyncio.Task]) -> None:
         """Cancel an HTTP task or return its completed response to the pool."""
@@ -1921,12 +1999,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         async with self._generation_lock:
             if self._generation_tasks.get(key) is task:
                 self._generation_tasks.pop(key, None)
-                self._generation_results[key] = _GenerationResponse(
-                    payload=payload,
-                    status=status,
-                    completed_at=time.monotonic(),
-                )
-                self._prune_generation_results(time.monotonic())
+                # Cache only successful logical generations. A transport 5xx
+                # is an attempt failure, not the result of the agent turn. If
+                # cached, all later HTTP retries replay the same stale wire
+                # generation and can never recover after D has torn it down.
+                if status < 400:
+                    self._generation_results[key] = _GenerationResponse(
+                        payload=payload,
+                        status=status,
+                        completed_at=time.monotonic(),
+                    )
+                    self._prune_generation_results(time.monotonic())
 
     async def _generate_once(
         self,
@@ -2076,6 +2159,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 # The request is mutated while binding its P/NUMA destination;
                 # isolate the elected producer from a retry's request object.
                 request_copy = orjson.loads(orjson.dumps(modified_request))
+                # A newly elected producer is a new physical wire attempt even
+                # when its logical request-generation key is unchanged. Never
+                # reuse a bootstrap room or TP mailbox identity from a failed
+                # transfer whose DMA may still be fenced or quarantined.
+                self._replace_prefill_attempt_rooms(request_copy)
+                self._set_prefill_attempt_rid(request_copy, replace=True)
                 task = asyncio.create_task(
                     self._generate_once(request_copy, prefill_server, endpoint)
                 )
@@ -2531,31 +2620,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     async def _reserve_p_ready_direct_batch(
         self, admissions: list[_PReadyAdmission]
     ) -> dict[_PReadyAdmission, Optional[DecodeReservation]]:
-        """Reserve at most one FIFO head per P from one D load snapshot."""
+        """Reserve the next fair-scan candidate per P from one D snapshot."""
 
-        # Once an earlier FIFO generation on one P has entered its Host/direct
-        # preparation phase without a D reservation, later generations from
-        # that P must not reserve D capacity ahead of it.  They may still
-        # stage into the bounded P->D Host pipeline and release P HBM; actual
-        # D admission remains ordered by ``commit_predecessor``.
-        host_owned_domains = {
-            domain
-            for domain, active in self._p_ready_fifo_active.items()
-            if any(
-                item.host_staged
-                or (
-                    item.initial_reservation is None
-                    and not item.prepare_complete
-                )
-                for item in active.values()
-            )
-        }
         eligible = [
             admission
             for admission in admissions
             if admission.request is not None
             and admission.commit is not None
-            and admission.domain not in host_owned_domains
         ]
         reservations = {admission: None for admission in admissions}
         if not eligible:
@@ -2588,13 +2659,11 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         active = self._p_ready_fifo_active.setdefault(admission.domain, {})
         active[admission.sequence] = admission
         loop = asyncio.get_running_loop()
-        predecessor = self._p_ready_commit_tails.get(admission.domain)
-        if predecessor is None:
-            predecessor = loop.create_future()
-            predecessor.set_result(None)
-        admission.commit_predecessor = predecessor
+        # ``ready_sequence`` remains the fair scan order, not a cross-request
+        # correctness dependency.  A Host-staged or temporarily infeasible
+        # generation must not block a later generation that can enter D now.
+        admission.commit_predecessor = None
         admission.commit_done = loop.create_future()
-        self._p_ready_commit_tails[admission.domain] = admission.commit_done
 
         waited = time.monotonic() - admission.enqueued_at
         if waited >= 0.5:
@@ -2621,19 +2690,31 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 reservation is not None or admission.prepare is not None
             )
             if prepared_reservation is None and admission.prepare is not None:
+                spill_delay = max(
+                    0.0, float(getattr(self, "p2d_host_spill_delay", 0.0))
+                )
+                if spill_delay > 0:
+                    grace_started_at = time.monotonic()
+                    await asyncio.sleep(spill_delay)
+                    if admission.cancel_requested:
+                        raise asyncio.CancelledError
+                    prepared_reservation = (
+                        await self._retry_p_ready_direct_after_grace(
+                            admission, not_before=grace_started_at
+                        )
+                    )
                 # Preparation owns only the physical handoff boundary.  Up to
                 # the number of real D2H lanes may run concurrently; after a
                 # complete Host snapshot is durable, P can immediately release
                 # the request-generation HBM even while ordered D admission is
                 # still waiting for capacity.
-                async with self._p_ready_stage_semaphore(admission.domain):
-                    prepared_reservation = await admission.prepare()
+                if prepared_reservation is None:
+                    async with self._p_ready_stage_semaphore(admission.domain):
+                        prepared_reservation = await admission.prepare()
             admission.prepare_complete = True
             admission.host_staged = (
                 admission.prepare is not None and prepared_reservation is None
             )
-            if admission.commit_predecessor is not None:
-                await asyncio.shield(admission.commit_predecessor)
             if admission.cancel_requested:
                 raise asyncio.CancelledError
             admission.commit_started = True
@@ -2709,7 +2790,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         return True
 
     def _next_p_ready_heads(self) -> list[_PReadyAdmission]:
-        """Return one authoritative FIFO head per unblocked P."""
+        """Return the next authoritative fair-scan candidate per P."""
 
         heads: list[_PReadyAdmission] = []
         domains = sorted(self._p_ready_fifo_waiters)
@@ -2751,9 +2832,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     reservation = reservations.get(admission)
                     admission.initial_reservation = reservation
                     # Capacity-bound generations prepare independently in a
-                    # bounded lane pool.  ``commit_predecessor`` alone owns D
-                    # FIFO ordering; blocking the whole P here would pin every
-                    # later completed generation in P HBM behind one full D.
+                    # bounded lane pool.  They do not gate later feasible
+                    # generations from the same P.
                     self._activate_p_ready_admission(admission)
                     admission.dispatch_task = asyncio.create_task(
                         self._run_p_ready_admission(
@@ -2765,8 +2845,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             f"{admission.sequence}"
                         ),
                     )
-                # Let ordered commit tasks issue their D POSTs, then drain the
-                # next FIFO heads without waiting for receiver completion.
+                # Let commit tasks issue their D POSTs, then scan the next
+                # candidates without waiting for receiver completion.
                 await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
@@ -3995,10 +4075,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 route_task.cancel()
                 await asyncio.gather(route_task, return_exceptions=True)
             await self._release_prefill_work(prefill_work)
-            # Host staging is owned by the admission state machine for the
-            # current FIFO head.  Publishing from every completed request here
-            # used to turn one transient D-full signal into a per-P Host-copy
-            # avalanche and allowed later snapshots to delay the true head.
+            # Host staging is owned independently by each admission state
+            # machine; it cannot gate the path choice of later P-ready work.
             p2d_attempt_snapshot = self._p2d_snapshot_for_rooms(rooms)
             # The request coroutine now becomes a pure producer.  The per-P
             # dispatcher owns FIFO order, future D-capacity credit and the
@@ -4070,7 +4148,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 await self._stage_p2d_until_durable(
                     rooms, prompt_tokens, domain
                 )
-                # Both outcomes continue at the ordered commit boundary:
+                # Both outcomes continue at the request-local commit boundary:
                 # HOST_READY means P pages may already be released; REJECTED
                 # means the complete P KV is retained.  In neither case may
                 # this bounded D2H preparation lane wait for D capacity.
@@ -4115,6 +4193,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 await asyncio.gather(route_task, return_exceptions=True)
             if ready_key is not None:
                 self._p_ready_submitted_sequences.discard(ready_key)
+            # Once the Decode POST has been submitted, closing its HTTP task is
+            # not a destination cleanup fence. Explicit abort makes D remove a
+            # request still parked in prealloc/transfer before Router drops the
+            # reservation and a retry starts a fresh physical generation.
+            if reservation is not None and decode_task is not None:
+                await self._abort_decode_attempt(
+                    session, reservation.url, modified_request
+                )
             await self._dispose_response_task(prefill_task)
             await self._dispose_response_task(decode_task)
             if admission_task is not None and not admission_task.done():

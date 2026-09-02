@@ -19,7 +19,11 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     HostStageState,
     SharedHostStagingLedger,
 )
-from sglang.srt.disaggregation.p2d_host_staging import p2d_snapshot_id
+from sglang.srt.disaggregation.p2d_host_staging import (
+    P2D_CUSTOM_PREFILL_DOMAIN,
+    P2D_CUSTOM_SNAPSHOT_ID,
+    p2d_snapshot_id,
+)
 from sglang.srt.disaggregation.agentic_prefill_pressure import (
     SharedPrefillPressureReservations,
 )
@@ -89,6 +93,47 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router._prefill_pressure_sample_started_at = 0.0
         router._prefill_pressure_interval = 0.2
         return router
+
+    def test_p2d_host_metadata_uses_chat_custom_params(self):
+        request = {
+            "custom_params": {"agentic_request_id": "chat-request"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        LateBindingMiniLoadBalancer._set_p2d_host_metadata(
+            request, "p2d:41", 1
+        )
+
+        self.assertNotIn("sampling_params", request)
+        self.assertEqual(
+            request["custom_params"],
+            {
+                "agentic_request_id": "chat-request",
+                P2D_CUSTOM_SNAPSHOT_ID: "p2d:41",
+                P2D_CUSTOM_PREFILL_DOMAIN: 1,
+            },
+        )
+
+    def test_p2d_host_metadata_uses_generate_sampling_params(self):
+        request = {
+            "sampling_params": {
+                "custom_params": {"agentic_request_id": "generate-request"}
+            }
+        }
+
+        LateBindingMiniLoadBalancer._set_p2d_host_metadata(
+            request, "p2d:42", 0
+        )
+
+        self.assertNotIn("custom_params", request)
+        self.assertEqual(
+            request["sampling_params"]["custom_params"],
+            {
+                "agentic_request_id": "generate-request",
+                P2D_CUSTOM_SNAPSHOT_ID: "p2d:42",
+                P2D_CUSTOM_PREFILL_DOMAIN: 0,
+            },
+        )
 
     async def test_random_routing_ablation_ignores_load_but_keeps_feasibility(self):
         router = self.make_router(Path("/dev/shm/test-ready"))
@@ -1064,7 +1109,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             await router.close()
 
     async def test_p_ready_host_staging_releases_producer_before_d_capacity(self):
-        """Blocked FIFO heads may stage concurrently but enter D in order."""
+        """Blocked requests stage independently without pinning P HBM."""
 
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))
@@ -1137,6 +1182,97 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(committed, [1, 2])
             await router.close()
 
+    async def test_p_ready_grace_retries_direct_before_host_staging(self):
+        """Capacity released during the grace interval must avoid Host."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.dynamic_prefill_domains = True
+            router._active_prefill_attempts = {}
+            router.p2d_host_spill_delay = 0.001
+
+            async def no_initial_direct(admissions):
+                return {admission: None for admission in admissions}
+
+            reservation = DecodeReservation(
+                reservation_id="after-grace",
+                url="http://d0",
+                prompt_tokens=512,
+                admission_tokens=1024,
+                request_count=1,
+                rooms=(505,),
+                created_at=time.monotonic(),
+                prefill_domain=0,
+            )
+            router._reserve_p_ready_direct_batch = no_initial_direct
+            router._retry_p_ready_direct_after_grace = AsyncMock(
+                return_value=reservation
+            )
+            prepare = AsyncMock(side_effect=AssertionError("must not stage"))
+            dispatch = AsyncMock(side_effect=AssertionError("must not reselect"))
+
+            rid = "grace-retry"
+            payload = {"rid": rid, "prefill_domain": 0, "ready_sequence": 1}
+            path = router._ready_path(505)
+            path.write_bytes(orjson.dumps(payload))
+            router._p_ready_snapshot[505] = payload | {"_path": path}
+            router._active_prefill_attempts[505] = rid
+
+            result = await router._dispatch_p_ready_in_order(
+                1,
+                0,
+                dispatch,
+                request={"max_tokens": 512},
+                rooms=(505,),
+                prompt_tokens=512,
+                commit=lambda selected: asyncio.sleep(0, result=selected),
+                prepare=prepare,
+            )
+
+            self.assertIs(result, reservation)
+            router._retry_p_ready_direct_after_grace.assert_awaited_once()
+            prepare.assert_not_awaited()
+            dispatch.assert_not_awaited()
+            await router.close()
+
+    async def test_p_ready_grace_retry_allows_later_feasible_request(self):
+        """An older blocked generation must not gate a later Direct retry."""
+
+        router = self.make_router(Path("/dev/shm/test-ready-grace-fifo"))
+        loop = asyncio.get_running_loop()
+
+        def admission(sequence):
+            return _PReadyAdmission(
+                domain=0,
+                sequence=sequence,
+                submitted_key=(0, sequence),
+                enqueued_at=time.monotonic(),
+                dispatch=AsyncMock(),
+                future=loop.create_future(),
+                finished=asyncio.Event(),
+                request={"max_tokens": 512},
+                rooms=(500 + sequence,),
+                prompt_tokens=512,
+                commit=AsyncMock(),
+                prepare=AsyncMock(),
+            )
+
+        first = admission(1)
+        second = admission(2)
+        router._p_ready_fifo_active = {0: {1: first, 2: second}}
+        router._load_cache = [
+            DecodeLoad("http://d0", 0, 4096, 0, 0, 0, 0, 0),
+            DecodeLoad("http://d1", 0, 4096, 0, 0, 0, 0, 0),
+        ]
+        router._observe_decode_load_after = AsyncMock(return_value=True)
+
+        selected = await router._retry_p_ready_direct_after_grace(
+            second, not_before=time.monotonic()
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(len(router._reservations), 1)
+        router._observe_decode_load_after.assert_awaited_once()
+
     async def test_stage_returns_at_host_durability_without_d_capacity(self):
         """Host durability, not D admission, is the P-HBM release boundary."""
 
@@ -1200,8 +1336,8 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 ledger.get(snapshot_id)["state"], HostStageState.REJECTED.value
             )
 
-    async def test_shutdown_releases_direct_reservation_before_fifo_handoff(self):
-        """A reservation waiting behind its predecessor is still Router-owned."""
+    async def test_p_ready_commit_does_not_wait_for_older_generation(self):
+        """Cross-request FIFO metadata cannot block a feasible Direct send."""
 
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))
@@ -1232,18 +1368,15 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
                 commit_done=loop.create_future(),
             )
             router._p_ready_fifo_active = {0: {1: admission}}
-            task = asyncio.create_task(
-                router._run_p_ready_admission(admission, reservation)
-            )
+            task = asyncio.create_task(router._run_p_ready_admission(admission, reservation))
             admission.dispatch_task = task
+            await asyncio.wait_for(task, timeout=1)
 
-            deadline = time.monotonic() + 1
-            while not admission.ownership_started and time.monotonic() < deadline:
-                await asyncio.sleep(0)
-            await router.close()
-
-            self.assertNotIn(reservation.reservation_id, router._reservations)
+            self.assertTrue(admission.commit_started)
             self.assertTrue(admission.finished.is_set())
+            self.assertFalse(predecessor.done())
+            router._reservations.pop(reservation.reservation_id, None)
+            await router.close()
 
     async def test_p_ready_broker_cancellation_during_load_does_not_reserve(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1923,6 +2056,72 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await retry, ({"text": [1, 2, 3]}, 200))
             await asyncio.sleep(0)
             self.assertEqual(calls, 1)
+
+    async def test_failed_generation_retry_uses_fresh_wire_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            attempts = []
+
+            async def generate_once(request, _prefill_server, _endpoint):
+                attempts.append((request["bootstrap_room"], request["rid"]))
+                if len(attempts) == 1:
+                    return {"error": "transport"}, 500
+                return {"ok": True}, 200
+
+            router._generate_once = generate_once
+            request = {"bootstrap_room": 99, "rid": "external-rid"}
+
+            self.assertEqual(
+                await router._generate_singleflight(
+                    "agent:g-failed", request, "http://p0", "generate"
+                ),
+                ({"error": "transport"}, 500),
+            )
+            # Let the done callback remove the failed producer. It must not
+            # publish that 5xx into the completed-generation cache.
+            await asyncio.sleep(0)
+            self.assertEqual(
+                await router._generate_singleflight(
+                    "agent:g-failed", request, "http://p0", "generate"
+                ),
+                ({"ok": True}, 200),
+            )
+            self.assertEqual(len(attempts), 2)
+            self.assertNotEqual(attempts[0], attempts[1])
+            self.assertNotIn(99, {attempts[0][0], attempts[1][0]})
+            self.assertNotIn(
+                "external-rid", {attempts[0][1], attempts[1][1]}
+            )
+
+    async def test_abort_decode_attempt_cancels_every_tp_request_id(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        calls = []
+
+        class Response:
+            status = 200
+
+            def release(self):
+                return None
+
+        class Session:
+            async def post(self, url, json):
+                calls.append((url, json))
+                return Response()
+
+        self.assertTrue(
+            await router._abort_decode_attempt(
+                Session(),
+                "http://d0",
+                {"rid": ["rank-0", "rank-1"]},
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("http://d0/abort_request", {"rid": "rank-0"}),
+                ("http://d0/abort_request", {"rid": "rank-1"}),
+            ],
+        )
 
     async def test_client_cancellation_does_not_cancel_generation_producer(self):
         with tempfile.TemporaryDirectory() as directory:
