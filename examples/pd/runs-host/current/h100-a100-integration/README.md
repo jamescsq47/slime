@@ -68,14 +68,31 @@ Qwen3-8B, BrowseComp canonical source-order n680 cycling, temperature 0,
 User changed concurrency from 384 to 512 during service startup; the c384
 attempt was stopped before workload execution and is not a performance result.
 P GPUs 0/2/4/6, D GPUs 1/3/5/7, search on GPU7.
-To compare with A100 r7, D mem fractions remain 0.85/0.85/0.85/0.74;
+The final rerun uses D mem fractions 0.80/0.80/0.80/0.60; P workers remain
+at 0.85.  The lower GPU7 fraction leaves room for the colocated search model.
 D→P Host is 128 GiB/P and P→D Host is 32 GiB/P. The H100 implementation
 uses memfd, two DMA lanes, 4,096-token chunks and a 640 GiB registration
 cache limit. Native SGLang HiCache/Mooncake is disabled.
 
-Formal result: **failed and terminated; no valid throughput result**.
-The c512 attempt encountered long runtime Host arena registration stalls,
-then D3 on GPU7 failed with CUDA OOM while sharing the card with the search
-service. Full chronology and raw monitoring samples are retained in
+The first c512 attempt encountered lazy Host registration stalls and then a
+GPU7 OOM. Full chronology is retained in
 [the failure report](browsecomp-qwen3-8b-tp1-4p4d-c512-w300-m1200-r1/FAILURE.md).
-The intended 300+1200 measurement was not successfully completed.
+
+The corrected launch now enforces this order:
+
+1. start every P/D model and preallocate every Host Arena;
+2. wait for all eight CUDA contexts to publish `prewarm_complete`;
+3. start search and Router, then admit requests;
+4. run 300 seconds of business warmup and 1,200 seconds of measurement.
+
+The c512 rerun completed successfully. Four P contexts each registered
+544 GiB in 296.6–296.7 seconds; four D contexts each registered 640 GiB in
+339.6–339.8 seconds. Requests were not admitted until all eight contexts had
+completed. The measured warmup was 301.20 seconds and the measurement window
+was 1,200.0006 seconds.
+
+Formal result: **4,638.2 Decode token/s** total (**1,159.5 token/s/D**),
+32,889 Prefill compute token/s, 2.320 Agent/s, 97.90% D Forward per card and
+86.81% P Forward per card. Page-aligned reverse Decode-KV reuse was 99.76%.
+Detailed results are in
+[the rerun report](browsecomp-qwen3-8b-tp1-4p4d-c512-prewarm-barrier-w300-m1200-r2/RESULTS.md).
