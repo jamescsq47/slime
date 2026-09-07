@@ -19,6 +19,6 @@ export SGLANG_AGENTIC_KV_REGISTER_CACHE_GIB=640
 export WARMUP_SECONDS=300
 export MAX_WARMUP_SECONDS=420
 export MEASURE_SECONDS=1200
-export MAX_INFLIGHT=384
-export RUN_DIR="${RUN_DIR:-${PD_DIR}/runs-host/current/h100-a100-integration/browsecomp-qwen3-8b-tp1-4p4d-c384-w300-m1200-r1}"
+export MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
+export RUN_DIR="${RUN_DIR:-${PD_DIR}/runs-host/current/h100-a100-integration/browsecomp-qwen3-8b-tp1-4p4d-c${MAX_INFLIGHT}-w300-m1200-r1}"
 exec bash "${SCRIPT_DIR}/run_qwen3_8b_tp1_browsecomp_4p4d.sh"

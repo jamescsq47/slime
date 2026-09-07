@@ -11,6 +11,27 @@ The Slime merge adds A100 workload/harness/configuration support and retains
 H100 PD control code. Deferred allocator frees own their index tensors.
 Final safety changes and formal metrics are recorded after verification.
 
+## Verification scope
+
+- Paired Slime PD control/Host/priority/progress/claim suite: 219 passed.
+- Workload plugins and SWE harness suite: 47 passed with the existing
+  `/homes/siqic/mini-swe-agent-v2/src` optional dependency on PYTHONPATH.
+- Router suite after test-session cleanup: 98 passed, no unclosed session.
+- Indexed DMA descriptor byte-address equivalence: 4 passed; real CUDA
+  P→D round trip and D→P source-release tests: 2 passed.
+- SGLang lifecycle/TP suite before the final ownership safety transplant:
+  308 passed. Final transplant results are recorded below when complete.
+- Merged staged sources: 34 Python AST checks and 17 shell syntax checks passed.
+- Broader inherited training tests are not all green: the A100 commit lacks
+  `examples/mixed/terminal_agent.py`, the pd inference environment lacks
+  `wandb`, and 11 three-domain training tests reference APIs absent from that
+  branch's `examples/mixed/custom_data_source.py`. These are separate from
+  the tested PD workload plugin path; no training-test pass is claimed.
+
+The canonical BrowseComp schedule was absent from both branch Git trees
+although launchers referenced it. It is now tracked, byte-identical to the
+original A100 file (SHA256 `156cee416e3e3771de680c38f26a70f8347f9d67c4c67c14f0d05d89826838d6`).
+
 ## DMA measurements on A100
 
 All raw JSON files, including failed gates, are under `dma/`.
@@ -40,9 +61,11 @@ change byte addresses, ownership, fences or transfer ordering.
 
 ## Formal configuration
 
-`scripts/new_method/run_h100_integration_a100_c384.sh` records the launch:
+`scripts/new_method/run_h100_integration_a100.sh` records the launch:
 Qwen3-8B, BrowseComp canonical source-order n680 cycling, temperature 0,
-4P:4D TP=1, c384, warmup 300 seconds and measurement 1,200 seconds.
+4P:4D TP=1, c512, warmup 300 seconds and measurement 1,200 seconds.
+User changed concurrency from 384 to 512 during service startup; the c384
+attempt was stopped before workload execution and is not a performance result.
 P GPUs 0/2/4/6, D GPUs 1/3/5/7, search on GPU7.
 To compare with A100 r7, D mem fractions remain 0.85/0.85/0.85/0.74;
 D→P Host is 128 GiB/P and P→D Host is 32 GiB/P. The H100 implementation
