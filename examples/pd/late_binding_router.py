@@ -30,6 +30,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
+    RequestGeneration,
     unpack_agentic_extra_key,
 )
 from sglang.srt.disaggregation.agentic_host_staging import (
@@ -40,9 +41,6 @@ from sglang.srt.disaggregation.p2d_host_staging import (
     P2D_CUSTOM_PREFILL_DOMAIN,
     P2D_CUSTOM_SNAPSHOT_ID,
     p2d_snapshot_id,
-)
-from sglang.srt.disaggregation.agentic_prefill_pressure import (
-    SharedPrefillPressureReservations,
 )
 from sglang_router.mini_lb import (
     AIOHTTP_STREAM_READ_CHUNK_SIZE,
@@ -186,31 +184,22 @@ class _PrefillRedirect(RuntimeError):
 class _PrefillAdmissionGate:
     """Bound hidden HTTP/bootstrap work before requests reach P.
 
-    Parent turns always precede initial requests.  This is intentionally a
-    strict agentic-serving priority boundary: a New request must never consume
-    the short D-HBM Direct deadline of a returned parent turn.  FIFO is kept
-    within each class.
+    This gate is FIFO across parent and initial turns. KV source affects only
+    the independent Direct/Slow I/O credits inside P, never request admission.
     """
 
-    def __init__(self, limit: int, new_aging_seconds: float):
+    def __init__(self, limit: int):
         if limit <= 0:
             raise ValueError("P admission limit must be positive")
         self.limit = limit
-        self.new_aging_seconds = max(0.0, new_aging_seconds)
         self.active = 0
         self._sequence = 0
         self._waiters: list[_PrefillAdmissionWaiter] = []
         self._condition = asyncio.Condition()
 
     def _next_waiter(self, now: float) -> _PrefillAdmissionWaiter:
-        def key(waiter: _PrefillAdmissionWaiter):
-            # Never promote an aged New request above a parent.  GPU-side
-            # admission has its own P-ready soft caps, while this gate only
-            # orders the small HTTP/tokenizer work window in front of P.
-            queue_class = 0 if waiter.parent_turn else 1
-            return queue_class, waiter.enqueued_at, waiter.sequence
-
-        return min(self._waiters, key=key)
+        del now
+        return min(self._waiters, key=lambda waiter: waiter.sequence)
 
     async def acquire(self, *, parent_turn: bool) -> float:
         waiter = _PrefillAdmissionWaiter(
@@ -231,14 +220,7 @@ class _PrefillAdmissionGate:
                         self.active += 1
                         self._condition.notify_all()
                         return time.monotonic() - waiter.enqueued_at
-                    # Aging changes priority even when no admission completes.
-                    try:
-                        await asyncio.wait_for(
-                            self._condition.wait(),
-                            timeout=max(0.01, self.new_aging_seconds),
-                        )
-                    except asyncio.TimeoutError:
-                        continue
+                    await self._condition.wait()
             except BaseException:
                 if waiter in self._waiters:
                     self._waiters.remove(waiter)
@@ -278,16 +260,11 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self.prefill_queue_timeout = _env_float(
             "SGLANG_PD_LATE_BIND_QUEUE_TIMEOUT_S", 3600.0
         )
-        self.prefill_new_aging_seconds = _env_float(
-            "SGLANG_PD_LATE_BIND_NEW_AGING_S", 10.0
-        )
         # Admission bounds the small HTTP/tokenizer bootstrap window in front
         # of each P.  A single global gate unnecessarily couples independent P
         # workers: pressure on P0 must not consume P1's admission capacity.
         self._prefill_admissions = [
-            _PrefillAdmissionGate(
-                self.max_prefill_inflight, self.prefill_new_aging_seconds
-            )
+            _PrefillAdmissionGate(self.max_prefill_inflight)
             for _ in self.prefill_urls
         ]
         # Retain the legacy attribute for single-P users and lightweight test
@@ -430,20 +407,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 self.p_ready_dir / "early-claims" / "prefill-loads.json"
             )
         self._prefill_pressure_path = Path(pressure_path)
-        reservation_path = os.getenv(
-            "SGLANG_AGENTIC_KV_PREFILL_RESERVATION_PATH",
-            f"{pressure_path}.reservations",
-        )
-        self._prefill_pressure_reservations = (
-            SharedPrefillPressureReservations(
-                reservation_path,
-                ttl_seconds=_env_float(
-                    "SGLANG_AGENTIC_KV_PREFILL_RESERVATION_TTL_S", 5.0
-                ),
-            )
-            if reservation_path
-            else None
-        )
         staging_path = os.getenv("SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH", "")
         self._d2p_host_ledger = (
             SharedHostStagingLedger(staging_path) if staging_path else None
@@ -649,39 +612,53 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     "_prefill_direct_pending_tokens",
                     [0] * count,
                 )
-                if (
-                    direct_workset_tokens
-                    and time.monotonic() - pressure_at <= pressure_max_age
-                ):
-                    feasible = []
+                pressure_fresh = time.monotonic() - pressure_at <= pressure_max_age
+                remaining_by_domain: dict[int, int] = {}
+                if pressure_fresh:
                     for candidate in candidates:
                         row = pressure_by_domain.get(candidate)
                         if row is None:
                             continue
                         capacity = int(row.get("hbm_capacity_tokens", 0))
-                        used = int(row.get("hbm_used_tokens", 0))
-                        available = capacity - used - direct_pending[candidate]
-                        if capacity > 0 and available >= direct_workset_tokens:
-                            feasible.append(candidate)
+                        if capacity <= 0:
+                            continue
+                        remaining_by_domain[candidate] = (
+                            capacity
+                            - int(row.get("hbm_used_tokens", 0))
+                            - direct_pending[candidate]
+                        )
+                    feasible = [
+                        candidate
+                        for candidate, remaining in remaining_by_domain.items()
+                        if remaining >= direct_workset_tokens
+                    ]
                     if feasible:
                         candidates = feasible
+                    elif remaining_by_domain:
+                        candidates = list(remaining_by_domain)
                 if getattr(self, "ablation_random_routing", False):
                     domain = self._routing_rng.choice(sorted(candidates))
+                elif remaining_by_domain:
+                    # D->P routing deliberately uses one cheap signal: choose
+                    # the P with the most uncommitted KV capacity.  Local
+                    # Router-local full-workset reservations are deducted so
+                    # stale samples cannot herd several requests onto one P.
+                    # The exact-size allocator remains authoritative.
+                    domain = max(
+                        candidates,
+                        key=lambda candidate: (
+                            remaining_by_domain[candidate],
+                            -((candidate - start) % count),
+                        ),
+                    )
                 else:
+                    # Startup or a stale/missing P sample has no meaningful
+                    # remaining-capacity ordering.  Preserve the local shadow
+                    # fallback until the next asynchronous sample arrives.
                     domain = min(
                         candidates,
                         key=lambda candidate: (
-                            self._prefill_pressure_score(
-                                pressure_by_domain.get(candidate, {}),
-                                pending_tokens=self._prefill_pending_tokens[
-                                    candidate
-                                ],
-                                pending_requests=self._prefill_pending_requests[
-                                    candidate
-                                ],
-                            )
-                            if pressure_by_domain.get(candidate) is not None
-                            else float(self._prefill_pending_tokens[candidate]),
+                            self._prefill_pending_tokens[candidate],
                             (candidate - start) % count,
                         ),
                     )
@@ -774,7 +751,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
 
     async def _fetch_prefill_hbm_pressure(
         self, session: aiohttp.ClientSession, url: str
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int]:
         """Read one logical P without putting the query on its GPU loop."""
 
         timeout = aiohttp.ClientTimeout(total=self.load_timeout)
@@ -788,8 +765,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             for row in rows
         )
         capacity = sum(int(row.get("max_total_num_tokens", 0)) for row in rows)
-        waiting = sum(int(row.get("num_waiting_reqs", 0)) for row in rows)
-        return used, capacity, waiting
+        return used, capacity
 
     @staticmethod
     def _write_prefill_pressure(path: Path, payload: dict[str, Any]) -> None:
@@ -808,6 +784,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             HostStageState.HOST_WRITING.value,
             HostStageState.HOST_READY.value,
             HostStageState.H2D_LOADING.value,
+            # The Host extent remains authoritative until the recovered HBM
+            # workset has been inserted and pinned, including retry windows.
+            HostStageState.HBM_READY.value,
+            HostStageState.RETRY_PENDING.value,
             # ABORTING likewise owns its extent until D is quiescent.
             HostStageState.ABORTING.value,
         }
@@ -921,45 +901,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             )
         return rows
 
-    @staticmethod
-    def _prefill_pressure_score(
-        row: dict[str, Any],
-        *,
-        pending_tokens: int,
-        pending_requests: int,
-    ) -> float:
-        capacity = max(1, int(row.get("hbm_capacity_tokens", 0)))
-        arena_capacity = max(1, int(row.get("arena_capacity_bytes", 0)))
-        p2d_capacity = max(
-            1, int(row.get("p2d_arena_capacity_bytes", arena_capacity))
-        )
-        return (
-            (
-                max(0, int(pending_tokens))
-                + max(0, int(row.get("p2d_inflight_tokens", 0)))
-                + max(0, int(row.get("p2d_host_tokens", 0)))
-                + max(0, int(row.get("d_slow_reserved_tokens", 0)))
-            )
-            / capacity
-            + max(0, int(row.get("hbm_used_tokens", 0))) / capacity
-            + 2.0
-            * max(0, int(row.get("arena_used_bytes", 0)))
-            / arena_capacity
-            + 2.0
-            * max(0, int(row.get("p2d_host_bytes", 0)))
-            / p2d_capacity
-            + 0.01
-            * (
-                max(0, int(pending_requests))
-                + max(0, int(row.get("scheduler_waiting", 0)))
-                + max(0, int(row.get("p2d_inflight_requests", 0)))
-                + max(0, int(row.get("p2d_host_requests", 0)))
-                + max(0, int(row.get("d_slow_reserved_requests", 0)))
-            )
-        )
-
     async def _prefill_pressure_monitor_loop(self) -> None:
-        """Publish a nonblocking shared snapshot for D-rank0 slow routing."""
+        """Publish independent P-HBM and Shared-Host capacity signals."""
 
         tp_size = max(1, int(os.getenv("SGLANG_AGENTIC_KV_TP_SIZE", "1")))
         arena_capacity = int(
@@ -977,57 +920,20 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     ),
                     return_exceptions=True,
                 )
-                async with self._prefill_work_lock:
-                    pending_tokens = list(self._prefill_pending_tokens)
-                    pending_requests = list(self._prefill_pending_requests)
                 arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
-                p2d_ledger = getattr(self, "p2d_host_ledger", None)
-                p2d_entries = (
-                    {}
-                    if p2d_ledger is None
-                    else await asyncio.to_thread(p2d_ledger.snapshot_entries)
-                )
-                p2d_pressure = self._p2d_pressure_by_domain(p2d_entries)
-                reservation_totals = (
-                    {}
-                    if self._prefill_pressure_reservations is None
-                    else await asyncio.to_thread(
-                        self._prefill_pressure_reservations.totals
-                    )
-                )
-                p2d_arena_capacity = int(
-                    float(
-                        os.getenv(
-                            "SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB",
-                            "32",
-                        )
-                    )
-                    * (1024**3)
-                    * tp_size
-                )
                 domains = []
                 for domain, result in enumerate(fetched):
                     if isinstance(result, BaseException):
-                        used = capacity = waiting = 0
+                        used = capacity = 0
                     else:
-                        used, capacity, waiting = result
-                    reserved_tokens, reserved_requests = reservation_totals.get(
-                        domain, (0, 0)
-                    )
+                        used, capacity = result
                     domains.append(
                         {
                             "domain": domain,
-                            "pending_tokens": pending_tokens[domain],
-                            "pending_requests": pending_requests[domain],
-                            "scheduler_waiting": waiting,
                             "hbm_used_tokens": used,
                             "hbm_capacity_tokens": capacity,
                             "arena_used_bytes": arena_used[domain],
                             "arena_capacity_bytes": arena_capacity,
-                            "p2d_arena_capacity_bytes": p2d_arena_capacity,
-                            **p2d_pressure[domain],
-                            "d_slow_reserved_tokens": reserved_tokens,
-                            "d_slow_reserved_requests": reserved_requests,
                         }
                     )
                 payload = {
@@ -1101,6 +1007,77 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 reservation.tokens,
                 self._prefill_pending_tokens,
             )
+
+    async def _move_prefill_work_to_max_remaining_kv(
+        self,
+        reservation: _PrefillWorkReservation,
+        required_workset_tokens: int,
+    ) -> int:
+        """Atomically retarget an existing request to the roomiest P HBM."""
+
+        required_workset_tokens = max(1, int(required_workset_tokens))
+        async with self._prefill_work_lock:
+            if reservation.released:
+                raise RuntimeError("cannot route a released Prefill reservation")
+            count = len(self.prefill_urls)
+            pressure = getattr(self, "_prefill_pressure_domains", [])
+            pressure_at = float(getattr(self, "_prefill_pressure_at", 0.0))
+            pressure_max_age = max(
+                1.0,
+                5.0 * float(getattr(self, "_prefill_pressure_interval", 0.2)),
+            )
+            if time.monotonic() - pressure_at > pressure_max_age:
+                pressure = []
+            pressure_by_domain = {
+                int(row.get("domain", -1)): row for row in pressure
+            }
+            remaining = {}
+            for domain in range(count):
+                row = pressure_by_domain.get(domain)
+                if row is None:
+                    continue
+                capacity = int(row.get("hbm_capacity_tokens", 0))
+                if capacity <= 0:
+                    continue
+                pending = self._prefill_direct_pending_tokens[domain]
+                if domain == reservation.domain:
+                    pending -= reservation.direct_workset_tokens
+                remaining[domain] = (
+                    capacity - int(row.get("hbm_used_tokens", 0)) - pending
+                )
+            feasible = [
+                domain
+                for domain, available in remaining.items()
+                if available >= required_workset_tokens
+            ]
+            candidates = feasible or list(remaining)
+            if candidates:
+                domain = max(candidates, key=lambda item: (remaining[item], -item))
+            else:
+                domain = min(
+                    range(count), key=lambda item: self._prefill_pending_tokens[item]
+                )
+            if domain != reservation.domain:
+                previous = reservation.domain
+                self._prefill_pending_tokens[previous] -= reservation.tokens
+                self._prefill_pending_requests[previous] -= reservation.requests
+                self._prefill_direct_pending_tokens[previous] -= (
+                    reservation.direct_workset_tokens
+                )
+                self._prefill_pending_tokens[domain] += reservation.tokens
+                self._prefill_pending_requests[domain] += reservation.requests
+                self._prefill_direct_pending_tokens[domain] += (
+                    reservation.direct_workset_tokens
+                )
+                reservation.domain = domain
+                logger.info(
+                    "PD_P_WORK_MOVE_MAX_REMAINING from_P=%d to_P=%d "
+                    "workset_tokens=%d",
+                    previous,
+                    domain,
+                    required_workset_tokens,
+                )
+            return domain
 
     async def _resize_prefill_work(
         self, reservation: _PrefillWorkReservation, tokens: int
@@ -1367,6 +1344,87 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             reason,
         )
 
+    async def _commit_slow_recovery_domain(
+        self,
+        parent: RequestGeneration,
+        route: dict[str, Any],
+        domain: int,
+    ) -> Optional[int]:
+        """Commit one Host-independent H2D/Prefill destination.
+
+        ``None`` is the explicit outcome when pressure eviction wins the
+        HOST_READY assignment CAS.  The caller then resizes/releases its
+        provisional incremental-work reservation and performs full Prefill.
+        """
+
+        ledger = getattr(self, "_d2p_host_ledger", None)
+        if ledger is None:
+            raise RuntimeError("dynamic Slow recovery requires a Host ledger")
+        deadline = time.monotonic() + self.ready_timeout
+        while True:
+            assigned = await asyncio.to_thread(
+                ledger.assign_d2p_recovery_domain, parent.snapshot_id, domain
+            )
+            entry = await asyncio.to_thread(ledger.get, parent.snapshot_id)
+            if assigned:
+                break
+            existing = None if entry is None else entry.get("recovery_domain")
+            if existing is not None:
+                domain = int(existing)
+                break
+            state = None if entry is None else entry.get("state")
+            if (
+                _HOST_STAGE_EVICTING is not None
+                and state == _HOST_STAGE_EVICTING.value
+            ):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for Host eviction fence of "
+                        f"{parent.snapshot_id}"
+                    )
+                await asyncio.sleep(self.ready_poll_interval)
+                continue
+            if (
+                _HOST_STAGE_RECOMPUTE_REQUIRED is not None
+                and state == _HOST_STAGE_RECOMPUTE_REQUIRED.value
+            ):
+                self.early_claim_store.publish_route(
+                    parent,
+                    route="recompute",
+                    prefill_domain=int(route.get("prefill_domain", domain)),
+                )
+                self.early_claim_store.remove_arrival(parent)
+                logger.info(
+                    "PD_SLOW_RECOVERY_ROUTE snapshot=%s state=%s "
+                    "action=full_recompute",
+                    parent.snapshot_id,
+                    state,
+                )
+                return None
+            raise RuntimeError(
+                f"cannot assign Slow recovery P for {parent.snapshot_id}: "
+                f"state={state}"
+            )
+        host_domain = route.get("arena_domain")
+        if host_domain is None and entry is not None:
+            host_domain = entry.get("arena_domain")
+        self.early_claim_store.publish_route(
+            parent,
+            route="host_ready",
+            prefill_domain=domain,
+            arena_domain=(None if host_domain is None else int(host_domain)),
+            arena_numa_node=route.get("arena_numa_node"),
+            snapshot_tokens=route.get("snapshot_tokens"),
+        )
+        logger.info(
+            "PD_SLOW_RECOVERY_ROUTE snapshot=%s host=%s P=%d "
+            "policy=max_remaining_kv",
+            parent.snapshot_id,
+            host_domain,
+            domain,
+        )
+        return domain
+
     async def _resolve_dynamic_prefill_work(
         self,
         request: dict[str, Any],
@@ -1456,6 +1514,43 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                 return await self._reserve_prefill_work(
                                     self._request_input_tokens(request)
                                 )
+                            # Host placement is complete before selecting the
+                            # independent H2D/Prefill P. Do not bind recovery
+                            # to the arena owner while D2H is still running.
+                            if (
+                                mode == "host_writing"
+                                or host_state != HostStageState.HOST_READY.value
+                            ):
+                                await asyncio.sleep(self.ready_poll_interval)
+                                continue
+                            if reservation is None:
+                                reservation = await self._reserve_prefill_work(
+                                    self._estimated_prefill_tokens(
+                                        request, snapshot_tokens
+                                    ),
+                                    direct_workset_tokens=self._request_input_tokens(
+                                        request
+                                    ),
+                                )
+                            domain = await self._commit_slow_recovery_domain(
+                                parent, route, reservation.domain
+                            )
+                            if domain is None:
+                                await self._release_prefill_work(reservation)
+                                reservation = None
+                                return await self._reserve_prefill_work(
+                                    self._request_input_tokens(request)
+                                )
+                            if domain != reservation.domain:
+                                await self._move_prefill_work(reservation, domain)
+                            logger.info(
+                                "PD_PREFILL_ROUTE snapshot=%s route=host_ready "
+                                "P=%d estimated_tokens=%d",
+                                parent.snapshot_id,
+                                domain,
+                                reservation.tokens,
+                            )
+                            return reservation
                         domain = int(route["prefill_domain"])
                         if not 0 <= domain < len(self.prefill_urls):
                             raise RuntimeError(f"invalid Prefill domain {domain}")
@@ -1465,14 +1560,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                     request, snapshot_tokens
                                 ),
                                 domain=domain,
-                                # The request may first reach Router just after
-                                # D/P completed Direct.  Bridge the same stale
-                                # pressure window as the ordinary direct_ready
-                                # path; Host routes own no P HBM yet.
-                                direct_workset_tokens=(
-                                    self._request_input_tokens(request)
-                                    if mode == "direct_complete"
-                                    else 0
+                                direct_workset_tokens=self._request_input_tokens(
+                                    request
                                 ),
                             )
                         else:
@@ -1569,6 +1658,65 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                 reservation, self._request_input_tokens(request)
                             )
                             return {"action": "recompute", "route": "host_evicted"}
+                        if (
+                            mode == "host_writing"
+                            or host_state != HostStageState.HOST_READY.value
+                        ):
+                            await asyncio.sleep(self.ready_poll_interval)
+                            continue
+                        original_domain = reservation.domain
+                        domain = await self._move_prefill_work_to_max_remaining_kv(
+                            reservation, self._request_input_tokens(request)
+                        )
+                        domain = await self._commit_slow_recovery_domain(
+                            parent, route, domain
+                        )
+                        if domain is None:
+                            # Max-KV selection moved only Router accounting;
+                            # eviction won before any redirect was committed.
+                            # The existing HTTP request still targets the
+                            # original P, so move its full-recompute charge
+                            # back there before resizing it.
+                            if reservation.domain != original_domain:
+                                await self._move_prefill_work(
+                                    reservation, original_domain
+                                )
+                            await self._settle_direct_workset(reservation)
+                            await self._resize_prefill_work(
+                                reservation, self._request_input_tokens(request)
+                            )
+                            return {
+                                "action": "recompute",
+                                "route": "host_evicted",
+                            }
+                        if domain != reservation.domain:
+                            await self._move_prefill_work(reservation, domain)
+                        if domain != original_domain:
+                            logger.info(
+                                "PD_PREFILL_REDIRECT snapshot=%s route=host_ready "
+                                "from_P=%d to_P=%d",
+                                parent.snapshot_id,
+                                original_domain,
+                                domain,
+                            )
+                        if domain != reservation.domain:
+                            raise RuntimeError("Slow recovery reservation move lost")
+                        # The request was already submitted for Direct. Make
+                        # the HTTP attempt follow the newly selected recovery
+                        # P whenever it differs from that original domain.
+                        return (
+                            {
+                                "action": "redirect",
+                                "route": "host_ready",
+                                "domain": domain,
+                            }
+                            if domain != original_domain
+                            else {
+                                "action": "settled",
+                                "route": "host_ready",
+                                "domain": domain,
+                            }
+                        )
                     domain = int(route["prefill_domain"])
                     if not 0 <= domain < len(self.prefill_urls):
                         raise RuntimeError(f"invalid Prefill domain {domain}")
@@ -3913,6 +4061,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         ready_key: Optional[Any] = None
         parent_admission: Optional[_PrefillAdmissionGate] = None
         parent_admission_domain: Optional[int] = None
+        pressure_handoff_task: Optional[asyncio.Task] = None
 
         async def release_parent_admission() -> None:
             nonlocal parent_admission
@@ -4023,6 +4172,22 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     await self._wait_until_prefill_scheduled(
                         rooms, prefill_task, route_task
                     )
+                    # The scheduled marker is published only after P owns the
+                    # complete parent+suffix workset.  Keep Router shadow
+                    # credit until a pressure fetch that began after this
+                    # physical allocation, then remove it exactly once.  This
+                    # applies equally to Direct and Slow H2D admission.
+                    if (
+                        prefill_work is not None
+                        and prefill_work.direct_workset_tokens > 0
+                        and pressure_handoff_task is None
+                    ):
+                        pressure_handoff_task = asyncio.create_task(
+                            self._settle_direct_workset_after_pressure(
+                                prefill_work,
+                                direct_terminal_at=time.monotonic(),
+                            )
+                        )
                     prompt_tokens = await self._wait_until_prefill_ready(
                         rooms, prefill_task, route_task
                     )
@@ -4075,6 +4240,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 route_task.cancel()
                 await asyncio.gather(route_task, return_exceptions=True)
             await self._release_prefill_work(prefill_work)
+            if pressure_handoff_task is not None:
+                await asyncio.gather(
+                    pressure_handoff_task, return_exceptions=True
+                )
             # Host staging is owned independently by each admission state
             # machine; it cannot gate the path choice of later P-ready work.
             p2d_attempt_snapshot = self._p2d_snapshot_for_rooms(rooms)
@@ -4188,6 +4357,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             return prefill_response, decode_response
         except BaseException:
             await self._release_prefill_work(prefill_work)
+            if pressure_handoff_task is not None:
+                await asyncio.gather(
+                    pressure_handoff_task, return_exceptions=True
+                )
             if route_task is not None and not route_task.done():
                 route_task.cancel()
                 await asyncio.gather(route_task, return_exceptions=True)

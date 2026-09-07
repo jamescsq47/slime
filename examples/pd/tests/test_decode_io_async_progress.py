@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import types
+from collections import deque
 
 import torch
 
@@ -244,7 +245,8 @@ def test_blocked_isolated_relay_does_not_stop_p_to_d_progress():
 
 
 class _PrefillHarness(SchedulerDisaggregationPrefillMixin):
-    pass
+    def __init__(self):
+        self._prefill_transfer_terminal_queue = deque()
 
 
 def test_prefill_producer_enqueues_fifo_without_touching_sender():
@@ -705,7 +707,7 @@ def test_unconfirmed_tool_candidate_preserves_parent_via_host_fallback():
         tp_world_size=1,
         tp_rank=0,
         agentic_fast_threshold=2.0,
-        agentic_early_claim_post_timeout=2.0,
+        agentic_direct_setup_timeout=2.0,
         agentic_relay_worker=None,
         agentic_early_claim_store=object(),
         agentic_host_staging_client=object(),

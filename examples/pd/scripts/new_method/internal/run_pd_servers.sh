@@ -213,6 +213,7 @@ if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
 fi
 
 pids=()
+frontend_pids=()
 cleanup_started=0
 
 process_group_has_live_members() {
@@ -228,18 +229,46 @@ process_group_has_live_members() {
 
 cleanup() {
   local pid index alive task_id
+  local frontend_graceful_seconds="${PD_FRONTEND_GRACEFUL_SHUTDOWN_SECONDS:-10}"
   local graceful_seconds="${PD_SERVICE_GRACEFUL_SHUTDOWN_SECONDS:-120}"
   local kill_wait_seconds="${PD_SERVICE_KILL_WAIT_SECONDS:-30}"
   local final_kill_wait_seconds="${PD_SERVICE_FINAL_KILL_WAIT_SECONDS:-60}"
-  local deadline=$((SECONDS + graceful_seconds))
+  local deadline
   (( cleanup_started == 1 )) && return
   cleanup_started=1
   trap - INT TERM
 
-  # Services are appended in dependency order (search, P, D..., router).
-  # Stop them in reverse order so no new requests/transfers are created while
-  # the GPU workers drain.  Address the whole setsid process group even when
-  # its launch_server parent has already exited but a scheduler child remains.
+  # Stop the HTTP frontends before their P/D dependencies.  A fixed-duration
+  # closed-loop run intentionally ends with live agents; terminating P/D at
+  # the same instant makes the Router report those expected cancellations as
+  # ServerDisconnectedError and then wait for its full graceful timeout.
+  # Keeping P/D alive through this short frontend drain preserves the current
+  # snapshot owner until the client-facing request has either unwound or the
+  # Router itself is retired.
+  for pid in "${frontend_pids[@]}"; do
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  deadline=$((SECONDS + frontend_graceful_seconds))
+  while (( SECONDS < deadline )); do
+    alive=0
+    for pid in "${frontend_pids[@]}"; do
+      process_group_has_live_members "${pid}" && alive=1
+    done
+    (( alive == 0 )) && break
+    sleep 1
+  done
+  for pid in "${frontend_pids[@]}"; do
+    if process_group_has_live_members "${pid}"; then
+      echo "Frontend process group ${pid} exceeded ${frontend_graceful_seconds}s drain; stopping it before P/D" >&2
+      kill -KILL -- "-${pid}" 2>/dev/null || true
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  done
+
+  # With every frontend gone, no new requests or transfers can be created.
+  # Address the whole setsid process group even when its launch_server parent
+  # has already exited but a scheduler child remains.
   for ((index=${#pids[@]} - 1; index >= 0; index--)); do
     pid="${pids[index]}"
     kill -TERM -- "-${pid}" 2>/dev/null || true
@@ -248,6 +277,7 @@ cleanup() {
     # original process group so a reparented Router cannot survive cleanup.
     kill -TERM "${pid}" 2>/dev/null || true
   done
+  deadline=$((SECONDS + graceful_seconds))
   while (( SECONDS < deadline )); do
     alive=0
     for pid in "${pids[@]}"; do
@@ -747,6 +777,7 @@ setsid env \
   >"${RUN_DIR}/logs/router.log" 2>&1 &
 router_pid=$!
 pids+=("${router_pid}")
+frontend_pids+=("${router_pid}")
 
 if (( ${#local_ports[@]} > 0 )); then
   local_worker_args=()
@@ -760,6 +791,7 @@ if (( ${#local_ports[@]} > 0 )); then
     >"${RUN_DIR}/logs/local-router.log" 2>&1 &
   local_router_pid=$!
   pids+=("${local_router_pid}")
+  frontend_pids+=("${local_router_pid}")
 fi
 
 wait_http router "http://127.0.0.1:${ROUTER_PORT}/health" "${router_pid}" 120

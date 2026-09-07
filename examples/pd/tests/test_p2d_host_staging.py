@@ -1,3 +1,4 @@
+import inspect
 import os
 import queue
 import shutil
@@ -10,7 +11,9 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.agentic_host_staging import (
+    AgenticDHostStagingClient,
     HostStageState,
+    SharedHostSnapshotArena,
     SharedHostStagingLedger,
 )
 from sglang.srt.disaggregation.base import KVPoll
@@ -19,9 +22,18 @@ from sglang.srt.disaggregation.p2d_host_staging import (
     AgenticPToDHostLoadManager,
     AgenticPToDHostReceiver,
     P2D_CUSTOM_SNAPSHOT_ID,
+    P2D_HOST_CAPACITY_LIMIT_DEFAULT,
     p2d_snapshot_from_req,
     p2d_snapshot_id,
 )
+
+
+def test_p2d_host_default_uses_full_arena_capacity():
+    assert P2D_HOST_CAPACITY_LIMIT_DEFAULT == 1.0
+    default = inspect.signature(AgenticPToDHostStagingManager).parameters[
+        "hard_watermark"
+    ].default
+    assert default == P2D_HOST_CAPACITY_LIMIT_DEFAULT
 
 
 class _TinyMHAPool:
@@ -252,6 +264,84 @@ def test_tp_host_load_failure_releases_source_only_after_all_ranks_drain():
             pass
 
 
+def test_p2d_cleanup_retries_extent_release_before_dropping_record():
+    snapshot_id = "p2d:unregister-retry"
+    snapshot = object()
+    release_results = iter((False, True))
+    release_calls = []
+
+    def release(value):
+        release_calls.append(value)
+        return next(release_results)
+
+    producer = AgenticPToDHostStagingManager.__new__(
+        AgenticPToDHostStagingManager
+    )
+    producer.ledger = SimpleNamespace(
+        get=lambda _snapshot_id: {"state": HostStageState.CONSUMED.value}
+    )
+    producer._lock = threading.RLock()
+    producer._active = {}
+    producer._records = {snapshot_id: {"snapshot": snapshot}}
+    producer.arena = SimpleNamespace(release=release)
+
+    producer._cleanup_consumed()
+    assert producer._records[snapshot_id]["snapshot"] is snapshot
+
+    producer._cleanup_consumed()
+    assert snapshot_id not in producer._records
+    assert release_calls == [snapshot, snapshot]
+
+
+def test_p2d_h2d_completion_retries_unregister_before_terminal():
+    snapshot_id = "p2d:h2d-unregister-retry"
+    terminal = []
+
+    class Snapshot:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self, *, unlink):
+            assert unlink is False
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("injected cudaHostUnregister failure")
+
+    receiver = SimpleNamespace(
+        snapshot_id=snapshot_id,
+        _grant={"arena_numa_node": 0},
+        _cross_numa=False,
+        mark_terminal=lambda result: terminal.append(result),
+    )
+    snapshot = Snapshot()
+    completion = {
+        "receiver": receiver,
+        "snapshot": snapshot,
+        "started_at": time.monotonic(),
+        "token_count": 1,
+        "byte_size": 128,
+        "worker_id": 0,
+        "host_copy_seconds": 0.0,
+        "gpu_elapsed_ms": 0.0,
+    }
+    loader = AgenticPToDHostLoadManager.__new__(AgenticPToDHostLoadManager)
+    loader._completion_lock = threading.RLock()
+    loader._group_pending = {}
+    loader._group_wakeup = threading.Event()
+    loader.decode_domain = 0
+    loader.numa_node = 0
+
+    assert loader._finish_h2d_success(completion) is False
+    assert loader._group_pending[snapshot_id] is completion
+    assert completion["snapshot"] is snapshot
+    assert terminal == []
+
+    assert loader._finish_h2d_success(completion) is True
+    assert snapshot_id not in loader._group_pending
+    assert "snapshot" not in completion
+    assert terminal == [KVPoll.Success]
+
+
 def test_tp_host_load_failure_does_not_count_unfenced_peer_as_drained():
     ledger_path = f"/dev/shm/sglang-p2d-unfenced-{time.time_ns()}.json"
     snapshot_id = p2d_snapshot_id(32)
@@ -307,6 +397,50 @@ def test_tp_host_load_failure_does_not_count_unfenced_peer_as_drained():
             os.unlink(ledger_path)
         except FileNotFoundError:
             pass
+
+
+def test_p2d_source_ready_failure_quarantines_without_publishing_terminal():
+    """An unprovable Prefill producer fence must retain P-HBM ownership."""
+
+    snapshot_id = "p2d:source-ready-failure"
+    transitions = []
+
+    class Snapshot:
+        def materialize(self):
+            return None
+
+    class FailedReadyEvent:
+        def synchronize(self):
+            raise RuntimeError("injected source-ready fence failure")
+
+    source_indices = object()
+    ready_event = FailedReadyEvent()
+    record = {
+        "snapshot": Snapshot(),
+        "source_indices": source_indices,
+        "source_ready_event": ready_event,
+    }
+    producer = AgenticPToDHostStagingManager.__new__(
+        AgenticPToDHostStagingManager
+    )
+    producer._stop = threading.Event()
+    producer._work = queue.SimpleQueue()
+    producer._work.put((snapshot_id, record))
+    producer._lock = threading.RLock()
+    producer._dma_quarantine = []
+    producer._active = {snapshot_id: record}
+    producer._results = {}
+    producer.ledger = SimpleNamespace(
+        transition=lambda *args, **kwargs: transitions.append((args, kwargs))
+    )
+
+    producer._worker(0, object(), object(), ())
+
+    assert transitions == []
+    assert producer._active[snapshot_id] is record
+    assert record["source_indices"] is source_indices
+    assert record["source_ready_event"] is ready_event
+    assert len(producer._dma_quarantine) == 1
 
 
 def test_tp_receiver_cancel_before_submit_is_group_fenced():
@@ -477,4 +611,124 @@ def test_real_cuda_p2d_host_round_trip():
             loader.close()
         if producer is not None:
             producer.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_real_cuda_d2p_pipelined_d2h_survives_source_release(monkeypatch):
+    """Double-bounce D2H publishes only after every CPU commit is durable."""
+
+    root = tempfile.mkdtemp(prefix="sglang-d2p-cuda-", dir="/dev/shm")
+    arena = None
+    try:
+        torch.cuda.set_device(0)
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_D2H_CHUNK_TOKENS", "16")
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS", "16")
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_D2H_INFLIGHT", "1")
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_D2H_BOUNCE_DEPTH", "2")
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_D2H_HOST_COPY_WORKERS", "1")
+        source = _TinyMHAPool()
+        token_count = 64
+        source_indices = torch.arange(
+            23, 23 + token_count, dtype=torch.int64, device="cuda"
+        )
+        expected_k = []
+        expected_v = []
+        for layer_id in range(source.layer_num):
+            values = torch.arange(
+                token_count * source.head_num * source.head_dim,
+                dtype=torch.float32,
+                device="cuda",
+            ).reshape(token_count, source.head_num, source.head_dim)
+            values += layer_id * 7000
+            source.k_buffer[layer_id][source_indices] = values.to(torch.bfloat16)
+            source.v_buffer[layer_id][source_indices] = (-values - 11).to(
+                torch.bfloat16
+            )
+            expected_k.append(source.k_buffer[layer_id][source_indices].cpu())
+            expected_v.append(source.v_buffer[layer_id][source_indices].cpu())
+
+        byte_size = (
+            2
+            * token_count
+            * source.layer_num
+            * source.head_num
+            * source.head_dim
+            * source.store_dtype.itemsize
+        )
+        arena = SharedHostSnapshotArena(
+            f"{root}/arena", 16 * 1024 * 1024, backend="memfd"
+        )
+        host_snapshot = arena.create(
+            "d2p-real:0", token_count, source, byte_size
+        )
+        ledger = SharedHostStagingLedger(f"{root}/ledger.json")
+        ledger.offer(
+            {
+                "snapshot_id": "d2p-real:0",
+                "request_id": "d2p-real",
+                "generation": 0,
+                "token_count": token_count,
+                "token_digest": "digest",
+                "byte_size": byte_size,
+                "storage_namespace": "d2p-real:0:",
+                "d_pid": os.getpid(),
+                "source_numa_node": 0,
+                "arena_numa_node": 0,
+                "arena_domain": 0,
+                "tp_rank": 0,
+                "tp_size": 1,
+            }
+        )
+        assert ledger.claim("d2p-real:0", "p0") is not None
+        assert ledger.publish_grants(
+            "d2p-real:0",
+            "p0",
+            [
+                {
+                    "kind": "shared_host_extent",
+                    "arena_path": host_snapshot.path,
+                    "arena_offset": host_snapshot.offset,
+                    "byte_size": byte_size,
+                    "token_count": token_count,
+                    "tp_rank": 0,
+                }
+            ],
+        )
+        client = AgenticDHostStagingClient(
+            ledger,
+            source,
+            1,
+            source_numa_node=0,
+            arena_numa_node=0,
+            arena_domain=0,
+        )
+        candidate = {
+            "manifest": SimpleNamespace(snapshot_id="d2p-real:0"),
+        }
+        deadline = time.monotonic() + 30
+        outcome = "waiting"
+        while outcome == "waiting" and time.monotonic() < deadline:
+            outcome = client.progress(candidate, source_indices)
+            time.sleep(0.001)
+        assert outcome == "host_ready"
+        assert ledger.get("d2p-real:0")["state"] == HostStageState.HOST_READY.value
+
+        # Model the scheduler releasing/reusing D HBM only after HOST_READY.
+        for layer_id in range(source.layer_num):
+            source.k_buffer[layer_id][source_indices] = 0
+            source.v_buffer[layer_id][source_indices] = 0
+        torch.cuda.synchronize()
+
+        host_snapshot.materialize()
+        for layer_id in range(source.layer_num):
+            torch.testing.assert_close(
+                host_snapshot.k_buffer[layer_id], expected_k[layer_id], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                host_snapshot.v_buffer[layer_id], expected_v[layer_id], rtol=0, atol=0
+            )
+    finally:
+        if arena is not None:
+            arena.close()
         shutil.rmtree(root, ignore_errors=True)

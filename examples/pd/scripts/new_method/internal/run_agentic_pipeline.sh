@@ -79,6 +79,7 @@ cleanup_pipeline() {
     # survive the experiment even though the GPU workers were stopped.
     deadline=$((
       SECONDS
+      + ${PD_FRONTEND_GRACEFUL_SHUTDOWN_SECONDS:-10}
       + ${PD_SERVICE_GRACEFUL_SHUTDOWN_SECONDS:-120}
       + ${PD_SERVICE_KILL_WAIT_SECONDS:-30}
       + ${PD_SERVICE_FINAL_KILL_WAIT_SECONDS:-60}
@@ -117,8 +118,14 @@ export SGLANG_AGENTIC_KV_D_HOSTLESS="${SGLANG_AGENTIC_KV_D_HOSTLESS:-true}"
 export SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB:-128}"
+export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_BACKEND="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_BACKEND:-memfd}"
+export SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA="${SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA:-1}"
+export SGLANG_AGENTIC_KV_REGISTER_WINDOW_GIB="${SGLANG_AGENTIC_KV_REGISTER_WINDOW_GIB:-8}"
+export SGLANG_AGENTIC_KV_REGISTER_CACHE_GIB="${SGLANG_AGENTIC_KV_REGISTER_CACHE_GIB:-64}"
+export SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA="${SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA:-0}"
 export SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH="${SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH:-${PD_P_READY_DIR}/early-claims/prefill-loads.json}"
 export SGLANG_AGENTIC_KV_P2D_HOST_STAGING="${SGLANG_AGENTIC_KV_P2D_HOST_STAGING:-false}"
+export SGLANG_AGENTIC_KV_P2D_HOST_ARENA_BACKEND="${SGLANG_AGENTIC_KV_P2D_HOST_ARENA_BACKEND:-memfd}"
 if [[ "${SGLANG_AGENTIC_KV_P2D_HOST_STAGING}" == "true" ]]; then
   export SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH
   export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR
@@ -149,20 +156,17 @@ export SGLANG_AGENTIC_KV_READY_TIMEOUT="${SGLANG_AGENTIC_KV_READY_TIMEOUT:-120}"
 export SGLANG_AGENTIC_KV_STALE_SECONDS="${SGLANG_AGENTIC_KV_STALE_SECONDS:-300}"
 export SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD="${SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD:-2.0}"
 export SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT="${SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT:-2.0}"
-# Split the fast-path deadline into the two phases required by the agentic
-# pipeline.  The first deadline classifies the tool as fast; only after the
-# parent turn actually returns does D start the P-admission deadline.  Once P
-# immediately allocates exact-size P pages from the arrival marker;
-# DIRECT_HANDSHAKE_TIMEOUT bounds receiver setup/DMA, not request scheduling.
+# The fast-tool window ends when the tool returns.  From that arrival onward,
+# DIRECT_HANDSHAKE_TIMEOUT is one shared budget for P admission plus Direct
+# receiver/transfer setup; a later P claim must not restart the clock.
 export SGLANG_AGENTIC_KV_EARLY_CLAIM="${SGLANG_AGENTIC_KV_EARLY_CLAIM:-true}"
-export SGLANG_AGENTIC_KV_EARLY_CLAIM_POST_TIMEOUT="${SGLANG_AGENTIC_KV_EARLY_CLAIM_POST_TIMEOUT:-${SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT}}"
 export SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK="${SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK:-0.85}"
 export SGLANG_AGENTIC_KV_DIRECT_MANIFEST_POLL_INTERVAL="${SGLANG_AGENTIC_KV_DIRECT_MANIFEST_POLL_INTERVAL:-0.10}"
 export SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT="${SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT:-4}"
 # Do not impose an artificial request/token credit on Prefill.  Native SGLang
-# admission remains the final HBM-safety boundary, while the waiting queue
-# still preserves Direct > slow recovery > new priority.  Experiments can
-# explicitly restore continuous/hysteresis backpressure through the env var.
+# admission remains the final HBM-safety boundary. Direct, Slow and new work
+# share native compute admission; only their physical I/O credits are separate.
+# Experiments can explicitly restore continuous/hysteresis backpressure.
 export SGLANG_PD_P_READY_BACKPRESSURE_MODE="${SGLANG_PD_P_READY_BACKPRESSURE_MODE:-disabled}"
 export SGLANG_PD_P_READY_REQUEST_CAP="${SGLANG_PD_P_READY_REQUEST_CAP:-0}"
 # Direct receives use exact-size full-workset allocations from ordinary P HBM.

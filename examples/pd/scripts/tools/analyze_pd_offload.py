@@ -290,6 +290,14 @@ def main() -> None:
         ),
         default=1,
     )
+    prefill_engine_count = max(
+        (
+            int(row.get("engine_count", 1))
+            for row in raw_metrics
+            if row.get("role") == "prefill"
+        ),
+        default=1,
+    )
 
     p_compute, counter_seconds = counter_delta(raw_metrics, "prefill", P_COMPUTE, start, end)
     # SGLang omits this series entirely when RadixCache is disabled.  That is
@@ -330,6 +338,7 @@ def main() -> None:
         "warmup_seconds": boundary["warmup_seconds"],
         "measurement_seconds": duration,
         "concurrency": boundary["state_at_measurement_start"]["active"],
+        "prefill_gpus": prefill_engine_count,
         "decode_gpus": decode_engine_count,
         "completed_agents": completed_count,
         "completion_rps": completed_count / duration,
@@ -396,7 +405,8 @@ def main() -> None:
     for axis in axes:
         axis.grid(alpha=0.2)
     fig.suptitle(
-        f"1P:{decode_engine_count}D c{summary['concurrency']}, page=64, Decode KV offload"
+        f"{prefill_engine_count}P:{decode_engine_count}D c{summary['concurrency']}, "
+        "page=64, Decode KV offload"
         f" — {completed_count} agents / {duration:.0f}s"
     )
     fig.tight_layout()

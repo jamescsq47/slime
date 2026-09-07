@@ -119,7 +119,7 @@ def test_decode_observes_arrival_then_removes_marker_without_credit_ledger():
         store.publish_arrival(request)
         manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
         manager.agentic_early_claim_store = store
-        manager.agentic_early_claim_post_timeout = 1.0
+        manager.agentic_direct_setup_timeout = 1.0
         manager.agentic_early_claim_poll_interval = 0.01
         manager.agentic_fast_threshold = 1.0
         candidate = {
@@ -157,7 +157,7 @@ def test_decode_rejects_arrival_outside_fast_tool_window():
         store.publish_arrival(request)
         manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
         manager.agentic_early_claim_store = store
-        manager.agentic_early_claim_post_timeout = 2.0
+        manager.agentic_direct_setup_timeout = 2.0
         manager.agentic_early_claim_poll_interval = 0.01
         manager.agentic_fast_threshold = 2.0
         candidate = {
@@ -209,6 +209,41 @@ def test_valid_tool_confirmation_is_generation_scoped():
         ) is None
         store.remove_tool(current)
         assert not store.tool_path(current).exists()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_direct_abort_marker_is_generation_and_claim_scoped():
+    directory = _directory()
+    try:
+        store = AgenticEarlyClaimStore(directory)
+        current = RequestGeneration("trajectory-direct-abort", 2)
+        previous = RequestGeneration("trajectory-direct-abort", 1)
+
+        published = store.publish_direct_abort(current, claim_id="direct:claim-2")
+        assert published["kind"] == "direct-abort"
+        assert published["claim_id"] == "direct:claim-2"
+        assert store.read_direct_abort(
+            current,
+            claim_id="direct:claim-2",
+            not_before=0.0,
+            max_age_seconds=5.0,
+        ) == published
+        assert store.read_direct_abort(
+            current,
+            claim_id="direct:another-claim",
+            not_before=0.0,
+            max_age_seconds=5.0,
+        ) is None
+        assert store.read_direct_abort(
+            previous,
+            claim_id="direct:claim-2",
+            not_before=0.0,
+            max_age_seconds=5.0,
+        ) is None
+
+        store.remove_direct_abort(current)
+        assert not store.direct_abort_path(current).exists()
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 

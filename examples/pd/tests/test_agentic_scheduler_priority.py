@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
 )
 from sglang.srt.managers.scheduler import (
     AgenticEarlyDirectReceive,
+    AgenticPWorksetLeaseBroker,
     Scheduler,
 )
 from sglang.srt.managers.schedule_policy import PrefillAdder
@@ -32,6 +33,26 @@ class _Req:
         self.rid = rid
         if queue_class is not None:
             self._agentic_kv_queue_class = queue_class
+
+
+def _direct_workset(request, parent_tokens, prompt_tokens, page_size=1):
+    broker = AgenticPWorksetLeaseBroker(page_size=page_size)
+    owner = broker.direct_owner(request.snapshot_id)
+    broker.request(
+        request.snapshot_id,
+        parent_tokens,
+        prompt_tokens,
+        owner=owner,
+    )
+    broker.service(
+        types.SimpleNamespace(
+            alloc=lambda count: torch.arange(count, dtype=torch.int64),
+            free=lambda _indices: None,
+        )
+    )
+    lease = broker.get(request.snapshot_id, owner=owner)
+    assert lease is not None
+    return broker, lease
 
 
 def test_new_method_forces_custom_storage_only_and_baseline_clears_it():
@@ -363,16 +384,19 @@ def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
         direct_room=7,
         claim_id="claim",
     )
+    broker, lease = _direct_workset(request, len(tokens), len(tokens) + 1)
     entry = AgenticEarlyDirectReceive(
         request=request,
         manifest=manifest,
         claim_id="claim",
         receiver=object(),
-        device_indices=torch.tensor([21, 22, 23, 24]),
+        device_indices=lease.parent_indices,
         started_at=time.monotonic(),
         arrived_at=time.time(),
+        workset_lease=lease,
         completed_at=time.monotonic(),
     )
+    scheduler.agentic_p_workset_broker = broker
     scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
     scheduler.agentic_early_direct_terminal = {}
     inserted = []
@@ -391,6 +415,14 @@ def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
     scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
         free=lambda indices: None
     )
+    received = types.SimpleNamespace(state=SnapshotState.P_RECEIVED)
+    scheduler._agentic_snapshot_store = types.MethodType(
+        lambda self: types.SimpleNamespace(
+            load=lambda *_args, **_kwargs: received,
+            commit_direct_bound=lambda *_args, **_kwargs: None,
+        ),
+        scheduler,
+    )
     req = _Req("tokenized-child")
     req.origin_input_ids = tokens + [99]
     req.extra_key = "cache-salt"
@@ -405,7 +437,7 @@ def test_completed_early_direct_binds_only_when_tokenized_req_arrives():
     assert request.snapshot_id not in scheduler.agentic_early_direct_receives
 
 
-def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
+def test_completed_direct_hands_pre_reserved_complete_workset_to_request():
     scheduler = Scheduler.__new__(Scheduler)
     request = RequestGeneration("trajectory-direct-transit", 0)
     tokens = list(range(64))
@@ -420,26 +452,22 @@ def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
         direct_room=8,
         claim_id="claim",
     )
-    allocation = types.SimpleNamespace(allocated_tokens=64, token_count=64)
-    ordinary_replacement = torch.arange(640, 704, dtype=torch.int64)
+    broker, lease = _direct_workset(request, 64, 65, page_size=64)
     entry = AgenticEarlyDirectReceive(
         request=request,
         manifest=manifest,
         claim_id="claim",
         receiver=object(),
-        device_indices=torch.arange(64, dtype=torch.int64),
+        device_indices=lease.parent_indices,
         started_at=time.monotonic(),
         arrived_at=time.time(),
-        credit_allocation=allocation,
-        ordinary_replacement_indices=ordinary_replacement,
+        workset_lease=lease,
         completed_at=time.monotonic(),
     )
+    scheduler.agentic_p_workset_broker = broker
     scheduler.agentic_early_direct_receives = {request.snapshot_id: entry}
     scheduler.agentic_early_direct_terminal = {}
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
-    scheduler.agentic_direct_ordinary_reserved_tokens = int(
-        ordinary_replacement.numel()
-    )
     inserted = []
     scheduler.tree_cache = types.SimpleNamespace(
         insert=lambda params: (
@@ -448,7 +476,7 @@ def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
     )
     scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
         alloc=lambda _tokens: (_ for _ in ()).throw(
-            AssertionError("ordinary pages must be reserved before Direct claim")
+            AssertionError("complete workset must be reserved before Direct claim")
         ),
         free=lambda _indices: None,
     )
@@ -459,15 +487,13 @@ def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
         last_device_node=parent_node,
     )
     scheduler.tree_cache.inc_lock_ref = lambda node: locks.append(node)
-    promoted = []
-    scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
-        promote_to_ordinary=lambda alloc, replacement: promoted.append(
-            (alloc, replacement)
+    received = types.SimpleNamespace(state=SnapshotState.P_RECEIVED)
+    scheduler._agentic_snapshot_store = types.MethodType(
+        lambda self: types.SimpleNamespace(
+            load=lambda *_args, **_kwargs: received,
+            commit_direct_bound=lambda *_args, **_kwargs: None,
         ),
-        mark_bound=lambda _alloc: (_ for _ in ()).throw(
-            AssertionError("successful ownership swap must not stay reserve-owned")
-        ),
-        free_tokens=0,
+        scheduler,
     )
     req = _Req("tokenized-direct-transit")
     req.origin_input_ids = tokens + [999]
@@ -476,9 +502,9 @@ def test_completed_direct_uses_pre_reserved_ordinary_pages_for_ownership_swap():
 
     assert scheduler._agentic_bind_early_direct_receive(req, request) is False
     assert len(inserted) == 1
-    assert promoted == [(allocation, ordinary_replacement)]
     assert locks == [parent_node]
-    assert not hasattr(req, "_agentic_direct_credit_allocation")
+    assert req._agentic_p_workset_lease is lease
+    assert req._agentic_workset_suffix_indices.numel() == 64
     assert req._agentic_direct_parent_pin_node is parent_node
     assert request.snapshot_id not in scheduler.agentic_early_direct_receives
 
@@ -537,28 +563,23 @@ def test_inotify_arrivals_are_deduplicated_then_admitted_from_fifo(monkeypatch):
     payload = {
         "arrived_at": time.time(),
         "target_prefill_domain": 1,
+        "prompt_token_count": 1536,
     }
     scheduler.agentic_early_direct_arrival_watcher = types.SimpleNamespace(
         poll=lambda _timeout: [(request, payload), (request, payload)]
     )
     scheduler.agentic_early_direct_admission_queue = deque()
     scheduler.agentic_early_direct_admission_ids = set()
-    scheduler.agentic_early_direct_reservation_queue = deque()
-    scheduler.agentic_early_direct_reserved_queue = deque()
     scheduler.agentic_early_direct_receives = {}
     scheduler.agentic_early_direct_terminal = {}
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
-    scheduler.agentic_direct_ordinary_reserved_tokens = 0
-    allocation = types.SimpleNamespace(allocated_tokens=1024)
-    scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
-        allocate=lambda tokens: allocation if tokens == 1024 else None,
-        release=lambda _allocation: None,
-    )
-    scheduler.server_args = types.SimpleNamespace(page_size=64)
-    ordinary = torch.arange(1024, dtype=torch.int64)
-    scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
-        alloc=lambda tokens: ordinary if tokens == 1024 else None,
-        free=lambda _indices: None,
+    lease = object()
+    scheduler.agentic_p_workset_broker = types.SimpleNamespace(
+        owner_is_superseded=lambda *_args, **_kwargs: False,
+        request=lambda *_args, **_kwargs: True,
+        get=lambda *_args, **_kwargs: lease,
+        cancel_unstarted=lambda *_args, **_kwargs: True,
+        request_release=lambda *_args, **_kwargs: True,
     )
     manifest = types.SimpleNamespace(
         request=request,
@@ -591,59 +612,56 @@ def test_inotify_arrivals_are_deduplicated_then_admitted_from_fifo(monkeypatch):
     )
 
     assert not scheduler.agentic_early_direct_admission_queue
-    assert len(scheduler.agentic_early_direct_reservation_queue) == 1
-
-    scheduler._agentic_reserve_queued_direct_pages()
-    assert len(scheduler.agentic_early_direct_reserved_queue) == 1
-    scheduler._agentic_start_reserved_direct_receives(snapshot_store)
-
     assert admitted[0][0] == request
-    assert admitted[0][1]["credit_allocation"] is allocation
-    assert admitted[0][1]["ordinary_replacement_indices"] is ordinary
-    assert not scheduler.agentic_early_direct_reserved_queue
+    assert admitted[0][1]["workset_lease"] is lease
     assert request.snapshot_id not in scheduler.agentic_early_direct_admission_ids
 
 
-def test_early_direct_ordinary_reservation_failure_never_claims():
+def test_early_direct_waits_in_fifo_until_complete_workset_is_granted():
     scheduler = Scheduler.__new__(Scheduler)
     request = RequestGeneration("trajectory-no-ordinary-space", 0)
-    manifest = types.SimpleNamespace(token_count=1024)
-    allocation = object()
-    released = []
-    scheduler.server_args = types.SimpleNamespace(page_size=64)
-    scheduler.agentic_direct_credit_pool = types.SimpleNamespace(
-        allocate=lambda _tokens: allocation,
-        release=lambda value: released.append(value),
+    payload = {
+        "arrived_at": time.time(),
+        "prompt_token_count": 1536,
+    }
+    manifest = types.SimpleNamespace(
+        request=request,
+        token_count=1024,
+        created_at=payload["arrived_at"],
+        state=SnapshotState.DIRECT_READY,
     )
-    scheduler.token_to_kv_pool_allocator = types.SimpleNamespace(
-        alloc=lambda _tokens: None
+    requested = []
+    scheduler.agentic_p_workset_broker = types.SimpleNamespace(
+        owner_is_superseded=lambda *_args, **_kwargs: False,
+        request=lambda *args, **kwargs: requested.append((args, kwargs)),
+        get=lambda *_args, **_kwargs: None,
     )
     scheduler.agentic_early_direct_poll_lock = threading.RLock()
-    scheduler.agentic_early_direct_reservation_queue = deque(
-        [(request, manifest, time.time(), 0)]
+    scheduler.agentic_early_direct_admission_queue = deque(
+        [(request, payload, manifest)]
     )
-    scheduler.agentic_early_direct_reserved_queue = deque()
     scheduler.agentic_early_direct_admission_ids = {request.snapshot_id}
+    scheduler.agentic_early_direct_receives = {}
+    scheduler.agentic_early_direct_terminal = {}
 
-    scheduler._agentic_reserve_queued_direct_pages()
+    scheduler._agentic_admit_queued_direct_receives(
+        types.SimpleNamespace(load=lambda *_args, **_kwargs: manifest),
+        direct_timeout=2.0,
+        poll_lock=scheduler.agentic_early_direct_poll_lock,
+    )
 
-    assert released == [allocation]
-    assert not scheduler.agentic_early_direct_reserved_queue
-    assert request.snapshot_id not in scheduler.agentic_early_direct_admission_ids
+    assert len(requested) == 1
+    assert len(scheduler.agentic_early_direct_admission_queue) == 1
+    assert request.snapshot_id in scheduler.agentic_early_direct_admission_ids
 
 
-def test_early_direct_pages_are_counted_as_transport_reservation():
+def test_workset_pages_are_counted_as_transport_reservation():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.agentic_host_staging_manager = None
     scheduler.decode_offload_manager = None
-    scheduler.agentic_early_direct_receives = {
-        "a": types.SimpleNamespace(
-            manifest=types.SimpleNamespace(token_count=640)
-        ),
-        "b": types.SimpleNamespace(
-            manifest=types.SimpleNamespace(token_count=1024)
-        ),
-    }
+    scheduler.agentic_p_workset_broker = types.SimpleNamespace(
+        unaccounted_tokens=1664
+    )
 
     assert scheduler._agentic_reserved_tokens() == 1664
 
@@ -754,7 +772,7 @@ def test_final_manifest_recomputes_without_ready_timeout(monkeypatch):
     assert req._agentic_kv_fallback == "final"
 
 
-def test_missing_parent_wait_uses_request_level_ready_timeout(monkeypatch):
+def test_missing_parent_timeout_warns_but_retains_parent(monkeypatch):
     monkeypatch.setenv("SGLANG_AGENTIC_KV_READY_TIMEOUT", "120")
     monkeypatch.setenv("SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT", "2")
     monkeypatch.setenv("SGLANG_AGENTIC_KV_HOST_TRANSITION_GRACE", "8")
@@ -794,8 +812,9 @@ def test_missing_parent_wait_uses_request_level_ready_timeout(monkeypatch):
     expired._agentic_kv_gate_complete = False
     assert scheduler._agentic_should_defer(
         expired, time.monotonic() - 121.0
-    ) is False
-    assert expired._agentic_kv_fallback == "timeout:missing"
+    ) is True
+    assert expired._agentic_parent_missing_warned is True
+    assert expired._agentic_kv_gate_complete is False
 
 
 def test_direct_loading_parent_waits_instead_of_recomputing(monkeypatch):
@@ -833,7 +852,7 @@ def test_direct_loading_parent_waits_instead_of_recomputing(monkeypatch):
     assert waiting._agentic_kv_gate_complete is False
 
 
-def test_ready_merge_is_stable_fast_then_slow_then_new():
+def test_ready_merge_preserves_native_order_across_kv_sources():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.waiting_queue = [
         _Req("new-old"),
@@ -844,16 +863,16 @@ def test_ready_merge_is_stable_fast_then_slow_then_new():
         [_Req("new-new"), _Req("fast-new", "fast"), _Req("slow-new", "slow")]
     )
     assert [req.rid for req in scheduler.waiting_queue] == [
-        "fast-old",
-        "fast-new",
-        "slow-old",
-        "slow-new",
         "new-old",
+        "slow-old",
+        "fast-old",
         "new-new",
+        "fast-new",
+        "slow-new",
     ]
 
 
-def test_priority_is_restored_after_generic_policy_sort():
+def test_generic_policy_order_is_not_overridden_by_kv_source():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.waiting_queue = [
         _Req("new"),
@@ -861,7 +880,7 @@ def test_priority_is_restored_after_generic_policy_sort():
         _Req("fast", "fast"),
     ]
     scheduler._prioritize_agentic_prefill_ready()
-    assert [req.rid for req in scheduler.waiting_queue] == ["fast", "slow", "new"]
+    assert [req.rid for req in scheduler.waiting_queue] == ["new", "slow", "fast"]
 
 
 def test_prefill_scheduler_publishes_atomic_acceptance_marker(monkeypatch, tmp_path):
@@ -881,6 +900,7 @@ def test_initial_request_enters_metadata_only_new_queue(monkeypatch):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.disaggregation_mode = scheduler_module.DisaggregationMode.PREFILL
     scheduler.agentic_kv_waiting_queue = []
+    scheduler.agentic_tp_prefill_sequence = 0
     req = _Req("initial-request")
     req._agentic_kv_gate_complete = False
     monkeypatch.delenv("SGLANG_PD_P_READY_DIR", raising=False)
@@ -1052,29 +1072,30 @@ def test_mooncake_claim_consumes_selected_io_slot(monkeypatch):
     assert admitted == ["claimed"]
 
 
-def test_stale_shared_host_gate_falls_back_at_ready_timeout(monkeypatch):
+def test_stale_shared_host_gate_warns_but_retains_authoritative_parent(monkeypatch):
     monkeypatch.setenv("SGLANG_AGENTIC_KV_READY_TIMEOUT", "0.01")
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.agentic_host_staging_manager = types.SimpleNamespace(
         loads={},
-        gate_request=lambda req, parent, allow_start=True: True,
+        gate_request=lambda req, parent, **kwargs: True,
         snapshot_ready=lambda parent: False,
     )
     req = _Req("stale-shared-host", "slow")
     req._agentic_kv_gate_complete = False
+    parent = RequestGeneration("stale-shared-host-parent", 0)
     monkeypatch.setattr(
         scheduler_module.AgenticRequestMetadata,
         "from_req",
-        lambda req: types.SimpleNamespace(parent=object()),
+        lambda req: types.SimpleNamespace(parent=parent),
     )
 
     deferred = scheduler._agentic_should_defer(
         req, time.monotonic() - 1.0, allow_start_io=True
     )
 
-    assert deferred is False
-    assert req._agentic_kv_gate_complete is True
-    assert req._agentic_kv_fallback == "timeout:shared_host"
+    assert deferred is True
+    assert req._agentic_kv_gate_complete is False
+    assert req._agentic_host_wait_warned is True
 
 
 def test_ready_shared_host_snapshot_does_not_timeout_while_queued(monkeypatch):
@@ -1082,7 +1103,7 @@ def test_ready_shared_host_snapshot_does_not_timeout_while_queued(monkeypatch):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.agentic_host_staging_manager = types.SimpleNamespace(
         loads={},
-        gate_request=lambda req, parent, allow_start=True: True,
+        gate_request=lambda req, parent, **kwargs: True,
         snapshot_ready=lambda parent: True,
     )
     req = _Req("ready-shared-host", "slow")
@@ -1101,10 +1122,9 @@ def test_ready_shared_host_snapshot_does_not_timeout_while_queued(monkeypatch):
     assert req._agentic_kv_gate_complete is False
 
 
-def test_fast_io_preempts_aged_slow_without_extra_concurrency(monkeypatch):
+def test_metadata_io_admission_uses_arrival_order(monkeypatch):
     monkeypatch.setenv("SGLANG_AGENTIC_KV_ADMISSION_BATCH", "1")
     monkeypatch.setenv("SGLANG_AGENTIC_KV_SELECTED_IO_CAP", "1")
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "2")
     scheduler = Scheduler.__new__(Scheduler)
     fast = _Req("fresh-fast", "fast")
     slow = _Req("aged-slow", "slow")
@@ -1122,13 +1142,11 @@ def test_fast_io_preempts_aged_slow_without_extra_concurrency(monkeypatch):
     scheduler._agentic_should_defer = types.MethodType(should_defer, scheduler)
     scheduler._drain_agentic_kv_waiting_queue()
 
-    # The fast request is inspected first.  Because it does not start I/O,
-    # the scheduler remains work-conserving and uses the slot for slow work.
-    assert calls == [("fresh-fast", True), ("aged-slow", True)]
+    # The older Slow request is selected first; KV source is not a priority.
+    assert calls == [("aged-slow", True)]
 
 
-def test_compute_priority_remains_fast_slow_new_despite_age(monkeypatch):
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "2")
+def test_compute_admission_preserves_native_order_across_sources(monkeypatch):
     scheduler = Scheduler.__new__(Scheduler)
     aged = _Req("aged", "slow")
     aged._agentic_kv_wait_started_at = time.monotonic() - 3
@@ -1141,16 +1159,14 @@ def test_compute_priority_remains_fast_slow_new_despite_age(monkeypatch):
     scheduler._prioritize_agentic_prefill_ready()
 
     assert [req.rid for req in scheduler.waiting_queue] == [
-        "fast",
-        "fresh",
-        "aged",
         "new",
+        "fresh",
+        "fast",
+        "aged",
     ]
 
 
-def test_new_compute_stays_after_fast_and_slow_despite_age(monkeypatch):
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_SLOW_AGING_SECONDS", "2")
-    monkeypatch.setenv("SGLANG_AGENTIC_KV_NEW_AGING_SECONDS", "10")
+def test_new_compute_is_not_demoted_by_kv_source(monkeypatch):
     scheduler = Scheduler.__new__(Scheduler)
     aged_new = _Req("aged-new")
     aged_new._agentic_kv_wait_started_at = time.monotonic() - 11
@@ -1164,10 +1180,10 @@ def test_new_compute_stays_after_fast_and_slow_despite_age(monkeypatch):
     scheduler._prioritize_agentic_prefill_ready()
 
     assert [req.rid for req in scheduler.waiting_queue] == [
-        "fast",
-        "slow",
         "fresh-new",
+        "slow",
         "aged-new",
+        "fast",
     ]
 
 
@@ -1233,11 +1249,11 @@ def test_p_ready_hysteresis_does_not_resume_above_token_cap(monkeypatch):
     scheduler.disagg_prefill_inflight_queue = [ready]
 
     # HBM is below the low watermark, but the independent completed-token
-    # credit is still exceeded, so ordinary New work must remain paused.
+    # credit is still exceeded, so compute admission remains paused.
     assert scheduler._should_throttle_p_ready_compute_ahead() is True
 
 
-def test_p_ready_soft_cap_holds_new_but_runs_direct(monkeypatch):
+def test_p_ready_soft_cap_is_class_neutral(monkeypatch):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.running_batch = types.SimpleNamespace(batch_is_full=True)
     scheduler.chunked_req = None
@@ -1256,5 +1272,19 @@ def test_p_ready_soft_cap_holds_new_but_runs_direct(monkeypatch):
     batch = scheduler.get_next_disagg_prefill_batch_to_run()
 
     assert batch is None
-    assert observed == [["direct"]]
-    assert [req.rid for req in scheduler.waiting_queue] == ["direct", "new"]
+    assert observed == []
+    assert [req.rid for req in scheduler.waiting_queue] == ["new", "direct"]
+
+
+def test_p_ready_token_credit_charge_is_class_neutral():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.page_size = 64
+
+    charges = []
+    for queue_class in (None, "fast", "slow"):
+        req = _Req(f"req-{queue_class}", queue_class)
+        req.fill_ids = list(range(65))
+        charges.append(scheduler._p_ready_protected_token_charge(req, 1024))
+
+    assert charges == [128, 128, 128]
+    assert scheduler._p_ready_protected_token_charge(req, None) == 0

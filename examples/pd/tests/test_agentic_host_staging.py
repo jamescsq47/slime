@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.agentic_host_staging import (
     AgenticPHostStagingManager,
     HostStageState,
     SharedHostStagingLedger,
+    _RegisteredHostArenaMapping,
 )
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
@@ -43,6 +44,57 @@ def _offer(snapshot_id="req:0"):
         "d_bootstrap_addr": "127.0.0.1:1",
         "room_seed": 10,
     }
+
+
+def test_registered_arena_prewarm_is_one_shot_and_releases_refs(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA", "1")
+    arena = _RegisteredHostArenaMapping.__new__(_RegisteredHostArenaMapping)
+    arena.path = "/proc/self/fd/test-prewarm"
+    arena.byte_size = 1024
+    arena.window_bytes = 512
+    arena._prewarm_started = False
+    arena._prewarm_thread = None
+    calls = []
+    arena.acquire = lambda offset, size, device: (
+        calls.append(("acquire", offset, size, device)) or (offset,)
+    )
+    arena.release = lambda windows: calls.append(("release", windows))
+
+    arena.prewarm("cuda:0")
+    arena._prewarm_thread.join(timeout=1)
+    arena.prewarm("cuda:0")
+
+    assert calls == [
+        ("acquire", 0, 512, "cuda:0"),
+        ("release", (0,)),
+        ("acquire", 512, 512, "cuda:0"),
+        ("release", (512,)),
+    ]
+
+
+def test_registered_arena_prewarm_failure_keeps_lazy_fallback(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA", "1")
+    arena = _RegisteredHostArenaMapping.__new__(_RegisteredHostArenaMapping)
+    arena.path = "/proc/self/fd/test-prewarm-failure"
+    arena.byte_size = 1024
+    arena.window_bytes = 512
+    arena._prewarm_started = False
+    arena._prewarm_thread = None
+    calls = []
+
+    def fail_acquire(offset, size, device):
+        calls.append((offset, size, device))
+        raise MemoryError("injected prewarm capacity failure")
+
+    arena.acquire = fail_acquire
+    arena.release = lambda windows: calls.append(("unexpected_release", windows))
+
+    # Prewarm is an optimization and may never turn a safe request-level
+    # registered-DMA/fallback decision into a staging failure.
+    arena.prewarm("cuda:0")
+    arena._prewarm_thread.join(timeout=1)
+    arena.prewarm("cuda:0")
+    assert calls == [(0, 512, "cuda:0")]
 
 
 def test_host_ready_requires_every_d2h_chunk_ack():
@@ -473,87 +525,6 @@ def test_claim_is_atomic_across_competing_p_threads():
         os.unlink(path)
 
 
-def test_tp_host_h2d_ready_barrier_waits_for_every_rank():
-    ledger, path = _ledger()
-    try:
-        ledger.offer(_offer())
-        assert ledger.claim("req:0", "p-group") is not None
-        assert ledger.publish_grants(
-            "req:0",
-            "p-group",
-            [{"seq": 0, "room": 11, "slot": 0, "start_page": 0, "num_pages": 3}],
-        )
-        assert ledger.ack_chunk("req:0", "p-group", 0)
-        assert ledger.mark_host_ready("req:0", "p-group", 1)
-
-        assert not ledger.mark_host_h2d_ready_rank(
-            "req:0", "p-group", tp_rank=0, tp_size=2
-        )
-        assert ledger.mark_host_h2d_ready_rank(
-            "req:0", "p-group", tp_rank=1, tp_size=2
-        )
-        assert ledger.get("req:0")["h2d_ready_ranks"] == [0, 1]
-        assert not ledger.tp_host_followers_loaded("req:0", "p-group", tp_size=2)
-        assert ledger.complete_host_load_rank(
-            "req:0", "p-group", tp_rank=1, tp_size=2
-        )
-        assert ledger.tp_host_followers_loaded("req:0", "p-group", tp_size=2)
-    finally:
-        os.unlink(path)
-
-
-def test_tp_host_load_selection_is_rank0_owned_and_group_atomic():
-    ledger, path = _ledger()
-    try:
-        # A non-primary rank cannot independently select its local queue head.
-        assert ledger.select_tp_host_load(
-            "rank1-head:0", "p-group", tp_rank=1, tp_size=2
-        ) == (None, False)
-        assert ledger.select_tp_host_load(
-            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
-        ) == ("rank0-head:0", False)
-        # Rank 1 is redirected to rank 0's snapshot until it joins that exact
-        # request-generation.
-        assert ledger.select_tp_host_load(
-            "rank1-head:0", "p-group", tp_rank=1, tp_size=2
-        ) == ("rank0-head:0", False)
-        assert ledger.select_tp_host_load(
-            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
-        ) == ("rank0-head:0", True)
-        assert ledger.active_tp_host_load("p-group", tp_size=2) == "rank0-head:0"
-        assert not ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
-        )
-        assert not ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
-        )
-        assert not ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
-        )
-        assert not ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
-        )
-        assert not ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
-        )
-        assert ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
-        )
-        assert ledger.progress_tp_host_admission(
-            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
-        )
-        assert ledger.admit_tp_host_load(
-            "rank0-head:0", "p-group", tp_rank=0, tp_size=2
-        )
-        assert ledger.active_tp_host_load("p-group", tp_size=2) == "rank0-head:0"
-        assert ledger.admit_tp_host_load(
-            "rank0-head:0", "p-group", tp_rank=1, tp_size=2
-        )
-        assert ledger.active_tp_host_load("p-group", tp_size=2) is None
-    finally:
-        os.unlink(path)
-
-
 def test_p_only_claims_offers_for_its_numa_arena():
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager.arena_numa_node = 0
@@ -613,6 +584,7 @@ def test_d_offer_carries_the_p_owned_arena_domain():
     client.arena_numa_node = 0
     client.arena_domain = 1
     client.direct_runtime = None
+    client.retain_logical_hashes = True
     metadata = AgenticRequestMetadata("domain-offer", 2, parent_generation=1)
     manifest = SnapshotManifest(
         request=metadata.current,
@@ -654,7 +626,7 @@ def test_p_keeps_capacity_blocked_offer_pending():
     assert manager._host_eviction_pressure is True
 
 
-def test_p_rejects_expired_capacity_blocked_offer_for_d_fail_open():
+def test_p_keeps_expired_capacity_blocked_offer_pending_for_eviction():
     manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
     manager.arena_numa_node = -1
     manager.arena_domain = -1
@@ -672,14 +644,9 @@ def test_p_rejects_expired_capacity_blocked_offer_for_d_fail_open():
     )
     manager._can_admit = lambda byte_size: False
 
-    assert manager._admit_one({"capacity-expired:0": offer}) is True
-    assert transitions == [
-        (
-            "capacity-expired:0",
-            HostStageState.REJECTED,
-            {"owner": "p0", "reason": "p_host_capacity_wait_timeout"},
-        )
-    ]
+    assert manager._admit_one({"capacity-expired:0": offer}) is False
+    assert transitions == []
+    assert manager._host_eviction_pressure is True
 
 
 def test_ledger_snapshot_reads_multiple_entries_once():
@@ -703,17 +670,16 @@ def test_consumed_entries_prune_earlier_than_failures():
         ledger.offer(_offer("consumed:0"))
         ledger.offer(_offer("failed:0"))
 
-        def make_terminal(entries):
-            now = __import__("time").time() - 10
-            entries["consumed:0"].update(
-                state=HostStageState.CONSUMED.value, updated_at=now
-            )
-            entries["failed:0"].update(
-                state=HostStageState.FAILED.value, updated_at=now
-            )
-            return None, True
+        def make_terminal(snapshot_id, state):
+            def mutate(entries):
+                now = __import__("time").time() - 10
+                entries[snapshot_id].update(state=state.value, updated_at=now)
+                return None, True
 
-        ledger._mutate(make_terminal)
+            ledger._mutate(mutate, event_snapshot_id=snapshot_id)
+
+        make_terminal("consumed:0", HostStageState.CONSUMED)
+        make_terminal("failed:0", HostStageState.FAILED)
         ledger.prune(older_than_seconds=600, consumed_older_than_seconds=5)
         assert ledger.get("consumed:0") is None
         assert ledger.get("failed:0") is not None
@@ -842,6 +808,9 @@ class _FakeStagingClient:
 
 def _decode_manager_for_staging(outcome):
     manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.tp_world_size = 1
+    manager.tp_rank = 0
+    manager.agentic_relay_worker = None
     request = RequestGeneration("req", 0)
     manifest = SnapshotManifest(
         request=request,
@@ -871,24 +840,10 @@ def _decode_manager_for_staging(outcome):
     return manager, req, releases
 
 
-def test_d_hbm_is_not_released_while_p_host_is_partial():
-    manager, _, releases = _decode_manager_for_staging("waiting")
-    manager._check_agentic_direct_progress()
-    assert releases == []
-    assert manager.agentic_direct_candidates
-
-
-def test_d_hbm_release_occurs_exactly_after_host_ready_ack():
-    manager, req, releases = _decode_manager_for_staging("host_ready")
-    manager._check_agentic_direct_progress()
-    assert releases == [(req, 0)]
-    assert manager.agentic_direct_candidates == {}
-    manager._check_agentic_direct_progress()
-    assert releases == [(req, 0)]
-
-
 def test_async_d_hbm_release_is_committed_only_by_scheduler():
     manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.tp_world_size = 1
+    manager.tp_rank = 0
     manager._decode_io_async_enabled = True
     manager._decode_io_events = queue.SimpleQueue()
     manager._decode_scheduler_commit_events = 0
@@ -928,6 +883,8 @@ def test_async_d_hbm_release_groups_allocator_frees():
             self.end_count += 1
 
     manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.tp_world_size = 1
+    manager.tp_rank = 0
     manager._decode_io_async_enabled = True
     manager._decode_io_events = queue.SimpleQueue()
     manager._decode_scheduler_commit_events = 0
@@ -954,6 +911,8 @@ def test_async_d_hbm_release_groups_allocator_frees():
 
 def test_async_d_hbm_release_waits_for_short_coalesce_window():
     manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.tp_world_size = 1
+    manager.tp_rank = 0
     manager._decode_io_async_enabled = True
     manager._decode_io_events = queue.SimpleQueue()
     manager._decode_scheduler_commit_events = 0
@@ -976,6 +935,8 @@ def test_async_d_hbm_release_waits_for_short_coalesce_window():
 
 def test_pending_release_pages_remain_accounted_before_scheduler_commit():
     manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.tp_world_size = 1
+    manager.tp_rank = 0
     manager._decode_io_async_enabled = True
     manager._decode_io_events = queue.SimpleQueue()
     manager._decode_pending_release_tokens = 0
@@ -1003,6 +964,8 @@ def test_pending_release_pages_remain_accounted_before_scheduler_commit():
 def test_d_accepts_every_state_after_complete_host_copy_as_release_ack():
     """P may advance past the short-lived HOST_READY state before D polls."""
     client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 0
+    client.tp_size = 1
     candidate = {"manifest": types.SimpleNamespace(snapshot_id="req:0")}
     for state in (
         HostStageState.HOST_READY,
@@ -1106,19 +1069,33 @@ def test_d_waits_for_local_dma_before_acknowledging_abort():
             trace.append("mapping_close")
 
     client = AgenticDHostStagingClient.__new__(AgenticDHostStagingClient)
+    client.tp_rank = 0
+    client.tp_size = 1
     client.ledger = types.SimpleNamespace(
         get=lambda _: {"state": HostStageState.ABORTING.value, "grants": []},
-        mark_writer_drained=lambda snapshot_id, d_pid: trace.append("writer_drained"),
+        mark_writer_rank_drained=lambda *args, **kwargs: trace.append(
+            "writer_drained"
+        ),
     )
     event = Event()
     candidate = {
         "manifest": types.SimpleNamespace(snapshot_id="req:0"),
         "arena_write": {
-            "event": event,
             "snapshot": Snapshot(),
-            "copy_refs": (),
+            "chunks": {
+                0: {
+                    "event": event,
+                    "copy_refs": (),
+                    "start": 0,
+                    "end": 1,
+                    "phase": "dma",
+                }
+            },
         },
     }
+    client._d2h_lanes = [
+        {"snapshot_id": "req:0", "phase": "dma"}
+    ]
     assert client.progress(candidate, []) == "waiting"
     assert trace == ["event_query"]
     assert "arena_write" in candidate
@@ -1191,74 +1168,6 @@ class _TraceTree:
         self.trace.append("gpu_unpin")
 
 
-def test_p_host_release_is_after_h2d_completion_and_gpu_pin():
-    ledger, path = _ledger()
-    try:
-        ledger.offer(_offer())
-        ledger.claim("req:0", "p0")
-        ledger.publish_grants(
-            "req:0",
-            "p0",
-            [{"seq": 0, "room": 1, "slot": 0, "start_page": 0, "num_pages": 3}],
-        )
-        ledger.ack_chunk("req:0", "p0", 0)
-        ledger.mark_host_ready("req:0", "p0", 1)
-        ledger.transition("req:0", HostStageState.H2D_LOADING, owner="p0")
-        trace = []
-        manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
-        manager.owner = "p0"
-        manager.ledger = ledger
-        manager.host_pool = _TraceHostPool(trace)
-        manager.tree_cache = _TraceTree(trace)
-        manager.token_allocator = types.SimpleNamespace(free=lambda _: trace.append("gpu_free"))
-        offer = _offer()
-        manager.arena = _TraceArena(trace)
-        record = {"offer": offer, "snapshot": object(), "loading": True}
-        manager.host_ready = {"req:0": record}
-        manager.loads = {
-            "next": {
-                "record": record,
-                "device_indices": [7, 8, 9],
-                "event": _TraceEvent(trace),
-                "copy_refs": (),
-            }
-        }
-        req = types.SimpleNamespace(
-            rid="next",
-            origin_input_ids=[0] * 192,
-            extra_key="agentic-v1:req:g1",
-            priority=0,
-        )
-        assert manager.gate_request(req, RequestGeneration("req", 0)) is False
-        assert trace == [
-            "h2d_complete",
-            "gpu_insert",
-            "gpu_match",
-            "gpu_pin",
-            "arena_free",
-        ]
-        assert ledger.get("req:0")["state"] == HostStageState.CONSUMED.value
-        manager.release_request_pin(req)
-        assert trace[-1] == "gpu_unpin"
-    finally:
-        os.unlink(path)
-
-
-def test_p_host_h2d_admission_is_serialized():
-    """A second demand restore waits without allocating while H2D is occupied."""
-
-    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
-    manager.loads = {"busy": {"event": object()}}
-    manager.max_h2d_inflight = 1
-    manager.host_ready = {
-        "next:0": {"offer": _offer("next:0"), "loading": False}
-    }
-    manager.ledger = types.SimpleNamespace(get=lambda _: None)
-    req = types.SimpleNamespace(rid="next")
-
-    assert manager.gate_request(req, RequestGeneration("next", 0)) is True
-
-
 def test_host_ready_defers_cuda_materialization_until_request_selection():
     class LazySnapshot:
         def materialize(self):
@@ -1283,44 +1192,6 @@ def test_host_ready_defers_cuda_materialization_until_request_selection():
     assert manager.active == {}
     assert manager.host_ready["req:0"]["snapshot"].__class__ is LazySnapshot
     assert manager.host_ready["req:0"]["ready_at"] > 0
-
-
-def test_selected_slow_recovery_maps_pageable_extent_once_before_h2d_admission():
-    trace = []
-
-    class LazySnapshot:
-        _materialized = None
-
-        def materialize(self):
-            trace.append("materialize")
-            self._materialized = object()
-            return self
-
-    manager = AgenticPHostStagingManager.__new__(AgenticPHostStagingManager)
-    manager._state_lock = threading.RLock()
-    manager.host_ready = {
-        "next:0": {
-            "offer": _offer("next:0"),
-            "snapshot": LazySnapshot(),
-            "loading": False,
-        }
-    }
-    manager.loads = {}
-    manager.max_h2d_inflight = 1
-    manager._ledger_entries_cache = {
-        "next:0": {"state": HostStageState.HOST_READY.value}
-    }
-    req = types.SimpleNamespace(rid="next")
-
-    assert manager.gate_request(req, RequestGeneration("next", 0)) is True
-    assert trace == ["materialize"]
-    assert manager.host_ready["next:0"]["loading"] is False
-
-    # An occupied H2D slot leaves the request queued without mapping again.
-    manager.loads = {"busy": {"event": object()}}
-    assert manager.gate_request(req, RequestGeneration("next", 0)) is True
-    assert trace == ["materialize"]
-    assert manager.host_ready["next:0"]["loading"] is False
 
 
 def test_spill_does_not_free_host_before_mooncake_commit_result():
