@@ -4,15 +4,17 @@
 
 除非单独说明，正式结果要求使用固定 source-order BrowseComp workload、
 temperature 0、8 张 GPU、300 秒预热和 1,200 秒测量。Decode 为所有 Decode
-计算资源的墙钟总吞吐。
+计算资源的墙钟总吞吐。最新的当前新方法 c384/c512 统一使用 D
+`mem_fraction_static=0.80/0.80/0.80/0.60`，并在业务请求开始前完成 Host Arena
+显式注册预热。
 
 | 方法 | 配置 | 状态 | Decode |
 |---|---|---|---:|
 | Colocated baseline | 8卡，c384 | 完成 | 4,834 token/s |
 | Colocated baseline | 8卡，c512 | 完成 | 4,434 token/s |
 | Colocated baseline | 8卡，c576 | 完成 | 4,349 token/s |
-| 当前新方法 | 4P:4D，c384 | 完成 | 4,374 token/s |
-| 当前新方法 | 4P:4D，c512 | 完成 | 4,436 token/s |
+| 当前新方法 | 4P:4D，c384 | 完成（显式 Host prewarm） | 4,700 token/s |
+| 当前新方法 | 4P:4D，c512 | 完成（显式 Host prewarm） | 4,638 token/s |
 | 当前新方法 | 4P:4D，c576，Host短snapshot优先驱逐 | 完成 | 4,017 token/s |
 | No-reverse PD | 4P:4D，c384 | 完成 | 2,013 token/s |
 | No-reverse PD | 4P:4D，c512 | 完成 | 2,071 token/s |
@@ -28,8 +30,8 @@ temperature 0、8 张 GPU、300 秒预热和 1,200 秒测量。Decode 为所有 
 | Colocated baseline | 384 | 2.392 | 38,149 token/s | 2,014 tokens | 15,893 tokens | 91.74% |
 | Colocated baseline | 512 | 2.181 | 46,523 token/s | 2,031 tokens | 21,308 tokens | 74.11% |
 | Colocated baseline | 576 | 2.160 | 47,552 token/s | 2,008 tokens | 21,957 tokens | 74.31% |
-| 当前新方法 4P:4D | 384 | 2.124 | 29,154 token/s | 2,054 tokens | 13,689 tokens | 100.00% |
-| 当前新方法 4P:4D | 512 | 2.219 | 30,709 token/s | 1,994 tokens | 13,804 tokens | 99.93% |
+| 当前新方法 4P:4D | 384 | 2.352 | 32,669 token/s | 1,993 tokens | 13,856 tokens | 99.98% |
+| 当前新方法 4P:4D | 512 | 2.320 | 32,889 token/s | 1,996 tokens | 14,154 tokens | 99.26% |
 | 当前新方法 4P:4D + Host驱逐 | 576 | 2.062 | 32,315 token/s | 1,943 tokens | 15,631 tokens | 96.32% |
 | No-reverse PD 4P:4D | 384 | 0.989 | 42,857 token/s | 2,030 tokens | 43,224 tokens | 0.00% |
 | No-reverse PD 4P:4D | 512 | 1.014 | 42,801 token/s | 2,039 tokens | 42,138 tokens | 0.00% |
@@ -46,8 +48,8 @@ rank 不重复计数。其他方法不使用当前新方法的自定义 D→P Di
 
 | 方法 | 配置 | Direct | Slow | Direct/Slow 比例 |
 |---|---|---:|---:|---:|
-| 当前新方法 | 4P:4D，c384 | 4,563 | 1,928 | 70.30% / 29.70% |
-| 当前新方法 | 4P:4D，c512 | 5,260 | 1,636 | 76.28% / 23.72% |
+| 当前新方法 | 4P:4D，c384 | — | — | 本轮未持久化路径事件，不沿用旧统计 |
+| 当前新方法 | 4P:4D，c512 | 4,753 | 2,340 | 67.01% / 32.99% |
 | 当前新方法 + Host驱逐 | 4P:4D，c576 | 4,986 | 1,345 | 78.76% / 21.24% |
 | Colocated / No-reverse / 原生 Mooncake | — | — | — | 不适用 |
 
@@ -62,8 +64,8 @@ KV pool，因此只在 D KV/running/queue 栏记录整体引擎状态。
 | Colocated c384 | 51.1% | — | — | — | 48.8% | 67.6% | 46.3 | 0.8 | — |
 | Colocated c512 | 60.4% | — | — | — | 39.6% | 84.1% | 59.9 | 3.1 | — |
 | Colocated c576 | 62.0% | — | — | — | 37.9% | 84.6% | 66.1 | 4.8 | — |
-| 当前新方法 4P:4D c384 | 76.6% | 96.5% | 1.5 | 17.7 | 98.1% | 89.6% | 41.1 | 0.0 | 0.6 |
-| 当前新方法 4P:4D c512 | 81.2% | 89.3% | 18.1 | 18.3 | 98.4% | 86.3% | 41.3 | 0.0 | 0.6 |
+| 当前新方法 4P:4D c384 | 87.0% | 90.6% | 8.7 | 12.4 | 97.6% | 86.4% | 52.8 | 0.0 | 0.3 |
+| 当前新方法 4P:4D c512 | 86.8% | 85.1% | 25.8 | 12.5 | 97.9% | 85.0% | 50.6 | 0.0 | 0.3 |
 | 当前新方法 + Host驱逐 c576 | 84.6% | 70.1% | 61.7 | 12.8 | 97.4% | 71.1% | 36.6 | 0.0 | 0.4 |
 | No-reverse 4P:4D c384 | 99.7% | 7.5% | 18.9 | 0.7 | 99.1% | 92.2% | 7.7 | 0.0 | 21.3 |
 | No-reverse 4P:4D c512 | 99.0% | 7.4% | 19.2 | 0.8 | 98.7% | 92.3% | 8.2 | 0.0 | 21.6 |
@@ -77,8 +79,8 @@ KV pool，因此只在 D KV/running/queue 栏记录整体引擎状态。
 - Colocated c384: [summary](archive/baseline/formal-browsecomp-source-order-colocated-8gpu-c384-w300-m1200-20260816-r1/offload_analysis_summary.json)
 - Colocated c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/baseline-colocated/offload_analysis_summary.json)
 - Colocated c576: [summary](archive/baseline/formal-browsecomp-source-order-colocated-8gpu-c576-w300-m1200-20260817-r1/offload_analysis_summary.json)
-- 当前新方法 c384: [summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
-- 当前新方法 c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
+- 当前新方法 c384: [report](current/h100-a100-integration/browsecomp-qwen3-8b-tp1-4p4d-c384-prewarm-barrier-w300-m1200-r2/RESULTS.md)
+- 当前新方法 c512: [report](current/h100-a100-integration/browsecomp-qwen3-8b-tp1-4p4d-c512-prewarm-barrier-w300-m1200-r2/RESULTS.md)
 - 当前新方法 c576（Host驱逐策略）: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/new-method-agentic-pd-host-evict-shortest-low75-r1/offload_analysis_summary.json)
 - 当前新方法 c576（驱逐前失败现场）: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
 - No-reverse c384: [summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/no-reverse-pd-4p4d/offload_analysis_summary.json)
@@ -154,8 +156,8 @@ KV pool，因此只在 D KV/running/queue 栏记录整体引擎状态。
 | Colocated baseline | 384 | 2,014 tokens | 15,893 tokens | 8.26% | 未单独记录 |
 | Colocated baseline | 512 | 2,031 tokens | 21,308 tokens | 25.89% | 未单独记录 |
 | Colocated baseline | 576 | 2,008 tokens | 21,957 tokens | 25.69% | 未单独记录 |
-| 当前新方法 4P:4D | 384 | 2,054 tokens | 13,689 tokens | 0.00% | 约 0 tokens |
-| 当前新方法 4P:4D | 512 | 1,994 tokens | 13,804 tokens | 0.07% | 接近 0，未单独记录绝对值 |
+| 当前新方法 4P:4D | 384 | 1,993 tokens | 13,856 tokens | 0.02% | 7.3 tokens |
+| 当前新方法 4P:4D | 512 | 1,996 tokens | 14,154 tokens | 0.74% | 未单独记录 |
 | 当前新方法 4P:4D + Host驱逐 | 576 | 1,943 tokens | 15,631 tokens | 3.68% | 1,356 tokens |
 | No-reverse PD 4P:4D | 384 | 2,030 tokens | 43,224 tokens | 100.00% | 未单独记录 |
 | No-reverse PD 4P:4D | 512 | 2,039 tokens | 42,138 tokens | 100.00% | 未单独记录 |
