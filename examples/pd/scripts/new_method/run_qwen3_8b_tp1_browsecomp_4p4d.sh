@@ -26,10 +26,10 @@ export DECODE_GPUS="${DECODE_GPUS:-1 3 5 7}"
 export PREFILL_TP_SIZE=1
 export DECODE_TP_SIZE=1
 export SEARCH_GPU="${SEARCH_GPU:-7}"
-# The retrieval service occupies about 16 GiB on GPU 7.  Full registered-Host
-# coverage also consumes CUDA mapping/page-table memory, so reserve explicit
-# HBM headroom on the co-located fourth Decode worker.
-export DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-0.85 0.85 0.85 0.68}"
+# Keep the model KV allocation identical to the colocated BrowseComp baseline.
+# GPU 7 also hosts the roughly 16-GiB retrieval service, so it uses 0.60 while
+# the other model GPUs use 0.80.
+export DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-0.80 0.80 0.80 0.60}"
 export SEARCH_START_AFTER_MODELS=true
 
 export MATH_RATIO=0

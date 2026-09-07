@@ -411,6 +411,75 @@ wait_http() {
   return 1
 }
 
+wait_registered_host_prewarm() {
+  case "${SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER:-0}" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    *) return 0 ;;
+  esac
+  local root="${SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR:?missing Host prewarm directory}"
+  local timeout="${SGLANG_AGENTIC_KV_REGISTER_PREWARM_TIMEOUT_SECONDS:-1800}"
+  local expected="$(((${#prefill_gpu_groups[@]} + ${#decode_gpu_groups[@]}) * PREFILL_TP_SIZE))"
+  local complete_count failed_count pid
+  local deadline=$((SECONDS + timeout))
+  mkdir -p "${root}/arenas" "${root}/complete" "${root}/failed"
+  : >"${root}/start.tmp"
+  mv -f "${root}/start.tmp" "${root}/start"
+  echo "Host registration prewarm started; waiting for ${expected} P/D CUDA contexts"
+  while (( SECONDS < deadline )); do
+    failed_count="$(find "${root}/failed" -maxdepth 1 -type f -name '*.json' | wc -l)"
+    if (( failed_count > 0 )); then
+      echo "Host registration prewarm failed:" >&2
+      find "${root}/failed" -maxdepth 1 -type f -name '*.json' -print -exec cat {} \; >&2
+      return 1
+    fi
+    complete_count="$(find "${root}/complete" -maxdepth 1 -type f -name '*.json' | wc -l)"
+    if (( complete_count == expected )); then
+      python - "${root}" "${RUN_DIR}/host_register_prewarm.json" "${expected}" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+records = [
+    json.loads(path.read_text(encoding="utf-8"))
+    for path in sorted((root / "complete").glob("*.json"))
+]
+report = {
+    "status": "complete",
+    "participant_count": len(records),
+    "expected_participant_count": int(sys.argv[3]),
+    "registered_bytes_sum_across_cuda_contexts": sum(
+        int(item["registered_bytes"]) for item in records
+    ),
+    "max_elapsed_seconds": max(
+        (float(item["elapsed_seconds"]) for item in records), default=0.0
+    ),
+    "participants": records,
+}
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+      echo "Host registration prewarm complete for all ${expected} P/D CUDA contexts"
+      return 0
+    fi
+    if (( complete_count > expected )); then
+      echo "Host registration prewarm produced too many completion records: ${complete_count}/${expected}" >&2
+      return 1
+    fi
+    for pid in "${prefill_pids[@]}" "${decode_pids[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        echo "A P/D service exited during Host registration prewarm" >&2
+        return 1
+      fi
+    done
+    sleep 2
+  done
+  echo "Host registration prewarm timed out after ${timeout}s" >&2
+  find "${root}" -maxdepth 2 -type f -print >&2
+  return 1
+}
+
 read -r -a prefill_ports <<<"${PREFILL_PORTS}"
 read -r -a bootstrap_ports <<<"${BOOTSTRAP_PORTS}"
 read -r -a decode_ports <<<"${DECODE_PORTS}"
@@ -468,6 +537,7 @@ if (( PREFILL_TP_SIZE != DECODE_TP_SIZE )); then
   echo "Agentic TP currently requires equal PREFILL_TP_SIZE and DECODE_TP_SIZE" >&2
   exit 1
 fi
+export SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT="${#prefill_gpu_groups[@]}"
 export SGLANG_AGENTIC_KV_TP_SIZE="${PREFILL_TP_SIZE}"
 if (( ${#decode_gpu_groups[@]} != ${#decode_ports[@]} )); then
   echo "DECODE GPU groups and DECODE_PORTS must contain the same number of entries" >&2
@@ -646,7 +716,6 @@ for index in "${!prefill_gpu_groups[@]}"; do
 done
 
 prefill_numa_domains="$(IFS=';'; echo "${prefill_numa_vectors[*]}")"
-export SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT="${#prefill_gpu_groups[@]}"
 export SGLANG_AGENTIC_KV_PREFILL_TP_NUMA_DOMAINS="${prefill_numa_domains}"
 
 decode_pids=()
@@ -704,6 +773,8 @@ for index in "${!decode_gpu_groups[@]}"; do
   # every worker is present.
   wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/model_info" "${decode_pids[$index]}"
 done
+
+wait_registered_host_prewarm
 
 if [[ "${PD_SKIP_SEARCH}" != "1" && "${SEARCH_START_AFTER_MODELS}" == "true" ]]; then
   start_search_server
