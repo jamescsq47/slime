@@ -52,3 +52,17 @@ Intended timing: 300 seconds warmup + 1200 seconds measurement.
 3. Re-run the full warmup + measurement after independent review of changes.
 
 No serving code or parameters were changed during this monitoring turn.
+
+## Cleanup verification
+
+The stopped workers took several minutes to finish NVIDIA driver cleanup.
+Some process leaders temporarily appeared as `Zl` while surviving kernel
+threads were in `os_acquire_rwlock_write`; a GPU query also waited in the
+driver during this period. No new experiment was started.
+
+At 04:19:44 UTC all remaining worker threads and the blocked query had exited.
+A subsequent successful `nvidia-smi` showed only the pre-existing unrelated
+592 MiB compute process on GPU0. GPU usage returned to the pre-run values
+(GPU0 599 MiB, GPU1/5 68 MiB, other GPUs 4 MiB, all 0% utilization).
+System available RAM returned to about 1.9 TiB. No experiment-owned live GPU
+process or launcher remained. The failure artifacts and raw logs were retained.
