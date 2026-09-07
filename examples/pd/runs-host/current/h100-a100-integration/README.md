@@ -19,8 +19,9 @@ Final safety changes and formal metrics are recorded after verification.
 - Router suite after test-session cleanup: 98 passed, no unclosed session.
 - Indexed DMA descriptor byte-address equivalence: 4 passed; real CUDA
   P→D round trip and D→P source-release tests: 2 passed.
-- SGLang lifecycle/TP suite before the final ownership safety transplant:
-  308 passed. Final transplant results are recorded below when complete.
+- SGLang final lifecycle/TP/DMA descriptor/integration safety suite: 321 passed.
+  Four Slime test fixtures were updated to carry explicit generation IDs;
+  the affected 36 Host/release tests passed without weakening assertions.
 - Merged staged sources: 34 Python AST checks and 17 shell syntax checks passed.
 - Broader inherited training tests are not all green: the A100 commit lacks
   `examples/mixed/terminal_agent.py`, the pd inference environment lacks
@@ -72,4 +73,9 @@ D→P Host is 128 GiB/P and P→D Host is 32 GiB/P. The H100 implementation
 uses memfd, two DMA lanes, 4,096-token chunks and a 640 GiB registration
 cache limit. Native SGLang HiCache/Mooncake is disabled.
 
-Formal result: pending.
+Formal result: **failed and terminated; no valid throughput result**.
+The c512 attempt encountered long runtime Host arena registration stalls,
+then D3 on GPU7 failed with CUDA OOM while sharing the card with the search
+service. Full chronology and raw monitoring samples are retained in
+[the failure report](browsecomp-qwen3-8b-tp1-4p4d-c512-w300-m1200-r1/FAILURE.md).
+The intended 300+1200 measurement was not successfully completed.
