@@ -104,6 +104,19 @@ def log_metrics(metrics: dict, step: int | None = None, step_key: str | None = N
         _warner.warn("Slime dashboard metric push failed; dropping this record")
 
 
+def get_sglang_summary(timeout: float = 2.0) -> dict[str, float]:
+    """Return the latest already-scraped SGLang aggregate for live logging."""
+    if _handle is None:
+        return {}
+    try:
+        import ray
+
+        return ray.get(_handle.get_sglang_summary.remote(), timeout=timeout)
+    except Exception:
+        _warner.warn("Slime dashboard SGLang summary is temporarily unavailable")
+        return {}
+
+
 def finish_dashboard() -> None:
     global _handle, _is_primary, _trace_sink
     if _trace_sink is not None:
@@ -153,6 +166,29 @@ def _args_snapshot(args) -> dict[str, Any]:
         "rollout_num_gpus_per_engine",
         "rollout_batch_size",
         "over_sampling_batch_size",
+        "adaptive_group_oversampling",
+        "adaptive_group_oversampling_min_groups",
+        "adaptive_group_oversampling_running_threshold",
+        "adaptive_group_oversampling_queue_threshold",
+        "adaptive_group_oversampling_expansion_kv_threshold",
+        "adaptive_group_oversampling_window_seconds",
+        "adaptive_group_oversampling_cooldown_seconds",
+        "adaptive_group_oversampling_post_resume_expansion_grace_seconds",
+        "adaptive_group_oversampling_recovery_seconds",
+        "adaptive_group_oversampling_step_groups",
+        "adaptive_group_oversampling_pressure_queue_threshold",
+        "adaptive_group_oversampling_pressure_kv_threshold",
+        "adaptive_group_oversampling_hard_max_engine_kv_threshold",
+        "adaptive_group_oversampling_hard_engine_queue_threshold",
+        "adaptive_group_oversampling_hard_pressure_kv_threshold",
+        "adaptive_group_oversampling_hard_pressure_seconds",
+        "adaptive_group_oversampling_hard_step_groups",
+        "decoupled_gpu_tool_scheduling",
+        "gpu_generation_slots",
+        "terminal_live_session_limit",
+        "terminal_concurrent_resets",
+        "inflight_group_soft_limit",
+        "max_inflight_groups",
         "n_samples_per_prompt",
         "global_batch_size",
         "update_weights_interval",

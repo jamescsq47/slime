@@ -1,0 +1,21 @@
+schema_version: 1
+
+datasets:
+  - id: qa
+    harness: browsecomp
+    path: ${PD_DATA_ROOT}/browsecomp/bc_train.jsonl
+    weight: 1
+    options:
+      max_response_tokens: 36864
+      max_tokens_per_turn: 2048
+      max_turns: 100
+      search_url: http://127.0.0.1:8750
+
+sampling:
+  policy: fixed
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1
+  schedule_file: ../workloads/fixed_browsecomp_source_order_n680.json

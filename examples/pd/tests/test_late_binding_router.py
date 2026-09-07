@@ -93,6 +93,13 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router._prefill_pressure_at = 0.0
         router._prefill_pressure_sample_started_at = 0.0
         router._prefill_pressure_interval = 0.2
+        async def close_sessions():
+            for name in ("_load_session", "_backend_session"):
+                session = getattr(router, name, None)
+                if session is not None and not session.closed:
+                    await session.close()
+
+        self.addAsyncCleanup(close_sessions)
         return router
 
     def test_p2d_host_metadata_uses_chat_custom_params(self):

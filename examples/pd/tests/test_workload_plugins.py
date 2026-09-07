@@ -14,6 +14,7 @@ from slime.utils.types import Sample
 
 from data.api import LoadContext
 from data.browsecomp import agent as browsecomp_agent
+from data.browsecomp import env as browsecomp_env
 from data.config import DatasetSpec, SamplingSpec, WorkloadSpec, legacy_workload, load_workload
 from data.dispatch import exact_counts, select_samples
 from data.registry import get_harness
@@ -37,6 +38,8 @@ class CharTokenizer:
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kwargs):
         rendered = "".join(f"<{item['role']}>{item['content']}" for item in messages)
+        if kwargs.get("tools"):
+            rendered = f"<tools>{len(kwargs['tools'])}</tools>" + rendered
         return rendered + ("<assistant>" if add_generation_prompt else "")
 
 
@@ -637,3 +640,185 @@ def test_browsecomp_harness_finishes_without_starting_search_service(monkeypatch
     assert payloads[0]["return_logprob"] is False
     assert "loss_mask" not in result.metadata
     assert "token_logprobs" not in result.metadata
+
+
+def test_browsecomp_optional_shared_search_budget_does_not_change_default(monkeypatch):
+    class FakeSearchClient:
+        def __init__(self, *args, **kwargs):
+            self.calls = []
+
+        async def search(self, query, k):
+            self.calls.append((query, k))
+            return [
+                {"docid": f"{query}-{index}", "url": f"https:///{index}", "text": "x"}
+                for index in range(50)
+            ]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(browsecomp_env, "AsyncSearchClient", FakeSearchClient)
+    response = "\n".join(
+        f"<function=search>\n<parameter=query>q{index}</parameter>\n"
+        "<parameter=topk>10</parameter>\n</function>"
+        for index in range(5)
+    )
+
+    default_env = browsecomp_env.BrowseCompEnv("q", "a", base_url="http://unused")
+    default_result = asyncio.run(default_env.run_action(response))
+    bounded_env = browsecomp_env.BrowseCompEnv(
+        "q",
+        "a",
+        base_url="http://unused",
+        search_total_topk_per_turn=10,
+    )
+    bounded_result = asyncio.run(bounded_env.run_action(response))
+
+    assert default_result["observation"].count("--- #") == 50
+    assert bounded_result["observation"].count("--- #") == 10
+    assert bounded_env.stats["search"] == 5
+
+
+def test_browsecomp_optional_observation_word_limits_do_not_change_defaults(monkeypatch):
+    class FakeSearchClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def search(self, query, k):
+            return [{"docid": "d", "url": "https:///d", "text": "zzword " * 600}]
+
+        async def open(self, url, docid):
+            return [{"docid": "d", "url": "https:///d", "text": "zzword " * 5000}]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(browsecomp_env, "AsyncSearchClient", FakeSearchClient)
+    default_env = browsecomp_env.BrowseCompEnv("q", "a", base_url="http://unused")
+    bounded_env = browsecomp_env.BrowseCompEnv(
+        "q",
+        "a",
+        base_url="http://unused",
+        search_snippet_words=256,
+        open_page_words=2048,
+    )
+    search = "<function=search><parameter=query>q</parameter></function>"
+    opened = "<function=open_page><parameter=docid>d</parameter></function>"
+    default_search = asyncio.run(default_env.run_action(search))["observation"]
+    bounded_search = asyncio.run(bounded_env.run_action(search))["observation"]
+    default_open = asyncio.run(default_env.run_action(opened))["observation"]
+    bounded_open = asyncio.run(bounded_env.run_action(opened))["observation"]
+
+    assert default_search.count("zzword") == 512
+    assert bounded_search.count("zzword") == 256
+    assert default_open.count("zzword") == 4096
+    assert bounded_open.count("zzword") == 2048
+
+
+def test_browsecomp_optional_strict_result_count_bounds_revisited_pages(monkeypatch):
+    class FakeSearchClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def search(self, query, k):
+            return [
+                {"docid": f"d{index}", "url": f"https:///{index}", "text": "body"}
+                for index in range(20)
+            ]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(browsecomp_env, "AsyncSearchClient", FakeSearchClient)
+    default_env = browsecomp_env.BrowseCompEnv("q", "a", base_url="http://unused")
+    strict_env = browsecomp_env.BrowseCompEnv(
+        "q",
+        "a",
+        base_url="http://unused",
+        search_count_revisits_as_full=True,
+    )
+    action = "<function=search><parameter=query>q</parameter><parameter=topk>5</parameter></function>"
+    asyncio.run(default_env.run_action(action))
+    asyncio.run(strict_env.run_action(action))
+    default_revisit = asyncio.run(default_env.run_action(action))["observation"]
+    strict_revisit = asyncio.run(strict_env.run_action(action))["observation"]
+
+    assert default_revisit.count("--- #") > 5
+    assert strict_revisit.count("--- #") == 5
+
+
+def test_browsecomp_qwen35_profile_is_isolated_and_replaces_system_prompt(tmp_path):
+    profile = tmp_path / "qwen35.yaml"
+    profile.write_text(
+        "schema_version: 1\nsystem_prompt: qwen35-only\nsearch_call_budget: 3\n"
+    )
+
+    loaded = browsecomp_agent._load_agent_profile(str(profile))
+    original = [
+        {"role": "system", "content": "generic-qwen"},
+        {"role": "user", "content": "question"},
+    ]
+    replaced = browsecomp_agent._replace_system_prompt(
+        original, loaded["system_prompt"]
+    )
+
+    assert original[0]["content"] == "generic-qwen"
+    assert replaced[0]["content"] == "qwen35-only"
+    assert loaded["search_call_budget"] == 3
+    assert browsecomp_agent._load_agent_profile(None) == {}
+
+
+def test_browsecomp_qwen35_uses_native_tools_and_tool_response_role():
+    tokenizer = CharTokenizer()
+    messages = [
+        {"role": "system", "content": "policy"},
+        {"role": "user", "content": "question"},
+    ]
+    tools = [{"type": "function", "function": {"name": "search"}}]
+
+    initial = browsecomp_agent._initial_tokens(
+        tokenizer, messages, tools=tools
+    )
+    observation = browsecomp_agent._observation_tokens(
+        tokenizer, "result", native_tool_response=True
+    )
+
+    assert "<tools>1</tools>" in tokenizer.decode(initial)
+    assert "<tool>result" in tokenizer.decode(observation)
+
+
+def test_browsecomp_qwen35_profile_limits_one_action_and_exposes_budget(monkeypatch):
+    class FakeSearchClient:
+        def __init__(self, *args, **kwargs):
+            self.queries = []
+
+        async def search(self, query, k):
+            self.queries.append(query)
+            return [{"docid": query, "url": f"https:///{query}", "text": "evidence"}]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(browsecomp_env, "AsyncSearchClient", FakeSearchClient)
+    env = browsecomp_env.BrowseCompEnv(
+        "q",
+        "a",
+        base_url="http://unused",
+        max_tool_calls_per_turn=1,
+        search_call_budget=1,
+        open_page_call_budget=0,
+        followup_prompt=(
+            "remaining search={search_remaining}, open={open_remaining}"
+        ),
+        budget_exhausted_prompt="finish now",
+    )
+    two_calls = (
+        '<tool_call>{"name":"search","arguments":{"query":["q1"]}}</tool_call>\n'
+        '<tool_call>{"name":"search","arguments":{"query":["q2"]}}</tool_call>'
+    )
+
+    result = asyncio.run(env.run_action(two_calls))
+
+    assert env.client.queries == ["q1"]
+    assert env.stats["search"] == 1
+    assert "finish now" in result["observation"]

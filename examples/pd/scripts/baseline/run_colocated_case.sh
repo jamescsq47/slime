@@ -21,6 +21,8 @@ MODEL_MAX_RESPONSE_LENGTH="${MODEL_MAX_RESPONSE_LENGTH:-36864}"
 MODEL_PAGE_SIZE="${MODEL_PAGE_SIZE:-64}"
 MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-}"
 MODEL_TOOL_CALL_PARSER="${MODEL_TOOL_CALL_PARSER:-}"
+MODEL_ATTENTION_BACKEND="${MODEL_ATTENTION_BACKEND:-}"
+MODEL_SAMPLING_BACKEND="${MODEL_SAMPLING_BACKEND:-}"
 MODEL_PORTS="${MODEL_PORTS:-27200 27201 27202 27203 27204 27205}"
 ROUTER_PORT="${ROUTER_PORT:-27210}"
 SEARCH_GPU="${SEARCH_GPU:-6}"
@@ -138,6 +140,12 @@ for index in "${!model_gpu_groups[@]}"; do
   fi
   if [[ -n "${MODEL_TOOL_CALL_PARSER}" ]]; then
     model_parser_args+=(--tool-call-parser "${MODEL_TOOL_CALL_PARSER}")
+  fi
+  if [[ -n "${MODEL_ATTENTION_BACKEND}" ]]; then
+    model_parser_args+=(--attention-backend "${MODEL_ATTENTION_BACKEND}")
+  fi
+  if [[ -n "${MODEL_SAMPLING_BACKEND}" ]]; then
+    model_parser_args+=(--sampling-backend "${MODEL_SAMPLING_BACKEND}")
   fi
   setsid env CUDA_VISIBLE_DEVICES="${model_gpu_groups[index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
     "${PD_ENV_BIN}/python" -m sglang.launch_server --model-path "${MODEL_PATH}" \

@@ -239,6 +239,88 @@ def test_group_generation_preserves_terminal_members_and_original_positions(monk
     asyncio.run(scenario())
 
 
+def test_resumable_group_restarts_aborted_sibling_before_old_tool_finishes(monkeypatch):
+    async def scenario():
+        state = FakeState()
+        state.aborted = False
+        state.abort_epoch = 0
+        tool_sample = Sample(prompt="tool", metadata={})
+        generation_sample = Sample(prompt="generation", metadata={})
+        group = [tool_sample, generation_sample]
+        resume_event = asyncio.Event()
+        resume_event.set()
+        tool_started = asyncio.Event()
+        generation_started = asyncio.Event()
+        release_old_generation = asyncio.Event()
+        release_old_tool = asyncio.Event()
+        sibling_resumed = asyncio.Event()
+        call_epochs = {id(tool_sample): [], id(generation_sample): []}
+
+        async def fake_generate_and_rm(args, sample, sampling_params, **kwargs):
+            epoch = kwargs["expected_abort_epoch"]
+            call_epochs[id(sample)].append(epoch)
+            if sample is tool_sample and epoch == 0:
+                sample.metadata[sglang_rollout.PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY] = True
+                tool_started.set()
+                await release_old_tool.wait()
+                sample.metadata.pop(sglang_rollout.PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY, None)
+                sample.status = Sample.Status.ABORTED
+                return sample
+            if sample is generation_sample and epoch == 0:
+                generation_started.set()
+                await release_old_generation.wait()
+                sample.status = Sample.Status.ABORTED
+                return sample
+
+            if sample is generation_sample:
+                sibling_resumed.set()
+            sample.status = Sample.Status.COMPLETED
+            sample.reward = 1.0
+            return sample
+
+        monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+        monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+        args = SimpleNamespace(sglang_enable_deterministic_inference=False, group_rm=False)
+
+        parent = asyncio.create_task(
+            sglang_rollout.generate_and_rm_group(
+                args,
+                group,
+                {},
+                resume_event=resume_event,
+            )
+        )
+        await asyncio.wait_for(tool_started.wait(), timeout=1)
+        await asyncio.wait_for(generation_started.wait(), timeout=1)
+
+        # Enter the collocated weight-update barrier. The generation child
+        # aborts promptly, while the old tool child intentionally keeps going.
+        resume_event.clear()
+        state.aborted = True
+        state.abort_epoch = 1
+        release_old_generation.set()
+        await asyncio.sleep(0)
+
+        # New weights become available before the tool returns. The generation
+        # sibling must resume now, independently of that old tool child.
+        state.aborted = False
+        resume_event.set()
+        await asyncio.wait_for(sibling_resumed.wait(), timeout=1)
+        assert not release_old_tool.is_set()
+        assert not parent.done()
+
+        release_old_tool.set()
+        result = await asyncio.wait_for(parent, timeout=1)
+
+        assert result == group
+        assert call_epochs[id(generation_sample)] == [0, 1]
+        assert call_epochs[id(tool_sample)] == [0, 1]
+        assert all(sample.status == Sample.Status.COMPLETED for sample in group)
+        assert not state.group_child_tasks
+
+    asyncio.run(scenario())
+
+
 def test_failed_deferred_tool_recycles_last_committed_group():
     async def scenario():
         state = FakeState()
@@ -559,10 +641,11 @@ def test_train_time_mask_preserves_current_policy_suffix():
         current_policy_version=1,
         mask_offpolicy_math=32,
         mask_offpolicy_qa=32,
+        mask_offpolicy_terminal=32,
     )
-    manager.data_source = SimpleNamespace(version_task_counts={0: {"math": 32, "qa": 32}})
+    manager.data_source = SimpleNamespace(version_task_counts={0: {"math": 32, "qa": 32, "terminal": 32}})
 
-    for task_type in ("math", "qa"):
+    for task_type in ("math", "qa", "terminal"):
         sample = Sample(
             prompt="question",
             response="abcde",

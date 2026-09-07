@@ -150,7 +150,7 @@ class DashboardReader:
             return sum(row["duration"] for row in rows) / len(rows) if rows else 0.0
 
         tool_series = {}
-        for domain in ("math", "qa"):
+        for domain in ("math", "qa", "terminal"):
             changes = []
             for span in tools:
                 if span["attrs"].get("task_type") != domain:

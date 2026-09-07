@@ -1,0 +1,36 @@
+{
+  "size_GiB": 1.0,
+  "repeats": 6,
+  "chunk_MiB": 128,
+  "chunk_gap_ms": 0.0,
+  "registration_ms": 168.3596931397915,
+  "registration_inclusive_d2h_GiB_s": 4.154248827466189,
+  "registration_inclusive_h2d_GiB_s": 4.66509893914922,
+  "torch_reports_pinned": true,
+  "validation": "PASS",
+  "d2h": {
+    "gpu_GiB_s": 13.87909641422924,
+    "gpu_p50_GiB_s": 13.999284265871532,
+    "wall_GiB_s": 13.820226840806182,
+    "wall_p50_GiB_s": 13.942692713827672
+  },
+  "h2d": {
+    "gpu_GiB_s": 21.879818282065198,
+    "gpu_p50_GiB_s": 21.882726924608725,
+    "wall_GiB_s": 21.74006014103999,
+    "wall_p50_GiB_s": 21.743162763579765
+  },
+  "concurrent_direction": "d2h",
+  "concurrent_gpu_GiB_s": 13.691030194478579,
+  "forward": {
+    "baseline_before_p50_ms": 0.5273600220680237,
+    "baseline_after_p50_ms": 0.5416960120201111,
+    "baseline_p50_ms": 0.5376000106334685,
+    "baseline_p95_ms": 0.5447679758071899,
+    "concurrent_p50_ms": 0.5488640069961548,
+    "concurrent_p95_ms": 0.5601279735565186,
+    "p50_regression": 0.02095237377211645,
+    "p95_regression": 0.028195485842517742,
+    "samples": 662
+  }
+}

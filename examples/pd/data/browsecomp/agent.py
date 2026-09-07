@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import os
 import time
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from agentic_kv_request import (
     add_agentic_kv_metadata,
@@ -35,11 +39,59 @@ DUMMY_MESSAGES = [
 ]
 
 
-def _render(tokenizer, messages: list[dict[str, Any]], *, generation: bool) -> str:
+@lru_cache(maxsize=8)
+def _load_agent_profile(value: str | None) -> dict[str, Any]:
+    """Load an optional model-specific BrowseComp profile.
+
+    Relative paths are resolved from the ``examples/pd`` directory so the
+    same workload YAML works regardless of the launcher's current directory.
+    The generic/Qwen3 path does not set this option and remains unchanged.
+    """
+
+    if not value:
+        return {}
+    path = Path(os.path.expanduser(os.path.expandvars(str(value))))
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise TypeError(f"BrowseComp agent profile must be a mapping: {path}")
+    if int(payload.get("schema_version", 1)) != 1:
+        raise ValueError(f"Unsupported BrowseComp agent profile schema: {path}")
+    payload.pop("schema_version", None)
+    payload["_profile_path"] = str(path.resolve())
+    return payload
+
+
+def _replace_system_prompt(prompt: Any, system_prompt: str | None) -> Any:
+    if not system_prompt:
+        return prompt
+    if not isinstance(prompt, list):
+        raise TypeError("system_prompt override requires a message-list BrowseComp prompt")
+    messages = [dict(message) for message in prompt]
+    replacement = {"role": "system", "content": str(system_prompt).strip()}
+    for index, message in enumerate(messages):
+        if message.get("role") == "system":
+            messages[index] = replacement
+            break
+    else:
+        messages.insert(0, replacement)
+    return messages
+
+
+def _render(
+    tokenizer,
+    messages: list[dict[str, Any]],
+    *,
+    generation: bool,
+    tools: list[dict[str, Any]] | None = None,
+) -> str:
     kwargs: dict[str, Any] = {}
     value = os.getenv("BROWSECOMP_ENABLE_THINKING")
     if value is not None:
         kwargs["enable_thinking"] = value.lower() in {"1", "true", "yes", "y"}
+    if tools is not None:
+        kwargs["tools"] = tools
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -48,19 +100,30 @@ def _render(tokenizer, messages: list[dict[str, Any]], *, generation: bool) -> s
     )
 
 
-def _initial_tokens(tokenizer, prompt: Any) -> list[int]:
+def _initial_tokens(
+    tokenizer,
+    prompt: Any,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> list[int]:
     if isinstance(prompt, list):
-        prompt = _render(tokenizer, prompt, generation=True)
+        prompt = _render(tokenizer, prompt, generation=True, tools=tools)
     if not isinstance(prompt, str):
         raise TypeError(f"BrowseComp prompt must be str or message list, got {type(prompt)}")
     return list(tokenizer.encode(prompt, add_special_tokens=False))
 
 
-def _observation_tokens(tokenizer, observation: str) -> list[int]:
+def _observation_tokens(
+    tokenizer,
+    observation: str,
+    *,
+    native_tool_response: bool = False,
+) -> list[int]:
     base = _render(tokenizer, DUMMY_MESSAGES, generation=False)
+    response_role = "tool" if native_tool_response else "user"
     full = _render(
         tokenizer,
-        DUMMY_MESSAGES + [{"role": "user", "content": observation}],
+        DUMMY_MESSAGES + [{"role": response_role, "content": observation}],
         generation=True,
     )
     base_ids = list(tokenizer.encode(base, add_special_tokens=False))
@@ -130,11 +193,21 @@ async def generate(
     if not question or not label:
         raise ValueError("BrowseComp sample requires metadata.question and answer")
 
-    state = GenerateState(args)
-    prompt_tokens = _initial_tokens(state.tokenizer, sample.prompt)
-    response_tokens: list[int] = []
     dataset_id = str(metadata.get("dataset_id") or metadata.get("task_type") or "qa")
-    options = getattr(args, "workload_dataset_options", {}).get(dataset_id, {})
+    raw_options = getattr(args, "workload_dataset_options", {}).get(dataset_id, {})
+    profile = _load_agent_profile(raw_options.get("agent_profile"))
+    options = {**profile, **raw_options}
+    state = GenerateState(args)
+    effective_prompt = _replace_system_prompt(
+        sample.prompt, options.get("system_prompt")
+    )
+    native_tools = options.get("tools") if options.get("native_tool_template") else None
+    prompt_tokens = _initial_tokens(
+        state.tokenizer,
+        effective_prompt,
+        tools=native_tools,
+    )
+    response_tokens: list[int] = []
     max_turns = int(options.get("max_turns", os.getenv("BROWSECOMP_MAX_TURNS", "100")))
     per_turn_cap = min(
         int(
@@ -156,6 +229,17 @@ async def generate(
         label_answer=label,
         must_search=os.getenv("BROWSECOMP_MUST_SEARCH", "1") == "1",
         base_url=options.get("search_url"),
+        search_total_topk_per_turn=options.get("search_total_topk_per_turn"),
+        search_snippet_words=options.get("search_snippet_words"),
+        open_page_words=options.get("open_page_words"),
+        search_count_revisits_as_full=bool(
+            options.get("search_count_revisits_as_full", False)
+        ),
+        max_tool_calls_per_turn=options.get("max_tool_calls_per_turn"),
+        search_call_budget=options.get("search_call_budget"),
+        open_page_call_budget=options.get("open_page_call_budget"),
+        followup_prompt=options.get("followup_prompt"),
+        budget_exhausted_prompt=options.get("budget_exhausted_prompt"),
     )
     started_at = time.monotonic()
     tool_seconds = 0.0
@@ -165,6 +249,8 @@ async def generate(
     completed_turns = 0
     terminal_repair_events: list[dict[str, Any]] = []
     metadata["terminal_repair_events"] = terminal_repair_events
+    if options.get("_profile_path"):
+        metadata["browsecomp_agent_profile"] = options["_profile_path"]
     pending_terminal_repair: dict[str, Any] | None = None
 
     try:
@@ -250,6 +336,9 @@ async def generate(
                 break
 
             parsed_calls = extract_fn_call(text) or []
+            max_calls = options.get("max_tool_calls_per_turn")
+            if max_calls is not None:
+                parsed_calls = parsed_calls[: max(1, int(max_calls))]
             explicit_terminal = (
                 any(call.get("function") == "finish" for call in parsed_calls)
                 or "<function=finish>" in text
@@ -309,7 +398,11 @@ async def generate(
                     turn,
                     p_ready_dir=str(getattr(args, "pd_p_ready_dir", "") or ""),
                 )
-            observation = _observation_tokens(state.tokenizer, result["observation"])
+            observation = _observation_tokens(
+                state.tokenizer,
+                result["observation"],
+                native_tool_response=bool(options.get("native_tool_template", False)),
+            )
             remaining = max_seq_len - len(prompt_tokens) - len(response_tokens)
             if remaining <= 0:
                 stop_reason = "budget"
