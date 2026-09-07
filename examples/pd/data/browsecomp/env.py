@@ -284,6 +284,15 @@ class BrowseCompEnv:
         label_answer: str,
         must_search: bool = True,
         base_url: str | None = None,
+        search_total_topk_per_turn: int | None = None,
+        search_snippet_words: int | None = None,
+        open_page_words: int | None = None,
+        search_count_revisits_as_full: bool = False,
+        max_tool_calls_per_turn: int | None = None,
+        search_call_budget: int | None = None,
+        open_page_call_budget: int | None = None,
+        followup_prompt: str | None = None,
+        budget_exhausted_prompt: str | None = None,
     ):
         base_url = base_url or os.getenv("LOCAL_SEARCH_URL")
         assert base_url, "LOCAL_SEARCH_URL must point at the BrowseComp-Plus search server"
@@ -292,6 +301,39 @@ class BrowseCompEnv:
         self.label_answer = label_answer
         self.predicted_answer: tuple | None = None  # (answer, explanation, confidence)
         self.must_search = must_search
+        self.search_total_topk_per_turn = (
+            max(1, int(search_total_topk_per_turn))
+            if search_total_topk_per_turn is not None
+            else None
+        )
+        self.search_snippet_words = (
+            max(1, int(search_snippet_words))
+            if search_snippet_words is not None
+            else _int_env("BROWSECOMP_SEARCH_SNIPPET_WORDS", 512)
+        )
+        self.open_page_words = (
+            max(1, int(open_page_words))
+            if open_page_words is not None
+            else _int_env("BROWSECOMP_OPEN_PAGE_WORDS", 4096)
+        )
+        self.search_count_revisits_as_full = search_count_revisits_as_full
+        self.max_tool_calls_per_turn = (
+            max(1, int(max_tool_calls_per_turn))
+            if max_tool_calls_per_turn is not None
+            else None
+        )
+        self.search_call_budget = (
+            max(0, int(search_call_budget))
+            if search_call_budget is not None
+            else None
+        )
+        self.open_page_call_budget = (
+            max(0, int(open_page_call_budget))
+            if open_page_call_budget is not None
+            else None
+        )
+        self.followup_prompt = followup_prompt
+        self.budget_exhausted_prompt = budget_exhausted_prompt
         # Off by default, matching FoldAgent's trained configuration.
         self.donotgiveup = os.getenv("BROWSECOMP_DO_NOT_GIVE_UP", "0") == "1"
         self.visited_pages: set = set()
@@ -305,11 +347,53 @@ class BrowseCompEnv:
         fn_call = extract_fn_call(response)
         if not fn_call:
             return {"observation": "No function call was detected in the model response."}
+        if self.max_tool_calls_per_turn is not None:
+            fn_call = fn_call[: self.max_tool_calls_per_turn]
+
+        per_call_search_topk: dict[int, int] = {}
+        if self.search_total_topk_per_turn is not None:
+            search_calls = [
+                (index, fn)
+                for index, fn in enumerate(fn_call)
+                if fn["function"] == "search"
+                and str(fn["arguments"].get("query", "")).strip()
+            ]
+            requested = {
+                index: min(
+                    (lambda value: int(value) if str(value).isdigit() else 10)(
+                        fn["arguments"].get("topk", 10)
+                    ),
+                    _int_env("BROWSECOMP_SEARCH_MAX_TOPK", 10),
+                )
+                for index, fn in search_calls
+            }
+            remaining = self.search_total_topk_per_turn
+            # Fair round-robin allocation preserves every parallel query when
+            # possible while bounding the aggregate result budget exactly.
+            while remaining > 0:
+                progressed = False
+                for index, _ in search_calls:
+                    allocated = per_call_search_topk.get(index, 0)
+                    if allocated >= requested[index]:
+                        continue
+                    per_call_search_topk[index] = allocated + 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining == 0:
+                        break
+                if not progressed:
+                    break
 
         observation = ""
-        for fn in fn_call:
+        for call_index, fn in enumerate(fn_call):
             name = fn["function"]
             if name == "search":
+                if (
+                    self.search_call_budget is not None
+                    and self.stats["search"] >= self.search_call_budget
+                ):
+                    observation += "[Search-call budget exhausted.]\n"
+                    continue
                 self.stats["search"] += 1
                 query = fn["arguments"].get("query", "")
                 topk = (lambda v: int(v) if str(v).isdigit() else 10)(fn["arguments"].get("topk", 10))
@@ -317,6 +401,14 @@ class BrowseCompEnv:
                 if not query:
                     observation += '[Error] The "search" function requires a "query" argument.'
                     continue
+                if self.search_total_topk_per_turn is not None:
+                    topk = per_call_search_topk.get(call_index, 0)
+                    if topk <= 0:
+                        observation += (
+                            f'[Search skipped for "{query}": this turn\'s shared '
+                            "search-result budget was exhausted.]\n"
+                        )
+                        continue
                 observation += f'[Search Results for "{query}"]\n'
                 try:
                     serp = await self.client.search(query, 50)
@@ -332,10 +424,14 @@ class BrowseCompEnv:
                             "open_page tool to inspect the full content) "
                             + " ".join(page["text"].split()[:128])
                         )
-                        show_topk += 0.25
+                        show_topk += (
+                            1 if self.search_count_revisits_as_full else 0.25
+                        )
                     else:
                         self.visited_pages.add(page["docid"])
-                        page["text"] = " ".join(page["text"].split()[: _int_env("BROWSECOMP_SEARCH_SNIPPET_WORDS", 512)])
+                        page["text"] = " ".join(
+                            page["text"].split()[: self.search_snippet_words]
+                        )
                         show_topk += 1
                     observation += (
                         f"\n--- #{i}: {page['docid']}---\n"
@@ -348,6 +444,12 @@ class BrowseCompEnv:
                 observation += "\n"
 
             elif name == "open_page":
+                if (
+                    self.open_page_call_budget is not None
+                    and self.stats["open_page"] >= self.open_page_call_budget
+                ):
+                    observation += "[Open-page-call budget exhausted.]\n"
+                    continue
                 self.stats["open_page"] += 1
                 url = fn["arguments"].get("url", None)
                 docid = fn["arguments"].get("docid", None)
@@ -360,7 +462,9 @@ class BrowseCompEnv:
                     observation += f"[Error] open_page backend rejected the request: {e}\n"
                     continue
                 for page in open_pages:
-                    page["text"] = keep_first_n_words(page["text"], _int_env("BROWSECOMP_OPEN_PAGE_WORDS", 4096))
+                    page["text"] = keep_first_n_words(
+                        page["text"], self.open_page_words
+                    )
                     observation += (
                         f"[Opened Page Content]\n"
                         f"docid: {page['docid']}\n"
@@ -418,5 +522,38 @@ class BrowseCompEnv:
             else:
                 observation = f'[Error] The function "{name}" is not supported.'
 
-        observation += REFLECT_NUDGE
+        search_left = (
+            None
+            if self.search_call_budget is None
+            else max(0, self.search_call_budget - self.stats["search"])
+        )
+        open_left = (
+            None
+            if self.open_page_call_budget is None
+            else max(0, self.open_page_call_budget - self.stats["open_page"])
+        )
+        exhausted = (
+            search_left == 0
+            and open_left == 0
+            and search_left is not None
+            and open_left is not None
+        )
+        if exhausted and self.budget_exhausted_prompt:
+            observation += "\n\n" + self.budget_exhausted_prompt.format(
+                search_used=self.stats["search"],
+                search_budget=self.search_call_budget,
+                open_used=self.stats["open_page"],
+                open_budget=self.open_page_call_budget,
+            )
+        elif self.followup_prompt:
+            observation += "\n\n" + self.followup_prompt.format(
+                search_used=self.stats["search"],
+                search_budget=self.search_call_budget,
+                search_remaining=search_left,
+                open_used=self.stats["open_page"],
+                open_budget=self.open_page_call_budget,
+                open_remaining=open_left,
+            )
+        else:
+            observation += REFLECT_NUDGE
         return {"observation": observation.strip()}

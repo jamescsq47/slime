@@ -1,0 +1,32 @@
+schema_version: 1
+datasets:
+  - id: swe_bench_verified_openenv_structured_tool_8k_t64_500
+    harness: swe_bench_openenv
+    path: ${PD_DATA_ROOT}/swe-bench-verified/test.jsonl
+    weight: 1
+    options:
+      max_response_tokens: 81920
+      max_tokens_per_turn: 8192
+      model_api: chat_completions
+      action_protocol: openai_tools
+      enable_thinking: true
+      max_turns: 64
+      history_messages: 12
+      max_observation_chars: 12000
+      max_identical_command_outcomes: 4
+      max_repeated_failing_commands: 0
+      command_timeout_seconds: 600
+      container_start_timeout_seconds: 600
+      container_network: none
+      sandbox_backend: docker
+      verifier_mode: inline
+      verifier_timeout_seconds: 2400
+      verifier_max_concurrent: 16
+      verifier_output_tail_chars: 12000
+sampling:
+  policy: random
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1

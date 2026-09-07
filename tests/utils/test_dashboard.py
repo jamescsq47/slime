@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from slime.dashboard.api import span as dashboard_span
+from slime.dashboard.backend import _args_snapshot
+from slime.dashboard.collector import summarize_sglang_records
 from slime.dashboard.gpu_sampler import GpuSampler
 from slime.dashboard.hooks import TraceEventSink
 from slime.dashboard.reader import DashboardReader
@@ -26,6 +28,17 @@ class _RemoteMethod:
 class _CollectorHandle:
     def __init__(self):
         self.push = _RemoteMethod()
+
+
+@pytest.mark.unit
+def test_dashboard_args_snapshot_includes_post_resume_expansion_grace():
+    args = SimpleNamespace(
+        adaptive_group_oversampling_post_resume_expansion_grace_seconds=30.0
+    )
+
+    assert _args_snapshot(args) == {
+        "adaptive_group_oversampling_post_resume_expansion_grace_seconds": 30.0
+    }
 
 
 @pytest.mark.unit
@@ -201,6 +214,32 @@ def test_sglang_scraper_attaches_explicit_worker_gpu():
     records = scraper.scrape_once(timestamp=123.0)
 
     assert records[0]["labels"]["gpu"] == "5"
+
+
+@pytest.mark.unit
+def test_summarize_sglang_records_aggregates_workers():
+    records = []
+    for worker, throughput, running, queued, kv_usage in (
+        ("worker-a", 120.0, 3.0, 4.0, 0.5),
+        ("worker-b", 180.0, 5.0, 6.0, 0.7),
+    ):
+        for metric, value in (
+            ("sglang_gen_throughput", throughput),
+            ("sglang_num_running_reqs", running),
+            ("sglang_num_queue_reqs", queued),
+            ("sglang_token_usage", kv_usage),
+        ):
+            records.append({"metric": metric, "worker_addr": worker, "value": value})
+
+    assert summarize_sglang_records(records) == {
+        "sglang/total_gen_throughput_tokens_per_sec": 300.0,
+        "sglang/avg_gen_throughput_per_engine": 150.0,
+        "sglang/total_running_requests": 8.0,
+        "sglang/total_queued_requests": 10.0,
+        "sglang/avg_kv_cache_usage": 0.6,
+        "sglang/max_kv_cache_usage": 0.7,
+        "sglang/max_kv_cache_engine_queued_requests": 6.0,
+    }
 
 
 class _FakeNvml:

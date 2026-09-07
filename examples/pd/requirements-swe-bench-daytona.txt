@@ -1,0 +1,3 @@
+-r requirements-swe-bench.txt
+# Optional remote sandbox backend; local Docker does not import this package.
+daytona==0.203.0

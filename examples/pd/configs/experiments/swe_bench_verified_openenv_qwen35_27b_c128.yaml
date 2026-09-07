@@ -1,0 +1,35 @@
+schema_version: 1
+datasets:
+  - id: swe_bench_verified_openenv
+    harness: swe_bench_openenv
+    path: ${PD_DATA_ROOT}/swe-bench-verified/test.jsonl
+    weight: 1
+    options:
+      # Miles PR #51 OpenEnv-style loop: policy emits one shell action per
+      # turn, then the durable repository patch is graded after policy exit.
+      max_response_tokens: 81920
+      max_tokens_per_turn: 8192
+      # Use SGLang's OpenAI entrypoint so the official qwen3 reasoning parser
+      # separates reasoning_content from the executable assistant content.
+      model_api: chat_completions
+      enable_thinking: true
+      max_turns: 64
+      history_messages: 12
+      max_observation_chars: 12000
+      max_identical_command_outcomes: 4
+      max_repeated_failing_commands: 0
+      command_timeout_seconds: 600
+      container_start_timeout_seconds: 600
+      container_network: none
+      sandbox_backend: docker
+      verifier_mode: inline
+      verifier_timeout_seconds: 2400
+      verifier_max_concurrent: 16
+      verifier_output_tail_chars: 12000
+sampling:
+  policy: random
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1

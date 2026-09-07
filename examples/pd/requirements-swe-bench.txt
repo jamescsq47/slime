@@ -1,0 +1,2 @@
+# Miles/Harbor verifier API used by data/swe_bench/verifier.py.
+swebench==4.0.3

@@ -12,6 +12,46 @@ from slime.dashboard.store import JsonlStore, PARTITIONED_STREAMS
 logger = logging.getLogger(__name__)
 
 
+def summarize_sglang_records(records: list[dict]) -> dict[str, float]:
+    """Aggregate one SGLang scrape without issuing another metrics request."""
+    values_by_metric: dict[str, dict[str, float]] = {}
+    for record in records:
+        worker = record.get("worker_addr")
+        if worker in (None, "router"):
+            continue
+        metric = str(record.get("metric", ""))
+        if metric not in {
+            "sglang_gen_throughput",
+            "sglang_num_running_reqs",
+            "sglang_num_queue_reqs",
+            "sglang_token_usage",
+        }:
+            continue
+        values_by_metric.setdefault(metric, {})[str(worker)] = float(record.get("value", 0.0))
+
+    throughput = list(values_by_metric.get("sglang_gen_throughput", {}).values())
+    if not throughput:
+        return {}
+
+    running = list(values_by_metric.get("sglang_num_running_reqs", {}).values())
+    queued = list(values_by_metric.get("sglang_num_queue_reqs", {}).values())
+    kv_by_worker = values_by_metric.get("sglang_token_usage", {})
+    queued_by_worker = values_by_metric.get("sglang_num_queue_reqs", {})
+    kv_usage = list(kv_by_worker.values())
+    max_kv_worker = max(kv_by_worker, key=kv_by_worker.get) if kv_by_worker else None
+    return {
+        "sglang/total_gen_throughput_tokens_per_sec": sum(throughput),
+        "sglang/avg_gen_throughput_per_engine": sum(throughput) / len(throughput),
+        "sglang/total_running_requests": sum(running),
+        "sglang/total_queued_requests": sum(queued),
+        "sglang/avg_kv_cache_usage": sum(kv_usage) / len(kv_usage) if kv_usage else 0.0,
+        "sglang/max_kv_cache_usage": kv_by_worker.get(max_kv_worker, 0.0),
+        "sglang/max_kv_cache_engine_queued_requests": queued_by_worker.get(
+            max_kv_worker, 0.0
+        ),
+    }
+
+
 class DashboardCollector:
     """Single-writer ingest actor for all dashboard telemetry."""
 
@@ -39,6 +79,7 @@ class DashboardCollector:
         self._samplers: dict[str, Any] = {}
         self._self_handle = None
         self._dropped = 0
+        self._latest_sglang_summary: dict[str, float] = {}
         self._warner = RateLimitedWarner(logger)
 
     def ping(self) -> bool:
@@ -92,6 +133,10 @@ class DashboardCollector:
                 "dropped": self._dropped,
             }
 
+    def get_sglang_summary(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._latest_sglang_summary)
+
     def flush(self) -> int:
         with self._lock:
             if self._dropped:
@@ -131,6 +176,10 @@ class DashboardCollector:
 
     def _push_engine_records(self, records: list[dict]) -> None:
         self.push("engine", records)
+        summary = summarize_sglang_records(records)
+        if summary:
+            with self._lock:
+                self._latest_sglang_summary = summary
 
     def _flush_loop(self) -> None:
         while not self._stop.wait(self.flush_interval):

@@ -542,10 +542,23 @@ class RolloutManager:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
 
+        update_token_load_order = getattr(
+            self.data_source,
+            "update_token_load_adaptive_order",
+            None,
+        )
+        if update_token_load_order is not None:
+            scheduling_metrics = update_token_load_order(data)
+            if scheduling_metrics:
+                if metrics is None:
+                    metrics = {}
+                metrics.update(scheduling_metrics)
+
         train_time_masked_count = 0
         if (
             getattr(self.args, "mask_offpolicy_math", None) is not None
             or getattr(self.args, "mask_offpolicy_qa", None) is not None
+            or getattr(self.args, "mask_offpolicy_terminal", None) is not None
         ):
             for sample in data:
                 train_time_masked_count += int(self._apply_train_time_offpolicy_mask(sample))
@@ -559,6 +572,7 @@ class RolloutManager:
             or getattr(self.data_source, 'count_aware_alternation', False)
             or getattr(self.args, 'mask_offpolicy_math', None) is not None
             or getattr(self.args, 'mask_offpolicy_qa', None) is not None
+            or getattr(self.args, 'mask_offpolicy_terminal', None) is not None
         )
         if need_task_counts:
             task_counts = {}
@@ -572,8 +586,8 @@ class RolloutManager:
             logger.info(f"[v{version}] recorded training composition: {task_counts}")
 
             # Count effective (unmasked) samples and max version lag.
-            sample_effective_counts = {"math": 0, "qa": 0}
-            sample_masked_counts = {"math": 0, "qa": 0}
+            sample_effective_counts = {"math": 0, "qa": 0, "terminal": 0}
+            sample_masked_counts = {"math": 0, "qa": 0, "terminal": 0}
             total_sample_effective = 0
             total_sample_masked = 0
             max_version_lag = 0
@@ -600,9 +614,11 @@ class RolloutManager:
             train_metrics = {
                 "tool/math_sample_effective": sample_effective_counts.get("math", 0),
                 "tool/qa_sample_effective": sample_effective_counts.get("qa", 0),
+                "tool/terminal_sample_effective": sample_effective_counts.get("terminal", 0),
                 "tool/total_sample_effective": total_sample_effective,
                 "tool/math_sample_masked": sample_masked_counts.get("math", 0),
                 "tool/qa_sample_masked": sample_masked_counts.get("qa", 0),
+                "tool/terminal_sample_masked": sample_masked_counts.get("terminal", 0),
                 "tool/total_sample_masked": total_sample_masked,
                 "tool/max_version_lag": max_version_lag,
                 **(lag_metrics or {}),
@@ -620,7 +636,7 @@ class RolloutManager:
         return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
 
     def _compute_lag_sample_metrics(self, samples, current_version):
-        """Compute per-group lag_sample_math and lag_sample_qa metrics.
+        """Compute per-group lag-sample metrics for all mixed domains.
 
         For each group, computes how many samples of its task type were trained
         across the versions between its dispatch_version and current_version.
@@ -654,6 +670,7 @@ class RolloutManager:
         # Compute lag_sample per group
         math_lag_samples = []
         qa_lag_samples = []
+        terminal_lag_samples = []
 
         for gid, info in groups.items():
             dispatch_version = info["dispatch_version"]
@@ -671,13 +688,16 @@ class RolloutManager:
 
             if task_type == "math":
                 math_lag_samples.append(lag_sample)
-            else:
+            elif task_type == "qa":
                 qa_lag_samples.append(lag_sample)
+            elif task_type == "terminal":
+                terminal_lag_samples.append(lag_sample)
 
         logger.info(
             f"[lag_metrics] current_version={current_version}, "
             f"version_task_counts_keys={list(version_task_counts.keys())}, "
-            f"groups={len(groups)}, math_lags={len(math_lag_samples)}, qa_lags={len(qa_lag_samples)}"
+            f"groups={len(groups)}, math_lags={len(math_lag_samples)}, "
+            f"qa_lags={len(qa_lag_samples)}, terminal_lags={len(terminal_lag_samples)}"
         )
 
         result = {}
@@ -687,6 +707,9 @@ class RolloutManager:
         if qa_lag_samples:
             result["tool/lag_sample_qa_average"] = sum(qa_lag_samples) / len(qa_lag_samples)
             result["tool/lag_sample_qa_max"] = max(qa_lag_samples)
+        if terminal_lag_samples:
+            result["tool/lag_sample_terminal_average"] = sum(terminal_lag_samples) / len(terminal_lag_samples)
+            result["tool/lag_sample_terminal_max"] = max(terminal_lag_samples)
 
         return result
 
@@ -884,6 +907,8 @@ class RolloutManager:
             return getattr(self.args, "mask_offpolicy_math", None)
         if task_type == "qa":
             return getattr(self.args, "mask_offpolicy_qa", None)
+        if task_type == "terminal":
+            return getattr(self.args, "mask_offpolicy_terminal", None)
         return None
 
     def _get_train_time_lag_sample_decision(self, sample: Sample) -> tuple[bool, int | None, int | None]:

@@ -6,7 +6,7 @@ import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 import numpy as np
@@ -38,6 +38,8 @@ __all__ = ["generate_rollout", "get_model_url"]
 logger = logging.getLogger(__name__)
 PARTIAL_ROLLOUT_TOOL_HANDOFF_DRAIN_TIMEOUT = 0.5
 PARTIAL_ROLLOUT_TOOL_INFLIGHT_KEY = "partial_rollout_tool_inflight"
+PARTIAL_ROLLOUT_TOOL_RESUME_PENDING_KEY = "partial_rollout_tool_resume_pending"
+PARTIAL_ROLLOUT_TOOL_RESUME_PRIORITY_KEY = "partial_rollout_tool_resume_priority"
 PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY = "partial_rollout_sglang_inflight"
 PARTIAL_ROLLOUT_SGLANG_DRAIN_TIMEOUT = 30.0
 
@@ -155,9 +157,33 @@ def track_sglang_generation(sample: Sample):
         sample.metadata.pop(PARTIAL_ROLLOUT_SGLANG_INFLIGHT_KEY, None)
 
 
+async def prioritize_tool_resume(args: Namespace, sample: Sample) -> None:
+    """Mark the next request for the tool-resume FIFO when it is enabled."""
+    prioritize = getattr(args, "_sglang_generation_slot_prioritize", None)
+    if prioritize is not None:
+        sample.metadata[PARTIAL_ROLLOUT_TOOL_RESUME_PRIORITY_KEY] = True
+        prioritize(sample)
+
+
+@asynccontextmanager
+async def sglang_generation_slot(args: Namespace, sample: Sample):
+    """Hold one request-level GPU slot only while `/generate` is in flight."""
+    acquire = getattr(args, "_sglang_generation_slot_acquire", None)
+    release = None
+    if acquire is not None:
+        resume = bool(sample.metadata.pop(PARTIAL_ROLLOUT_TOOL_RESUME_PRIORITY_KEY, False))
+        release = await acquire(sample, resume)
+    try:
+        with track_sglang_generation(sample):
+            yield
+    finally:
+        if release is not None:
+            release()
+
+
 def _count_inflight_sglang_requests(state: GenerateState) -> int:
     count = 0
-    for group in state.pending_groups.values():
+    for group in getattr(state, "pending_groups", {}).values():
         for item in group:
             samples = item if isinstance(item, list) else [item]
             count += sum(
@@ -455,7 +481,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             headers = {"X-SMG-Routing-Key": sample.session_id}
 
     with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
-        with track_sglang_generation(sample):
+        async with sglang_generation_slot(args, sample):
             output = await post(url, payload, headers=headers)
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
 
@@ -502,6 +528,10 @@ async def generate_and_rm(
     evaluation: bool = False,
     expected_abort_epoch: int | None = None,
 ) -> Sample | list[Sample]:
+    activate_sample = getattr(args, "_sglang_sample_activation_acquire", None)
+    if activate_sample is not None and not isinstance(sample, list):
+        await activate_sample(sample)
+
     # mask previous off-policy generation for partial rollout
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
@@ -520,8 +550,7 @@ async def generate_and_rm(
 
     state = GenerateState(args)
 
-    # generate
-    async with state.semaphore:
+    async def run_generate():
         if state.aborted or (expected_abort_epoch is not None and state.abort_epoch != expected_abort_epoch):
             sample.status = Sample.Status.ABORTED
             return sample
@@ -533,11 +562,39 @@ async def generate_and_rm(
             custom_generate_func = load_function(custom_func_path)
             # if signature has evaluation, pass evaluation
             if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
+                return await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
             else:
-                sample = await custom_generate_func(args, sample, sampling_params)
+                return await custom_generate_func(args, sample, sampling_params)
+        return await generate(args, sample, sampling_params)
+
+    # The legacy path limits whole sample lifetimes. The decoupled path limits
+    # each actual SGLang request inside sglang_generation_slot instead, so tool
+    # and reward waits never consume GPU generation capacity.
+    try:
+        if getattr(args, "_sglang_generation_slot_acquire", None) is None:
+            async with state.semaphore:
+                sample = await run_generate()
         else:
-            sample = await generate(args, sample, sampling_params)
+            sample = await run_generate()
+    except BaseException:
+        discard_resume = getattr(args, "_sglang_generation_slot_discard", None)
+        if discard_resume is not None and not isinstance(sample, list):
+            discard_resume(sample)
+        raise
+
+    if not isinstance(sample, list) and sample.status in {
+        Sample.Status.COMPLETED,
+        Sample.Status.TRUNCATED,
+    }:
+        discard_resume = getattr(args, "_sglang_generation_slot_discard", None)
+        if discard_resume is not None:
+            discard_resume(sample)
+
+    if not isinstance(sample, list) and sample.status == Sample.Status.ABORTED:
+        discard_resume = getattr(args, "_sglang_generation_slot_discard", None)
+        if discard_resume is not None:
+            discard_resume(sample)
+        return sample
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -567,24 +624,196 @@ async def generate_and_rm(
     return sample
 
 
+def _sample_needs_group_work(args: Namespace, sample: Sample) -> bool:
+    return not (
+        sample.status in {Sample.Status.COMPLETED, Sample.Status.TRUNCATED}
+        and (args.group_rm or sample.reward is not None)
+    )
+
+
+async def _generate_and_rm_group_resumable(
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool,
+    resume_event: asyncio.Event,
+    on_sample_dispatch: Callable[[Sample, int], None] | None,
+    sample_done_callback: Callable[[], None] | None,
+) -> list[Sample]:
+    """Run group members independently while retaining one completion barrier.
+
+    A weight update clears ``resume_event`` before SGLang is aborted. Children
+    already inside CPU/network tools may finish in the old task, while aborted
+    generation siblings remain idle. Once the new weights are active, setting
+    ``resume_event`` lets only those idle siblings resume immediately; it does
+    not wait for the old-epoch tool children.
+    """
+    state = GenerateState(args)
+    parent_task = asyncio.current_task()
+    active: dict[int, tuple[asyncio.Task, int]] = {}
+    credited_indices: set[int] = set()
+
+    def release_sample_slot(idx: int) -> None:
+        if idx in credited_indices:
+            return
+        credited_indices.add(idx)
+        if sample_done_callback is not None:
+            sample_done_callback()
+
+    def refresh_child_tracking() -> None:
+        if parent_task is not None:
+            state.group_child_tasks[parent_task] = [
+                (task, group[idx]) for idx, (task, _) in active.items()
+            ]
+
+    def start_ready_children() -> None:
+        if state.aborted or not resume_event.is_set():
+            return
+        child_epoch = state.abort_epoch
+        for idx, sample in enumerate(group):
+            if idx in active:
+                continue
+            if not _sample_needs_group_work(args, sample):
+                # Recycled partial groups may already contain terminal
+                # siblings. This submission reserved one virtual sample slot
+                # for every group member, so an already-finished member
+                # releases its slot immediately.
+                release_sample_slot(idx)
+                continue
+            if on_sample_dispatch is not None:
+                on_sample_dispatch(sample, idx)
+            current_sampling_params = sampling_params.copy()
+            if getattr(args, "sglang_enable_deterministic_inference", False):
+                current_sampling_params["sampling_seed"] = state.group_sampling_seeds[idx]
+            task = asyncio.create_task(
+                generate_and_rm(
+                    args,
+                    sample,
+                    current_sampling_params,
+                    evaluation=evaluation,
+                    expected_abort_epoch=child_epoch,
+                )
+            )
+            active[idx] = (task, child_epoch)
+        refresh_child_tracking()
+
+    try:
+        while True:
+            start_ready_children()
+            if not active:
+                if not any(_sample_needs_group_work(args, sample) for sample in group):
+                    break
+                await resume_event.wait()
+                # GenerateState.reset() can clear the boolean abort before the
+                # weight sync is complete. The event is the authoritative gate,
+                # but yield once so after_weight_update can publish the epoch.
+                await asyncio.sleep(0)
+                continue
+
+            wait_tasks = [task for task, _ in active.values()]
+            resume_waiter = None
+            if not resume_event.is_set():
+                resume_waiter = asyncio.create_task(resume_event.wait())
+                wait_tasks.append(resume_waiter)
+            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+            if resume_waiter is not None:
+                if resume_waiter in done:
+                    done.remove(resume_waiter)
+                else:
+                    resume_waiter.cancel()
+                    await asyncio.gather(resume_waiter, return_exceptions=True)
+
+            for idx, (task, child_epoch) in list(active.items()):
+                if task not in done:
+                    continue
+                active.pop(idx)
+                try:
+                    result = task.result()
+                except asyncio.CancelledError:
+                    if group[idx].status == Sample.Status.PENDING:
+                        group[idx].status = Sample.Status.ABORTED
+                    raise
+                except BaseException:
+                    if group[idx].status == Sample.Status.PENDING:
+                        group[idx].status = Sample.Status.ABORTED
+                    raise
+                group[idx] = result
+
+                # An abort without an epoch change is not a weight-boundary
+                # handoff. Return it to the caller's normal recycle path rather
+                # than spinning and retrying forever in this coordinator.
+                if (
+                    group[idx].status == Sample.Status.ABORTED
+                    and state.abort_epoch == child_epoch
+                    and resume_event.is_set()
+                ):
+                    return group
+                if not _sample_needs_group_work(args, group[idx]):
+                    release_sample_slot(idx)
+            refresh_child_tracking()
+
+        if args.group_rm:
+            with trace_span(group, "group_reward_model"):
+                rewards = await batched_async_rm(args, group)
+            for sample, reward in zip(group, rewards, strict=False):
+                sample.reward = reward
+        return group
+    finally:
+        remaining = [task for task, _ in active.values() if not task.done()]
+        for task in remaining:
+            task.cancel()
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
+        # A submitted group reserves exactly len(group) sample slots. If the
+        # coordinator exits early (non-boundary abort, exception, or
+        # cancellation), release every slot not already returned by a
+        # terminal member. Weight-boundary partial resumes do not reach this
+        # finally block, so they never create duplicate completion credits.
+        for idx in range(len(group)):
+            release_sample_slot(idx)
+        if parent_task is not None:
+            state.group_child_tasks.pop(parent_task, None)
+
+
 @trace_function(
     "generate_and_rm_group",
     target="group",
-    attrs_getter=lambda args, group, sampling_params, evaluation=False: {"group_size": len(group)},
+    attrs_getter=lambda args, group, sampling_params, evaluation=False, **_: {"group_size": len(group)},
 )
 async def generate_and_rm_group(
-    args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+    *,
+    resume_event: asyncio.Event | None = None,
+    on_sample_dispatch: Callable[[Sample, int], None] | None = None,
+    sample_done_callback: Callable[[], None] | None = None,
 ) -> list[Sample]:
     state = GenerateState(args)
     group_abort_epoch = state.abort_epoch
 
     if state.aborted:
+        if sample_done_callback is not None:
+            for _ in group:
+                sample_done_callback()
         return group
 
     # Generate a unique session_id for each sample in the group
     for sample in group:
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
+
+    if resume_event is not None:
+        return await _generate_and_rm_group_resumable(
+            args,
+            group,
+            sampling_params,
+            evaluation,
+            resume_event,
+            on_sample_dispatch,
+            sample_done_callback,
+        )
 
     task_entries = []
     for idx, sample in enumerate(group):
@@ -594,9 +823,9 @@ async def generate_and_rm_group(
         # terminal response whose reward request was interrupted; running it
         # through generate_and_rm retries only the reward (see the early
         # return there) and never regenerates tokens.
-        if sample.status in {Sample.Status.COMPLETED, Sample.Status.TRUNCATED} and (
-            args.group_rm or sample.reward is not None
-        ):
+        if not _sample_needs_group_work(args, sample):
+            if sample_done_callback is not None:
+                sample_done_callback()
             continue
 
         current_sampling_params = sampling_params.copy()
@@ -612,6 +841,11 @@ async def generate_and_rm_group(
                 expected_abort_epoch=group_abort_epoch,
             )
         )
+        if sample_done_callback is not None:
+            # Every child outcome releases the slot reserved by this group
+            # submission. Failed or cancelled children must count as well,
+            # otherwise sample-level concurrency decays after errors.
+            task.add_done_callback(lambda _task: sample_done_callback())
         task_entries.append((idx, sample, task))
 
     parent_task = asyncio.current_task()
@@ -1219,6 +1453,9 @@ async def eval_rollout_single_dataset(
             sample = copy.deepcopy(prompt_sample)
             sample.index = sample_index
             sample_index += 1
+            # Each eval trajectory needs its own stable routing key. Reusing a
+            # copied prompt's session_id would make repeated samples collide.
+            sample.session_id = str(uuid.uuid4())
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
             sampling_params = base_sampling_params

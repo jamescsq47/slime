@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Full SWE-bench Verified correctness/profile run. Physical topology is 2P:6D;
+# TP=2 makes this one logical Prefill replica and three Decode replicas.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+export MODEL_PATH="${MODEL_PATH:-/homes/siqic/Qwen3-32B}"
+export PD_DATA_ROOT="${PD_DATA_ROOT:-/tmp/pd-data}"
+export WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-${SCRIPT_DIR}/../../configs/experiments/swe_bench_verified_full_c128.yaml}"
+
+export PREFILL_GPU_GROUPS="${PREFILL_GPU_GROUPS:-0,4}"
+export DECODE_GPU_GROUPS="${DECODE_GPU_GROUPS:-1,5;2,6;3,7}"
+export PREFILL_TP_SIZE=2
+export DECODE_TP_SIZE=2
+export PREFILL_PORTS="${PREFILL_PORTS:-27300}"
+export BOOTSTRAP_PORTS="${BOOTSTRAP_PORTS:-28300}"
+export DECODE_PORTS="${DECODE_PORTS:-27301 27302 27303}"
+
+export PD_SKIP_SEARCH=1
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
+export DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-0.80 0.80 0.80}"
+export PD_PAGE_SIZE="${PD_PAGE_SIZE:-64}"
+export MAX_CONTEXT_LENGTH="${MAX_CONTEXT_LENGTH:-40960}"
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-36864}"
+export PREFILL_CHUNKED_PREFILL_SIZE="${PREFILL_CHUNKED_PREFILL_SIZE:-8192}"
+export PREFILL_MAX_PREFILL_TOKENS="${PREFILL_MAX_PREFILL_TOKENS:-16384}"
+
+# Exactly one pass over all 500 Verified tasks. No warmup samples and no
+# duration cutoff: every selected task must reach a durable result row.
+export REQUESTS="${REQUESTS:-500}"
+export WARMUP_REQUESTS=0
+export MAX_INFLIGHT="${MAX_INFLIGHT:-128}"
+export ARRIVAL_RATE="${ARRIVAL_RATE:-100}"
+export ARRIVAL_RATES="${ARRIVAL_RATES:-${ARRIVAL_RATE}}"
+export ARRIVAL_DISTRIBUTION=fixed
+export CLOSED_LOOP=0
+export DISPATCH_POLICY=random
+export SCHEDULE_FILE=""
+export PRESERVE_SOURCE_ORDER=true
+export SEED="${SEED:-2026}"
+export TEMPERATURE="${TEMPERATURE:-0}"
+export TOP_P="${TOP_P:-1}"
+export TOP_K="${TOP_K:--1}"
+
+export FAST_TOOL_THRESHOLD_SECONDS="${FAST_TOOL_THRESHOLD_SECONDS:-2}"
+export DIRECT_WAIT_SECONDS="${DIRECT_WAIT_SECONDS:-2}"
+export EARLY_CLAIM_POST_TIMEOUT_SECONDS="${EARLY_CLAIM_POST_TIMEOUT_SECONDS:-2}"
+export DIRECT_IO_CAP="${DIRECT_IO_CAP:-8}"
+export SELECTED_IO_CAP="${SELECTED_IO_CAP:-4}"
+export P_H2D_MAX_INFLIGHT="${P_H2D_MAX_INFLIGHT:-4}"
+export MAX_PREFILL_INFLIGHT="${MAX_PREFILL_INFLIGHT:-12}"
+export D_TARGET_KV_FRACTION="${D_TARGET_KV_FRACTION:-1.0}"
+export P_ACCEPT_TIMEOUT_SECONDS="${P_ACCEPT_TIMEOUT_SECONDS:-600}"
+export P2D_HOST_STAGING="${P2D_HOST_STAGING:-true}"
+export P2D_HOST_ARENA_GIB_PER_P="${P2D_HOST_ARENA_GIB_PER_P:-64}"
+export PD_HICACHE_PREFETCH_THRESHOLD="${PD_HICACHE_PREFETCH_THRESHOLD:-1000000}"
+
+export PD_LATE_BIND_NUMA_DOMAINS=0
+export SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS=0
+export SGLANG_PD_LATE_BIND_GLOBAL_DECODE=1
+
+export RUN_DIR="${RUN_DIR:-/tmp/pd-runs/qwen3-32b-tp2-swe-bench-verified-2p6d-c128-full-20260824-r1}"
+
+exec bash "${SCRIPT_DIR}/run_2p6d_numa_case.sh"

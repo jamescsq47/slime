@@ -118,6 +118,8 @@ export SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB:-128}"
 export SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH="${SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH:-${PD_P_READY_DIR}/early-claims/prefill-loads.json}"
+export SGLANG_AGENTIC_KV_HOST_CAPACITY_PATH="${SGLANG_AGENTIC_KV_HOST_CAPACITY_PATH:-${PD_P_READY_DIR}/early-claims/host-capacities.json}"
+export SGLANG_AGENTIC_KV_HOST_PLACEMENT_RESERVATION_PATH="${SGLANG_AGENTIC_KV_HOST_PLACEMENT_RESERVATION_PATH:-${PD_P_READY_DIR}/early-claims/host-placement-reservations.json}"
 export SGLANG_AGENTIC_KV_P2D_HOST_STAGING="${SGLANG_AGENTIC_KV_P2D_HOST_STAGING:-false}"
 if [[ "${SGLANG_AGENTIC_KV_P2D_HOST_STAGING}" == "true" ]]; then
   export SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH
@@ -169,12 +171,12 @@ export SGLANG_PD_P_READY_REQUEST_CAP="${SGLANG_PD_P_READY_REQUEST_CAP:-0}"
 # Eight concurrent rooms absorb short bursts without a permanent transit pool.
 export SGLANG_AGENTIC_KV_DIRECT_IO_CAP="${SGLANG_AGENTIC_KV_DIRECT_IO_CAP:-8}"
 export SGLANG_PD_DECODE_ENABLE_RADIX_CACHE="${SGLANG_PD_DECODE_ENABLE_RADIX_CACHE:-true}"
-# Bound slow-path pressure on Decode.  Only one gather+D2H chunk is submitted
-# at a time on each D; the background worker returns to Decode before issuing
-# the next chunk.  Completed KV releases are likewise committed one request at
-# a time on the allocator-owning scheduler thread.
-export SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS="${SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS:-512}"
-export SGLANG_AGENTIC_KV_D2H_CHUNK_TOKENS="${SGLANG_AGENTIC_KV_D2H_CHUNK_TOKENS:-512}"
+# Bound slow-path pressure on Decode.  Four lanes may each own one outstanding
+# gather+D2H chunk.  A completed chunk immediately submits its successor, but
+# no lane queues multiple chunks ahead of Decode.  1024 tokens amortizes the
+# control/commit cost while preserving bounded interference.
+export SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS="${SGLANG_AGENTIC_KV_D2H_STAGING_TOKENS:-1024}"
+export SGLANG_AGENTIC_KV_D2H_CHUNK_TOKENS="${SGLANG_AGENTIC_KV_D2H_CHUNK_TOKENS:-1024}"
 export SGLANG_DECODE_IO_MAX_COMMITS_PER_STEP="${SGLANG_DECODE_IO_MAX_COMMITS_PER_STEP:-1}"
 # Once the scheduler has allocated exact P pages and launched reverse NIXL,
 # keep receiver progress independent of long Prefill forwards.  The worker
