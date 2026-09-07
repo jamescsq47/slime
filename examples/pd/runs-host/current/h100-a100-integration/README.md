@@ -96,3 +96,18 @@ Formal result: **4,638.2 Decode token/s** total (**1,159.5 token/s/D**),
 86.81% P Forward per card. Page-aligned reverse Decode-KV reuse was 99.76%.
 Detailed results are in
 [the rerun report](browsecomp-qwen3-8b-tp1-4p4d-c512-prewarm-barrier-w300-m1200-r2/RESULTS.md).
+
+## Formal c384 rerun
+
+The same code and startup barrier were rerun at c384. The formal result is
+**4,700.0 Decode token/s** total (**1,175.0 token/s/D**), 32,669 Prefill
+compute token/s, 2.352 Agent/s, 97.62% D Forward per card and 86.96% P Forward
+per card. Page-aligned reverse Decode-KV reuse was 99.995%; there were no
+request failures, Router 500 responses, OOMs or worker tracebacks.
+
+This is 1.33% above the current c512 run. It does not reproduce the historical
+5,167.5 token/s c384 result because that run used larger D memory fractions
+(`0.85/0.85/0.85/0.74` instead of the current fixed
+`0.80/0.80/0.80/0.60`) and exposed 6.13% more aggregate D KV capacity. Full
+metrics and the apples-to-apples comparison are in
+[the c384 report](browsecomp-qwen3-8b-tp1-4p4d-c384-prewarm-barrier-w300-m1200-r2/RESULTS.md).
