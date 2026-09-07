@@ -856,7 +856,7 @@ def test_async_d_hbm_release_is_committed_only_by_scheduler():
 
     # This call models the background transport thread.  It must never mutate
     # allocator/request-pool state directly.
-    manager._enqueue_agentic_release(req, 0)
+    manager._enqueue_agentic_release(req, 0, snapshot_id="scheduler-release:0")
     assert releases == []
 
     # Only the Decode scheduler's bounded commit drain may release the pages.
@@ -899,7 +899,7 @@ def test_async_d_hbm_release_groups_allocator_frees():
     manager._release_finished_req = release
     reqs = [types.SimpleNamespace(req_pool_idx=i) for i in (7, 8, 9)]
     for req in reqs:
-        manager._enqueue_agentic_release(req, 0)
+        manager._enqueue_agentic_release(req, 0, snapshot_id=f"group-release:{req.req_pool_idx}")
 
     manager._drain_decode_io_events()
 
@@ -924,7 +924,7 @@ def test_async_d_hbm_release_waits_for_short_coalesce_window():
         (released_req, offset)
     )
 
-    manager._enqueue_agentic_release(req, 0)
+    manager._enqueue_agentic_release(req, 0, snapshot_id="coalesced-release:0")
     manager._drain_decode_io_events()
     assert releases == []
 
@@ -951,7 +951,7 @@ def test_pending_release_pages_remain_accounted_before_scheduler_commit():
     )
     manager._release_finished_req = lambda *_args: None
 
-    manager._enqueue_agentic_release(req, 0)
+    manager._enqueue_agentic_release(req, 0, snapshot_id="accounted-release:0")
 
     # The physical allocation occupies 12 pages until the scheduler applies
     # the queued free.  Idle memory checking must not report these as leaked.
