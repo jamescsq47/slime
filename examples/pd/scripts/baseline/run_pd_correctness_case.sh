@@ -76,7 +76,7 @@ if [[ "${CASE_MODE}" != no_reverse ]]; then
 fi
 
 p_args=(--model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${P_PORT}" \
-  --context-length 40960 --page-size 64 --mem-fraction-static 0.85 --enable-metrics \
+  --context-length 40960 --page-size 64 --mem-fraction-static 0.80 --enable-metrics \
   --enable-deterministic-inference --attention-backend triton --random-seed 2026 \
   --disaggregation-mode prefill \
   --disaggregation-transfer-backend nixl --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}")
@@ -94,7 +94,7 @@ p_pid=$!; pd_track_group "${p_pid}"
 pd_wait_http prefill "http://127.0.0.1:${P_PORT}/health" "${p_pid}" 900
 
 d_args=(--model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${D_PORT}" \
-  --context-length 40960 --page-size 64 --mem-fraction-static 0.85 --enable-metrics \
+  --context-length 40960 --page-size 64 --mem-fraction-static 0.80 --enable-metrics \
   --enable-deterministic-inference --attention-backend triton --random-seed 2026 \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend nixl)

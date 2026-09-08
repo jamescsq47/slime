@@ -34,7 +34,7 @@ cat >"${RUN_ROOT}/experiment_config.json" <<EOF
   "measurement_seconds": ${MEASURE_SECONDS},
   "context_length": 40960,
   "page_size": 64,
-  "mem_fraction_static": 0.85,
+  "mem_fraction_static": 0.80,
   "temperature": 0,
   "top_p": 1,
   "top_k": -1
@@ -76,19 +76,24 @@ run_case() {
 
 run_case colocated-4gpu \
   MODEL_GPUS='0 1 2 3' MODEL_PORTS='27700 27701 27702 27703' \
+  MODEL_MEM_FRACTION_STATICS='0.80 0.80 0.80 0.80' \
   ROUTER_PORT=27710 SEARCH_PORT=8770 \
   bash "${SCRIPT_DIR}/run_colocated_case.sh"
 
 run_case pd-no-reverse-1p3d \
   CASE_MODE=no_reverse PREFILL_GPUS='0' PREFILL_PORTS='27800' \
+  PREFILL_MEM_FRACTION_STATICS='0.80' \
   PREFILL_BOOTSTRAP_PORTS='28800' DECODE_GPUS='1 2 3' \
+  DECODE_MEM_FRACTION_STATICS='0.80 0.80 0.80' \
   DECODE_PORTS='27801 27802 27803' ROUTER_PORT=27810 \
   ROUTER_PROMETHEUS_PORT=27820 SEARCH_PORT=8780 \
   bash "${SCRIPT_DIR}/run_pd_case.sh"
 
 run_case pd-native-mooncake-1p3d \
   CASE_MODE=native_mooncake PREFILL_GPUS='0' PREFILL_PORTS='27900' \
+  PREFILL_MEM_FRACTION_STATICS='0.80' \
   PREFILL_BOOTSTRAP_PORTS='28900' DECODE_GPUS='1 2 3' \
+  DECODE_MEM_FRACTION_STATICS='0.80 0.80 0.80' \
   DECODE_PORTS='27901 27902 27903' ROUTER_PORT=27910 \
   ROUTER_PROMETHEUS_PORT=27920 SEARCH_PORT=8790 \
   MOONCAKE_MASTER_PORT=57951 MOONCAKE_CLIENT_PORT=57952 \

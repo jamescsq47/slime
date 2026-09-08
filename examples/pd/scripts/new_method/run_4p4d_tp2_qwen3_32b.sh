@@ -14,7 +14,8 @@ export DECODE_TP_SIZE=2
 export PREFILL_PORTS="${PREFILL_PORTS:-27300 27400}"
 export BOOTSTRAP_PORTS="${BOOTSTRAP_PORTS:-28300 28400}"
 export DECODE_PORTS="${DECODE_PORTS:-27301 27401}"
-export DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-0.85 0.74}"
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
+export DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-0.80 0.60}"
 # GPU7 hosts the retrieval model before the [3,7] Decode group starts.  The
 # group already uses GPU7's lower, uniform KV-pool fraction, so the remaining
 # free-memory difference is expected rather than evidence of a stray process.

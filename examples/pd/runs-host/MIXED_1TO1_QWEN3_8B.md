@@ -5,21 +5,33 @@
 正式结果使用固定 1:1 workload 顺序、temperature 0、8 张 GPU、300 秒预热和
 1,200 秒测量。Decode 为所有 Decode 计算资源的墙钟总吞吐。
 
+> **显存比例校正（2026-09-07）：** 既有 PD 运行给普通 P/D GPU 使用了
+> `mem_fraction_static=0.85`，没有与 colocated 的普通 GPU `0.80`（搜索 GPU 7
+> 为 `0.60`）严格对齐。因此下面所有非 colocated 数字仅保留为历史诊断值，均需
+> 按 `0.80`/GPU 7 `0.60` 重跑；本次只修改配置和标注，不启动实验。
+
+> **新方法语义校正（2026-09-08）：** 当前新方法现在是“工具超过1秒走Slow；
+> 工具1秒内返回时尝试Direct；Direct在1秒内未建立则完整重算”。本文件已有的
+> Agentic-PD 结果全部使用旧“Direct失败→Slow”语义，因此除显存不对齐外也必须
+> 按新方法重跑；现有数值只作为旧版快慢路径的历史记录。
+
 | 方法 | 配置 | 状态 | Decode |
 |---|---|---|---:|
 | Colocated baseline | 8卡，c512 | 完成 | 8,971 token/s |
 | Colocated baseline | 8卡，c640 | 完成 | 8,380 token/s |
 | Colocated baseline | 8卡，c768 | 完成 | 7,141 token/s |
-| 原生 Mooncake | 2P:6D，c512 | 完成 | 3,509 token/s |
-| 原生 Mooncake | 4P:4D，c512 | 完成 | 4,914 token/s |
-| No-reverse PD | 2P:6D，c512 | 完成 | 3,213 token/s |
-| No-reverse PD | 4P:4D，c512 | 完成 | 4,942 token/s |
-| 当前新方法 | 2P:6D，c512，全局Host恢复，temperature=1 | 历史结果，不纳入最终对比 | 9,006 token/s |
-| 当前新方法 | 2P:6D，c512，全局Host恢复、P→D可行请求先行，temperature=0 | 完成 | 9,800 token/s |
-| 当前新方法 | 2P:6D，c640 | 完成 | 9,819 token/s |
-| 当前新方法 | 2P:6D，c768 | 完成 | 9,146 token/s |
+| 原生 Mooncake | 2P:6D，c512 | 需重跑（历史普通卡=0.85） | 3,509 token/s |
+| 原生 Mooncake | 4P:4D，c512 | 需重跑（历史普通卡=0.85） | 4,914 token/s |
+| No-reverse PD | 2P:6D，c512 | 需重跑（历史普通卡=0.85） | 3,213 token/s |
+| No-reverse PD | 4P:4D，c512 | 需重跑（历史普通卡=0.85） | 4,942 token/s |
+| 旧版快慢路径 | 2P:6D，c512，全局Host恢复，temperature=1 | 历史；需重跑（显存、采样与方法均不对齐） | 9,006 token/s |
+| 旧版快慢路径 | 2P:6D，c512，全局Host恢复、P→D可行请求先行，temperature=0 | 需重跑（历史 P=0.85，且不是当前新方法） | 9,800 token/s |
+| 旧版快慢路径 | 2P:6D，c640 | 需重跑（历史 P=0.85，且不是当前新方法） | 9,819 token/s |
+| 旧版快慢路径 | 2P:6D，c768 | 需重跑（历史 P=0.85，且不是当前新方法） | 9,146 token/s |
 
 ## 已完成结果明细
+
+以下非 colocated 明细均待按对齐后的显存比例重跑，不用于最终收益结论。
 
 | 方法 | 并发 | Agent/s | Prefill compute | Decode/Agent | 实际 Prefill/Agent | Parent KV复用 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -30,10 +42,10 @@
 | 原生 Mooncake 4P:4D | 512 | 1.163 | 26,619 token/s | 4,211 tokens | 22,813 tokens | 未统一记录 |
 | No-reverse PD 2P:6D | 512 | 0.748 | 23,010 token/s | 4,282 tokens | 30,661 tokens | 未统一记录 |
 | No-reverse PD 4P:4D | 512 | 1.217 | 42,230 token/s | 4,047 tokens | 34,585 tokens | 未统一记录 |
-| 当前新方法 2P:6D（temperature=1，历史） | 512 | 2.351 | 18,924 token/s | 3,823 tokens | 8,034 tokens | 100.00% |
-| 当前新方法 2P:6D（temperature=0，P→D可行请求先行） | 512 | 2.428 | 18,215 token/s | 4,027 tokens | 7,486 tokens | 100.00% |
-| 当前新方法 2P:6D（temperature=0） | 640 | 2.442 | 18,110 token/s | 4,017 tokens | 7,410 tokens | 100.00% |
-| 当前新方法 2P:6D（temperature=0） | 768 | 2.345 | 18,169 token/s | 3,896 tokens | 7,740 tokens | 98.62% |
+| 旧版快慢路径 2P:6D（temperature=1，需重跑） | 512 | 2.351 | 18,924 token/s | 3,823 tokens | 8,034 tokens | 100.00% |
+| 旧版快慢路径 2P:6D（temperature=0，需重跑） | 512 | 2.428 | 18,215 token/s | 4,027 tokens | 7,486 tokens | 100.00% |
+| 旧版快慢路径 2P:6D（temperature=0，需重跑） | 640 | 2.442 | 18,110 token/s | 4,017 tokens | 7,410 tokens | 100.00% |
+| 旧版快慢路径 2P:6D（temperature=0，需重跑） | 768 | 2.345 | 18,169 token/s | 3,896 tokens | 7,740 tokens | 98.62% |
 
 ## D→P 快慢路径比例
 
@@ -41,10 +53,10 @@
 
 | 方法 | 配置 | Direct | Slow | Direct/Slow 比例 |
 |---|---|---:|---:|---:|
-| 当前新方法（temperature=1，历史） | 2P:6D，c512 | 8,814 | 355 | 96.13% / 3.87% |
-| 当前新方法（temperature=0，P→D可行请求先行） | 2P:6D，c512 | 10,715 | 84 | 99.22% / 0.78% |
-| 当前新方法（temperature=0） | 2P:6D，c640 | 9,564 | 641 | 93.72% / 6.28% |
-| 当前新方法（temperature=0） | 2P:6D，c768 | 9,384 | 799 | 92.15% / 7.85% |
+| 旧版快慢路径（temperature=1，需重跑） | 2P:6D，c512 | 8,814 | 355 | 96.13% / 3.87% |
+| 旧版快慢路径（temperature=0，需重跑） | 2P:6D，c512 | 10,715 | 84 | 99.22% / 0.78% |
+| 旧版快慢路径（temperature=0，需重跑） | 2P:6D，c640 | 9,564 | 641 | 93.72% / 6.28% |
+| 旧版快慢路径（temperature=0，需重跑） | 2P:6D，c768 | 9,384 | 799 | 92.15% / 7.85% |
 | Colocated / No-reverse / 原生 Mooncake | — | — | — | 不适用 |
 
 ## 稳态资源明细
@@ -62,10 +74,10 @@ KV pool，因此只在 D KV/running/queue 栏记录整体引擎状态。
 | 原生 Mooncake 4P:4D c512 | 70.4% | 6.6% | 5.0 | 1.5 | 99.6% | 88.5% | 49.9 | 0.0 | 8.0 |
 | No-reverse 2P:6D c512 | 100.0% | 7.0% | 103.7 | 1.1 | 98.0% | 91.1% | 8.4 | 0.0 | 35.7 |
 | No-reverse 4P:4D c512 | 91.7% | 6.5% | 9.7 | 1.1 | 99.8% | 88.5% | 41.2 | 0.0 | 12.8 |
-| 当前新方法 2P:6D c512（temperature=1，历史） | 97.5% | 68.1% | 66.2 | 6.5 | 99.8% | 68.1% | 56.5 | 0.0 | 0.2 |
-| 当前新方法 2P:6D c512（temperature=0，P→D可行请求先行） | 94.2% | 56.3% | 24.0 | 10.6 | 99.7% | 81.0% | 69.7 | 0.0 | 0.22 |
-| 当前新方法 2P:6D c640（temperature=0） | 93.4% | 74.9% | 57.8 | 16.8 | 99.7% | 78.4% | 67.1 | 0.0 | 0.3 |
-| 当前新方法 2P:6D c768（temperature=0） | 94.1% | 77.9% | 110.9 | 16.4 | 99.7% | 75.5% | 60.5 | 0.0 | 0.3 |
+| 旧版快慢路径 2P:6D c512（temperature=1，需重跑） | 97.5% | 68.1% | 66.2 | 6.5 | 99.8% | 68.1% | 56.5 | 0.0 | 0.2 |
+| 旧版快慢路径 2P:6D c512（temperature=0，需重跑） | 94.2% | 56.3% | 24.0 | 10.6 | 99.7% | 81.0% | 69.7 | 0.0 | 0.22 |
+| 旧版快慢路径 2P:6D c640（temperature=0，需重跑） | 93.4% | 74.9% | 57.8 | 16.8 | 99.7% | 78.4% | 67.1 | 0.0 | 0.3 |
+| 旧版快慢路径 2P:6D c768（temperature=0，需重跑） | 94.1% | 77.9% | 110.9 | 16.4 | 99.7% | 75.5% | 60.5 | 0.0 | 0.3 |
 
 ## 原始结果
 
@@ -76,11 +88,11 @@ KV pool，因此只在 D KV/running/queue 栏记录整体引擎状态。
 - 原生 Mooncake 4P:4D c512: [summary](archive/baseline/mixed-pd-8gpu-c512-s2026-w300-m1200/pd-native-mooncake-4p4d/offload_analysis_summary.json)
 - No-reverse 2P:6D c512: [summary](archive/baseline/mixed-pd-8gpu-c512-s2026-w300-m1200/pd-no-reverse-2p6d/offload_analysis_summary.json)
 - No-reverse 4P:4D c512: [summary](archive/baseline/mixed-pd-8gpu-c512-s2026-w300-m1200/pd-no-reverse-4p4d/offload_analysis_summary.json)
-- 当前新方法 2P:6D c512（temperature=1，历史）: [summary](current/qwen3-8b-tp1-mixed1to1-c512-global-host-restore-w300-m1200/offload_analysis_summary.json)
-- 当前新方法 2P:6D c512（temperature=0，P→D可行请求先行）: [summary](current/ablations/mixed1to1-qwen3-8b-2p6d-c512/target1-spill0p5-nonstrict/full/offload_analysis_summary.json)
-- 当前新方法 2P:6D c512（temperature=0，旧严格FIFO参考）: [summary](current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/full/offload_analysis_summary.json)
-- 当前新方法 2P:6D c640（temperature=0）: [summary](current/qwen3-8b-tp1-mixed1to1-c640-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
-- 当前新方法 2P:6D c768（temperature=0）: [summary](current/qwen3-8b-tp1-mixed1to1-c768-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
+- 旧版快慢路径 2P:6D c512（temperature=1，需重跑）: [summary](current/qwen3-8b-tp1-mixed1to1-c512-global-host-restore-w300-m1200/offload_analysis_summary.json)
+- 旧版快慢路径 2P:6D c512（temperature=0，需重跑）: [summary](current/ablations/mixed1to1-qwen3-8b-2p6d-c512/target1-spill0p5-nonstrict/full/offload_analysis_summary.json)
+- 旧版快慢路径 2P:6D c512（temperature=0，旧严格FIFO参考）: [summary](current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/full/offload_analysis_summary.json)
+- 旧版快慢路径 2P:6D c640（temperature=0，需重跑）: [summary](current/qwen3-8b-tp1-mixed1to1-c640-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
+- 旧版快慢路径 2P:6D c768（temperature=0，需重跑）: [summary](current/qwen3-8b-tp1-mixed1to1-c768-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
 
 `c512` 的 `temperature=1` 旧结果只保留为历史诊断；最终横向对比使用
 `temperature=0` 的正式结果。
@@ -100,14 +112,14 @@ token 加权复用统计时标为“未记录”；No-reverse 的上一轮父 KV
 | 原生 Mooncake | 4P:4D，c512 | 4,211 tokens | 22,813 tokens | 未记录 | 未单独记录 |
 | No-reverse PD | 2P:6D，c512 | 4,282 tokens | 30,661 tokens | 100.00%（设计值） | 未单独记录 |
 | No-reverse PD | 4P:4D，c512 | 4,047 tokens | 34,585 tokens | 100.00%（设计值） | 未单独记录 |
-| 当前新方法（temperature=1，历史） | 2P:6D，c512 | 3,823 tokens | 8,034 tokens | 0.00% | 约 0 tokens |
-| 当前新方法（temperature=0，P→D可行请求先行） | 2P:6D，c512 | 4,027 tokens | 7,486 tokens | 0.00% | 0 tokens |
-| 当前新方法 | 2P:6D，c640 | 4,017 tokens | 7,410 tokens | 0.00% | 0 tokens |
-| 当前新方法 | 2P:6D，c768 | 3,896 tokens | 7,740 tokens | 1.38% | 341 tokens |
+| 旧版快慢路径（temperature=1，需重跑） | 2P:6D，c512 | 3,823 tokens | 8,034 tokens | 0.00% | 约 0 tokens |
+| 旧版快慢路径（temperature=0，需重跑） | 2P:6D，c512 | 4,027 tokens | 7,486 tokens | 0.00% | 0 tokens |
+| 旧版快慢路径（需重跑） | 2P:6D，c640 | 4,017 tokens | 7,410 tokens | 0.00% | 0 tokens |
+| 旧版快慢路径（需重跑） | 2P:6D，c768 | 3,896 tokens | 7,740 tokens | 1.38% | 341 tokens |
 
-## 并发扫描结论
+## 旧版快慢路径并发扫描结论（需按当前新方法重跑）
 
-- 当前非严格 FIFO 的 `c512` Decode 为 9,800 token/s，与历史 `c640` 的
+- 旧版非严格 FIFO 的 `c512` Decode 为 9,800 token/s，与历史 `c640` 的
   9,819 token/s 基本相同，同时保持 page-aligned Parent KV 100% 复用。
 - `c768` 的 P queue 增至 110.9/卡，Shared Host Arena 触发 shortest-first
   request-generation 驱逐，Parent KV 复用因此降至 98.62%，Decode 回落到

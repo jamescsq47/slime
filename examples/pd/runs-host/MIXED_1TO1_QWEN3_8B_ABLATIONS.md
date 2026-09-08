@@ -14,6 +14,15 @@ All rows use the same serving workload and differ only in the named ablation.
 | Timing | 300 s warmup + 1200 s measurement |
 | Request source | `fixed_random_s2026_n8192.json` |
 | Native HiCache/Mooncake | disabled |
+| Required static memory | ordinary P/D GPU `0.80`; search GPU 7 `0.60` |
+
+> **Rerun required:** all completed ablation rows below used `0.85` on ordinary
+> PD GPUs. Their values are historical diagnostics only until rerun with the
+> colocated-aligned `0.80`/GPU 7 `0.60` configuration. No rerun was started.
+
+> **方法语义也已变化：** 当前新方法现为“工具超过1秒走Slow；工具1秒内返回
+> 尝试Direct；Direct在1秒内未建立则完整重算”。本文件所有已完成行都早于该
+> 定义，继续作为旧消融数据保留，但必须用新方法和对齐显存重新配对运行。
 
 ## Lifecycle/router fixes in this paired rerun
 
@@ -40,11 +49,11 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | D→P Direct | D→P Host | P→D Host | P/D routing | Decode token/s | Decode token/s/D | Agent/s | Status |
 |---|---:|---:|---:|---|---:|---:|---:|---|
-| Full method（P→D可行请求先行） | on | on | on | complete pressure / global P→D Host | 9,799.5 | 1,633.3 | 2.428 | complete |
-| D→P Direct only | on | off | on | load-aware | 9,445.5 | 1,574.2 | 2.380 | complete |
-| D→P Slow only | off | on | on | complete pressure / global P→D Host | 4,500.5 | 750.1 | 1.198 | complete; Host-capacity limited |
-| Random P/D routing | on | on | on | random among capacity-feasible workers | 9,702.6 | 1,617.1 | 2.417 | complete |
-| P→D Direct only | on | on | off | load-aware | 9,817.0 | 1,636.2 | 2.450 | complete |
+| 旧版快慢路径 Full（需重跑） | on | on | on | complete pressure / global P→D Host | 9,799.5 | 1,633.3 | 2.428 | historical; rerun required (0.85 and old path policy) |
+| D→P Direct only | on | off | on | load-aware | 9,445.5 | 1,574.2 | 2.380 | historical; rerun required (0.85) |
+| D→P Slow only | off | on | on | complete pressure / global P→D Host | 4,500.5 | 750.1 | 1.198 | historical; rerun required (0.85) |
+| Random P/D routing | on | on | on | random among capacity-feasible workers | 9,702.6 | 1,617.1 | 2.417 | historical; rerun required (0.85) |
+| P→D Direct only | on | on | off | load-aware | 9,817.0 | 1,636.2 | 2.450 | historical; rerun required (0.85) |
 
 ## D→P 快慢路径比例
 
@@ -53,7 +62,7 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Direct | Slow | Direct/Slow 比例 |
 |---|---:|---:|---:|
-| Full method（P→D可行请求先行） | 10,715 | 84 | 99.22% / 0.78%（按完成路径） |
+| 旧版快慢路径 Full（需重跑） | 10,715 | 84 | 99.22% / 0.78%（按完成路径） |
 | D→P Direct only | 10,224 | 0 | 100% / 0% (另有 61 次 Direct 失败后完整重算) |
 | D→P Slow only | 0 | 5,793 | 0% / 100%（2,936 Host→P complete，2,847 Host evictions） |
 | Random P/D routing | 10,392 | 134 | 98.73% / 1.27% |
@@ -63,7 +72,7 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Prefill token/s | Actual Prefill/Agent | Decode/Agent | Parent KV reuse | P Forward/card | D Forward/card | P KV | P queue | P inflight | D KV | D running | D prealloc | D transfer |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Full method（P→D可行请求先行） | 18,215.5 | 7,485.8 | 4,027.2 | 100% | 94.2% | 99.7% | 56.3% | 24.0 | 10.56 | 81.0% | 69.7 | 1.42 | 0.22 |
+| 旧版快慢路径 Full（需重跑） | 18,215.5 | 7,485.8 | 4,027.2 | 100% | 94.2% | 99.7% | 56.3% | 24.0 | 10.56 | 81.0% | 69.7 | 1.42 | 0.22 |
 | D→P Direct only | 18,946.7 | 7,930.2 | 3,953.4 | 98.17% | 96.9% | 99.9% | 48.2% | 61.6 | 6.67 | 68.8% | 59.4 | 0.16 | 0.20 |
 | D→P Slow only | 22,159.5 | 18,442.5 | 3,745.6 | 62.21% | 98.8% | 94.4% | 22.4% | 183.5 | 3.14 | 26.7% | 14.7 | 0.03 | 0.03 |
 | Random P/D routing | 18,214.0 | 7,525.0 | 4,008.6 | 100% | 94.5% | 99.8% | 52.1% | 38.6 | 7.10 | 75.6% | 65.7 | 0.15 | 0.25 |
@@ -73,7 +82,7 @@ All rows use the same serving workload and differ only in the named ablation.
 
 | Variant | Run directory | D→P Direct/Slow | P→D Direct/Slow | Host ownership conservation |
 |---|---|---|---|---|
-| Full method（P→D可行请求先行） | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/target1-spill0p5-nonstrict/full` | 10,715 Direct / 84 Host D2H complete（正式窗口） | 1,317 Host D2H / 1,314 Host H2D/release（正式窗口） | Parent KV page-aligned 100%；0 eviction/invariant error |
+| 旧版快慢路径 Full（需重跑） | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/target1-spill0p5-nonstrict/full` | 10,715 Direct / 84 Host D2H complete（正式窗口） | 1,317 Host D2H / 1,314 Host H2D/release（正式窗口） | Parent KV page-aligned 100%；0 eviction/invariant error |
 | D→P Direct only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/d2p-direct-only` | 10,224 Direct / 0 Slow / 61 recompute | 13,285 Direct / 1,217 Host | D→P Host disabled；P→D Host complete=release=1,217；无 CAS ownership failure |
 | D→P Slow only | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/lifecycle-router-fix/d2p-slow-only` | 0 Direct / 5,793 Host D2H complete | 7,069 P→D releases / 0 Host | 2,936 H2D complete；2,937 H2D releases；2,847 safe evictions；0 invariant error |
 | Random P/D routing | `current/ablations/mixed1to1-qwen3-8b-2p6d-c512/random-routing` | 10,392 Direct / 134 Slow | 13,693 P→D releases；3,035 Host D2H / 3,016 Host H2D | D→P Slow D2H=release=H2D=134；0 Host eviction |
@@ -86,9 +95,9 @@ historical strict-FIFO Full result (9,417.9 token/s) and Slow-only result were
 the paired rerun produced from SGLang commit `c549c0e005` and Slime commit
 `95fc685`; the current Full row is the later non-strict admission checkpoint.
 
-## P→D非严格FIFO正式结果
+## 旧版P→D非严格FIFO正式结果（需重跑）
 
-- 新 Full method 完整通过 300 秒预热和 1,200 秒测量，完成 2,914 agents；
+- 旧版 Full method 完整通过 300 秒预热和 1,200 秒测量，完成 2,914 agents；
   Decode 为 9,799.5 token/s，单 D 为 1,633.3 token/s，D Forward 为
   99.69%，page-aligned Parent KV reuse 为 100%。
 - 相比严格 FIFO Full 参考，D running 从 61.0 提高到 69.7/卡，D KV 从

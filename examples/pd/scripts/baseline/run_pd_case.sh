@@ -111,13 +111,14 @@ if [[ -n "${PREFILL_MEM_FRACTION_STATICS}" ]]; then
   read -r -a p_mem_fraction_statics <<<"${PREFILL_MEM_FRACTION_STATICS}"
 else
   p_mem_fraction_statics=()
-  for _ in "${p_gpu_groups[@]}"; do p_mem_fraction_statics+=(0.85); done
+  # Fair-comparison default; wrappers still override service-sharing GPUs.
+  for _ in "${p_gpu_groups[@]}"; do p_mem_fraction_statics+=(0.80); done
 fi
 if [[ -n "${DECODE_MEM_FRACTION_STATICS}" ]]; then
   read -r -a d_mem_fraction_statics <<<"${DECODE_MEM_FRACTION_STATICS}"
 else
   d_mem_fraction_statics=()
-  for _ in "${d_gpu_groups[@]}"; do d_mem_fraction_statics+=(0.85); done
+  for _ in "${d_gpu_groups[@]}"; do d_mem_fraction_statics+=(0.80); done
 fi
 (( ${#p_gpu_groups[@]} == ${#p_ports[@]} && ${#p_gpu_groups[@]} == ${#p_bootstrap_ports[@]} )) || {
   echo "Prefill GPU groups/PREFILL_PORTS/PREFILL_BOOTSTRAP_PORTS length mismatch" >&2; exit 2;

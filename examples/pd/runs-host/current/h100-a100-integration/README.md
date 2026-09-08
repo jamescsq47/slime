@@ -1,5 +1,9 @@
 # H100 implementation integrated on A100
 
+> **历史实现说明：** 本目录中的 Agentic-PD 正式结果采用旧“Direct失败→Slow”
+> 路径策略，不是 2026-09-08 起定义的“快慢路径+Direct失败重算”当前新方法。
+> 性能数字保留用于实现回归，但需按当前新方法重跑后才能用于最终横向结论。
+
 Baseline branches: Slime H100 `2f9ed17`, merged with A100 `82e18c1`;
 SGLang pd_node_h100 `20dd76e`, with selected A100 safety fixes.
 

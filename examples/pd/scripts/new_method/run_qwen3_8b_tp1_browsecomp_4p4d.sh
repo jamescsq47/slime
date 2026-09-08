@@ -26,9 +26,10 @@ export DECODE_GPUS="${DECODE_GPUS:-1 3 5 7}"
 export PREFILL_TP_SIZE=1
 export DECODE_TP_SIZE=1
 export SEARCH_GPU="${SEARCH_GPU:-7}"
-# Keep the model KV allocation identical to the colocated BrowseComp baseline.
-# GPU 7 also hosts the roughly 16-GiB retrieval service, so it uses 0.60 while
-# the other model GPUs use 0.80.
+# Keep every physical GPU's model KV allocation identical to the colocated
+# BrowseComp baseline. P GPUs are ordinary model-only GPUs and use 0.80 too.
+# GPU 7 also hosts the roughly 16-GiB retrieval service, so it uses 0.60.
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
 export DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-0.80 0.80 0.80 0.60}"
 export SEARCH_START_AFTER_MODELS=true
 
@@ -59,8 +60,8 @@ export MEASURE_SECONDS="${MEASURE_SECONDS:-1200}"
 
 # One tool-return-relative two-second Direct setup window.  Slow recovery uses
 # max-free Host for D2H, then max-free P KV for H2D, as enforced by the router.
-export FAST_TOOL_THRESHOLD_SECONDS=2
-export DIRECT_WAIT_SECONDS=2
+export FAST_TOOL_THRESHOLD_SECONDS="${FAST_TOOL_THRESHOLD_SECONDS:-2}"
+export DIRECT_WAIT_SECONDS="${DIRECT_WAIT_SECONDS:-2}"
 export P_ACCEPT_TIMEOUT_SECONDS=600
 export P_QUEUE_TIMEOUT_SECONDS=3600
 export P_READY_TIMEOUT_SECONDS=600

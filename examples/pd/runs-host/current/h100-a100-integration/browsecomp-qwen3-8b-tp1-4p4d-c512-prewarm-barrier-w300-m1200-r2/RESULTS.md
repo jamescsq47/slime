@@ -1,5 +1,9 @@
 # BrowseComp Qwen3-8B c512: explicit Host prewarm barrier
 
+> **需重跑：** 本轮使用旧“Direct失败→Slow”方案，不是当前“工具超过1秒走
+> Slow、快速工具Direct建立失败则重算”的新方法；同时 P 使用历史显存比例。
+> 以下数字仅作历史诊断。
+
 ## Status
 
 Completed successfully with 301.20 seconds of business warmup followed by a

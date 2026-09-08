@@ -75,7 +75,10 @@ CLOSED_LOOP_MEASUREMENT_SECONDS="${CLOSED_LOOP_MEASUREMENT_SECONDS:-300}"
 ROUTER_HEALTH_TIMEOUT_SECS="${ROUTER_HEALTH_TIMEOUT_SECS:-60}"
 ROUTER_HEALTH_FAILURE_THRESHOLD="${ROUTER_HEALTH_FAILURE_THRESHOLD:-10}"
 MAX_EXISTING_GPU_MEMORY_MB="${MAX_EXISTING_GPU_MEMORY_MB:-1024}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+# Fair-comparison default: PD workers use the same per-physical-GPU static
+# memory fraction as the corresponding colocated run. Topology wrappers must
+# still override GPUs that host another service.
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
 PREFILL_CHUNKED_PREFILL_SIZE="${PREFILL_CHUNKED_PREFILL_SIZE:-8192}"
 PREFILL_MAX_PREFILL_TOKENS="${PREFILL_MAX_PREFILL_TOKENS:-8192}"
 DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-}"
@@ -820,7 +823,7 @@ done
 router_entry=(python -m sglang_router.launch_router)
 router_policy_args=()
 if [[ "${PD_LATE_BINDING}" == "1" ]]; then
-  router_entry=(python "${PD_DIR}/launch_late_binding_router.py")
+  router_entry=(python "${PD_LATE_BIND_ROUTER_ENTRY:-${PD_DIR}/launch_late_binding_router.py}")
   router_policy_args=(--policy random)
 fi
 setsid env \
