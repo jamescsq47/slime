@@ -860,9 +860,9 @@ def policy_loss_function(
             if train_rollout_logprob_abs_diff is not None:
                 mismatch_metrics["train_rollout_logprob_abs_diff"] = (old_log_probs - rollout_log_probs).abs()
 
-            # Always emit both task namespaces.  This keeps the logging keys
+            # Always emit every mixed-task namespace.  This keeps the logging keys
             # identical on every rank even when a micro-batch is single-task.
-            for task_type in ("math", "qa"):
+            for task_type in ("math", "qa", "terminal"):
                 task_loss_masks = [
                     loss_mask if sample_task_type == task_type else torch.zeros_like(loss_mask)
                     for sample_task_type, loss_mask in zip(task_types, batch["loss_masks"], strict=True)

@@ -1,0 +1,20 @@
+{
+  "expect": "modified",
+  "python": "/homes/siqic/anaconda3/envs/pd/bin/python",
+  "python_version": "3.12.13",
+  "sglang_version": "0.5.10.post1",
+  "sglang_package": "/homes/siqic/sglang-agentic/python/sglang",
+  "mooncake_transfer_engine_version": "0.3.12.post1",
+  "custom_modules": {
+    "agentic_host_staging.py": true,
+    "agentic_kv_lifecycle.py": true,
+    "agentic_direct_transfer.py": true,
+    "agentic_early_claim.py": true
+  },
+  "decode_manager_sha256": "ffa8e80c00923df98a8c76c8842e29bd775c7696f566c11f5659e0797017f8a7",
+  "agentic_environment_variables": [
+    "SGLANG_AGENTIC_KV_FORCE_SLOW_PATH",
+    "SGLANG_AGENTIC_KV_HOST_STAGING"
+  ],
+  "valid": true
+}

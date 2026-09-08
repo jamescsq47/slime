@@ -11,6 +11,8 @@ cd "${PD_DIR}"
 # Use the node-local, byte-identical model replica by default.  Keeping model
 # reads off /homes avoids the shared NFS thundering herd when 1P+3D start.
 MODEL_PATH="${MODEL_PATH:-/dataset/model/qwen3/Qwen3-8B}"
+MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-}"
+MODEL_TOOL_CALL_PARSER="${MODEL_TOOL_CALL_PARSER:-}"
 MATH_DATA="${MATH_DATA:-${WORKSPACE_ROOT}/data/dapo-math-17k/dapo-math-17k.jsonl}"
 QA_DATA="${QA_DATA:-${WORKSPACE_ROOT}/data/browsecomp/bc_train.jsonl}"
 WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-}"
@@ -73,7 +75,10 @@ CLOSED_LOOP_MEASUREMENT_SECONDS="${CLOSED_LOOP_MEASUREMENT_SECONDS:-300}"
 ROUTER_HEALTH_TIMEOUT_SECS="${ROUTER_HEALTH_TIMEOUT_SECS:-60}"
 ROUTER_HEALTH_FAILURE_THRESHOLD="${ROUTER_HEALTH_FAILURE_THRESHOLD:-10}"
 MAX_EXISTING_GPU_MEMORY_MB="${MAX_EXISTING_GPU_MEMORY_MB:-1024}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+# Fair-comparison default: PD workers use the same per-physical-GPU static
+# memory fraction as the corresponding colocated run. Topology wrappers must
+# still override GPUs that host another service.
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
 PREFILL_CHUNKED_PREFILL_SIZE="${PREFILL_CHUNKED_PREFILL_SIZE:-8192}"
 PREFILL_MAX_PREFILL_TOKENS="${PREFILL_MAX_PREFILL_TOKENS:-8192}"
 DECODE_MEM_FRACTION_STATICS="${DECODE_MEM_FRACTION_STATICS:-}"
@@ -96,6 +101,18 @@ PD_LATE_BIND_SOFT_RESERVATION_FORCE_AFTER_S="${PD_LATE_BIND_SOFT_RESERVATION_FOR
 # contains physical plus queued token demand, so use it until that bug is fixed.
 PD_LATE_BIND_FORCE_LEGACY_LOADS="${PD_LATE_BIND_FORCE_LEGACY_LOADS:-1}"
 PD_HICACHE_STORAGE_BACKEND="${PD_HICACHE_STORAGE_BACKEND:-}"
+if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
+  echo "new_method does not use a native HiCache/Mooncake storage backend" >&2
+  exit 2
+fi
+case "${SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY:-}" in
+  1|true|TRUE|yes|YES|on|ON) ;;
+  *)
+    echo "new_method refuses stock HiCache/Mooncake policy; " \
+      "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY must be true" >&2
+    exit 2
+    ;;
+esac
 PD_ENABLE_DECODE_OFFLOAD_KVCACHE="${PD_ENABLE_DECODE_OFFLOAD_KVCACHE:-0}"
 PD_HICACHE_SIZE_GB="${PD_HICACHE_SIZE_GB:-0}"
 PD_PREFILL_HICACHE_SIZE_GB="${PD_PREFILL_HICACHE_SIZE_GB:-${PD_HICACHE_SIZE_GB}}"
@@ -111,9 +128,8 @@ PD_CORRECTNESS_CAPTURE_LABEL="${PD_CORRECTNESS_CAPTURE_LABEL:-pd-capture}"
 PD_SERVE_ONLY="${PD_SERVE_ONLY:-0}"
 PD_DETERMINISTIC_INFERENCE="${PD_DETERMINISTIC_INFERENCE:-0}"
 PD_SERVER_RANDOM_SEED="${PD_SERVER_RANDOM_SEED:-2026}"
-# Keep reverse NIXL listeners out of Linux's usual ephemeral range
-# (32768-60999).  An outgoing Mooncake/UCX connection can otherwise occupy a
-# derived 4xxxx/5xxxx port after preflight but before the D listener binds.
+MAMBA_TRACK_INTERVAL="${MAMBA_TRACK_INTERVAL:-}"
+# Keep reverse NIXL listeners out of Linux's usual ephemeral range.
 # The legacy offset remains available when explicitly supplied.
 AGENTIC_DIRECT_BASE_PORT="${AGENTIC_DIRECT_BASE_PORT:-61000}"
 AGENTIC_DIRECT_PORT_OFFSET="${AGENTIC_DIRECT_PORT_OFFSET:-}"
@@ -132,9 +148,13 @@ if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
 fi
 export PYTHONPATH="${PD_DIR}:${REPO_ROOT}:${PYTHONPATH:-}"
 export LOCAL_SEARCH_URL="http://127.0.0.1:${SEARCH_PORT}"
+# Router backend connections are pooled.  Keep SGLang's server-side lifetime
+# comfortably above the Router's 30-second client idle lifetime so a saturated
+# Router never reuses a socket that Uvicorn has already reaped.
+export SGLANG_TIMEOUT_KEEP_ALIVE="${SGLANG_TIMEOUT_KEEP_ALIVE:-120}"
 
-if [[ "${PD_ENABLE_DECODE_OFFLOAD_KVCACHE}" == "1" && -z "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
-  echo "PD_ENABLE_DECODE_OFFLOAD_KVCACHE=1 requires PD_HICACHE_STORAGE_BACKEND" >&2
+if [[ "${PD_ENABLE_DECODE_OFFLOAD_KVCACHE}" == "1" ]]; then
+  echo "new_method permanently forbids native Decode KV offload" >&2
   exit 1
 fi
 if [[ "${PD_LATE_BINDING}" == "1" && -z "${PD_P_READY_DIR}" ]]; then
@@ -145,12 +165,23 @@ fi
 prefill_hicache_args=()
 decode_hicache_args=()
 deterministic_args=()
+mamba_args=()
+model_parser_args=()
 if [[ "${PD_DETERMINISTIC_INFERENCE}" == "1" ]]; then
   deterministic_args+=(
     --enable-deterministic-inference
     --attention-backend triton
     --random-seed "${PD_SERVER_RANDOM_SEED}"
   )
+fi
+if [[ -n "${MAMBA_TRACK_INTERVAL}" ]]; then
+  mamba_args+=(--mamba-track-interval "${MAMBA_TRACK_INTERVAL}")
+fi
+if [[ -n "${MODEL_REASONING_PARSER}" ]]; then
+  model_parser_args+=(--reasoning-parser "${MODEL_REASONING_PARSER}")
+fi
+if [[ -n "${MODEL_TOOL_CALL_PARSER}" ]]; then
+  model_parser_args+=(--tool-call-parser "${MODEL_TOOL_CALL_PARSER}")
 fi
 storage_extra_config="${PD_HICACHE_STORAGE_EXTRA_CONFIG}"
 if [[ -z "${storage_extra_config}" && "${PD_HICACHE_STORAGE_BACKEND}" == "file" ]]; then
@@ -164,11 +195,8 @@ hicache_metadata_args=(
 )
 if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
   prefill_hicache_args+=(
-    --enable-hierarchical-cache
-    --hicache-write-policy "${PD_PREFILL_HICACHE_WRITE_POLICY}"
     --hicache-mem-layout "${PD_HICACHE_MEM_LAYOUT}"
     --hicache-storage-backend "${PD_HICACHE_STORAGE_BACKEND}"
-    --hicache-storage-prefetch-policy "${PD_HICACHE_STORAGE_PREFETCH_POLICY}"
   )
   if [[ -n "${storage_extra_config}" ]]; then
     prefill_hicache_args+=(--hicache-storage-backend-extra-config "${storage_extra_config}")
@@ -177,22 +205,18 @@ if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
     prefill_hicache_args+=(--hicache-size "${PD_PREFILL_HICACHE_SIZE_GB}")
   fi
 fi
-if [[ "${PD_ENABLE_DECODE_OFFLOAD_KVCACHE}" == "1" ]]; then
+if [[ -n "${PD_HICACHE_STORAGE_BACKEND}" ]]; then
   decode_hicache_args+=(
-    --disaggregation-decode-enable-offload-kvcache
     --hicache-mem-layout "${PD_HICACHE_MEM_LAYOUT}"
     --hicache-storage-backend "${PD_HICACHE_STORAGE_BACKEND}"
   )
   if [[ -n "${storage_extra_config}" ]]; then
     decode_hicache_args+=(--hicache-storage-backend-extra-config "${storage_extra_config}")
   fi
-  if (( PD_DECODE_HICACHE_SIZE_GB > 0 )); then
-    decode_hicache_args+=(--hicache-size "${PD_DECODE_HICACHE_SIZE_GB}")
-  fi
-  hicache_metadata_args+=(--pd-enable-decode-offload-kvcache)
 fi
 
 pids=()
+frontend_pids=()
 cleanup_started=0
 
 process_group_has_live_members() {
@@ -208,18 +232,46 @@ process_group_has_live_members() {
 
 cleanup() {
   local pid index alive task_id
+  local frontend_graceful_seconds="${PD_FRONTEND_GRACEFUL_SHUTDOWN_SECONDS:-10}"
   local graceful_seconds="${PD_SERVICE_GRACEFUL_SHUTDOWN_SECONDS:-120}"
   local kill_wait_seconds="${PD_SERVICE_KILL_WAIT_SECONDS:-30}"
   local final_kill_wait_seconds="${PD_SERVICE_FINAL_KILL_WAIT_SECONDS:-60}"
-  local deadline=$((SECONDS + graceful_seconds))
+  local deadline
   (( cleanup_started == 1 )) && return
   cleanup_started=1
   trap - INT TERM
 
-  # Services are appended in dependency order (search, P, D..., router).
-  # Stop them in reverse order so no new requests/transfers are created while
-  # the GPU workers drain.  Address the whole setsid process group even when
-  # its launch_server parent has already exited but a scheduler child remains.
+  # Stop the HTTP frontends before their P/D dependencies.  A fixed-duration
+  # closed-loop run intentionally ends with live agents; terminating P/D at
+  # the same instant makes the Router report those expected cancellations as
+  # ServerDisconnectedError and then wait for its full graceful timeout.
+  # Keeping P/D alive through this short frontend drain preserves the current
+  # snapshot owner until the client-facing request has either unwound or the
+  # Router itself is retired.
+  for pid in "${frontend_pids[@]}"; do
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  deadline=$((SECONDS + frontend_graceful_seconds))
+  while (( SECONDS < deadline )); do
+    alive=0
+    for pid in "${frontend_pids[@]}"; do
+      process_group_has_live_members "${pid}" && alive=1
+    done
+    (( alive == 0 )) && break
+    sleep 1
+  done
+  for pid in "${frontend_pids[@]}"; do
+    if process_group_has_live_members "${pid}"; then
+      echo "Frontend process group ${pid} exceeded ${frontend_graceful_seconds}s drain; stopping it before P/D" >&2
+      kill -KILL -- "-${pid}" 2>/dev/null || true
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  done
+
+  # With every frontend gone, no new requests or transfers can be created.
+  # Address the whole setsid process group even when its launch_server parent
+  # has already exited but a scheduler child remains.
   for ((index=${#pids[@]} - 1; index >= 0; index--)); do
     pid="${pids[index]}"
     kill -TERM -- "-${pid}" 2>/dev/null || true
@@ -228,6 +280,7 @@ cleanup() {
     # original process group so a reparented Router cannot survive cleanup.
     kill -TERM "${pid}" 2>/dev/null || true
   done
+  deadline=$((SECONDS + graceful_seconds))
   while (( SECONDS < deadline )); do
     alive=0
     for pid in "${pids[@]}"; do
@@ -314,8 +367,25 @@ check_gpu_idle() {
 
 gpu_numa_node() {
   local gpu="$1"
+  local bus
   local node
-  node="$(nvidia-smi topo -m | awk -v row="GPU${gpu}" '$1 == row {print $(NF-1); exit}')"
+  # Query this GPU's PCI function directly instead of parsing the complete
+  # topology matrix.  On large NVSwitch hosts ``nvidia-smi topo -m`` can block
+  # indefinitely while the ordinary per-GPU NVML query and sysfs remain
+  # healthy.  NUMA affinity is a PCI-device property, so sysfs is also the
+  # authoritative and cheaper source here.
+  bus="$(
+    timeout 5s nvidia-smi --id="${gpu}" --query-gpu=pci.bus_id \
+      --format=csv,noheader,nounits 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d ' '
+  )" || true
+  # NVML commonly prints an eight-digit PCI domain, while Linux sysfs uses
+  # four digits for the same function (00000000:07:00.0 -> 0000:07:00.0).
+  bus="${bus#0000}"
+  if [[ -n "${bus}" && -r "/sys/bus/pci/devices/${bus}/numa_node" ]]; then
+    node="$(<"/sys/bus/pci/devices/${bus}/numa_node")"
+  else
+    node=""
+  fi
   if [[ "${node}" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "${node}"
   else
@@ -341,6 +411,75 @@ wait_http() {
     sleep 2
   done
   echo "${name} did not become ready within ${timeout}s" >&2
+  return 1
+}
+
+wait_registered_host_prewarm() {
+  case "${SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER:-0}" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    *) return 0 ;;
+  esac
+  local root="${SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR:?missing Host prewarm directory}"
+  local timeout="${SGLANG_AGENTIC_KV_REGISTER_PREWARM_TIMEOUT_SECONDS:-1800}"
+  local expected="$(((${#prefill_gpu_groups[@]} + ${#decode_gpu_groups[@]}) * PREFILL_TP_SIZE))"
+  local complete_count failed_count pid
+  local deadline=$((SECONDS + timeout))
+  mkdir -p "${root}/arenas" "${root}/complete" "${root}/failed"
+  : >"${root}/start.tmp"
+  mv -f "${root}/start.tmp" "${root}/start"
+  echo "Host registration prewarm started; waiting for ${expected} P/D CUDA contexts"
+  while (( SECONDS < deadline )); do
+    failed_count="$(find "${root}/failed" -maxdepth 1 -type f -name '*.json' | wc -l)"
+    if (( failed_count > 0 )); then
+      echo "Host registration prewarm failed:" >&2
+      find "${root}/failed" -maxdepth 1 -type f -name '*.json' -print -exec cat {} \; >&2
+      return 1
+    fi
+    complete_count="$(find "${root}/complete" -maxdepth 1 -type f -name '*.json' | wc -l)"
+    if (( complete_count == expected )); then
+      python - "${root}" "${RUN_DIR}/host_register_prewarm.json" "${expected}" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+records = [
+    json.loads(path.read_text(encoding="utf-8"))
+    for path in sorted((root / "complete").glob("*.json"))
+]
+report = {
+    "status": "complete",
+    "participant_count": len(records),
+    "expected_participant_count": int(sys.argv[3]),
+    "registered_bytes_sum_across_cuda_contexts": sum(
+        int(item["registered_bytes"]) for item in records
+    ),
+    "max_elapsed_seconds": max(
+        (float(item["elapsed_seconds"]) for item in records), default=0.0
+    ),
+    "participants": records,
+}
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+      echo "Host registration prewarm complete for all ${expected} P/D CUDA contexts"
+      return 0
+    fi
+    if (( complete_count > expected )); then
+      echo "Host registration prewarm produced too many completion records: ${complete_count}/${expected}" >&2
+      return 1
+    fi
+    for pid in "${prefill_pids[@]}" "${decode_pids[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        echo "A P/D service exited during Host registration prewarm" >&2
+        return 1
+      fi
+    done
+    sleep 2
+  done
+  echo "Host registration prewarm timed out after ${timeout}s" >&2
+  find "${root}" -maxdepth 2 -type f -print >&2
   return 1
 }
 
@@ -401,6 +540,7 @@ if (( PREFILL_TP_SIZE != DECODE_TP_SIZE )); then
   echo "Agentic TP currently requires equal PREFILL_TP_SIZE and DECODE_TP_SIZE" >&2
   exit 1
 fi
+export SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT="${#prefill_gpu_groups[@]}"
 export SGLANG_AGENTIC_KV_TP_SIZE="${PREFILL_TP_SIZE}"
 if (( ${#decode_gpu_groups[@]} != ${#decode_ports[@]} )); then
   echo "DECODE GPU groups and DECODE_PORTS must contain the same number of entries" >&2
@@ -548,8 +688,11 @@ for index in "${!prefill_gpu_groups[@]}"; do
       --tp-size "${PREFILL_TP_SIZE}" --numa-node "${prefill_group_numas[@]}" \
       --context-length "${MAX_CONTEXT_LENGTH}" --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" --enable-metrics \
+      --skip-server-warmup \
       --chunked-prefill-size "${PREFILL_CHUNKED_PREFILL_SIZE}" \
       --max-prefill-tokens "${PREFILL_MAX_PREFILL_TOKENS}" \
+      "${mamba_args[@]}" \
+      "${model_parser_args[@]}" \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
       --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
@@ -559,7 +702,11 @@ for index in "${!prefill_gpu_groups[@]}"; do
   prefill_pid="$!"
   prefill_pids+=("${prefill_pid}")
   pids+=("${prefill_pid}")
-  wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/health" "${prefill_pids[$index]}"
+  # A disaggregated P's /health probe performs a real Prefill and waits for a
+  # Decode consumer.  During bootstrap no D or Router exists yet, so using it
+  # here serializes startup behind an impossible transfer.  /model_info proves
+  # the HTTP/model process is ready without creating a P-ready generation.
+  wait_http "prefill-${index}" "http://127.0.0.1:${prefill_ports[$index]}/model_info" "${prefill_pids[$index]}"
   # The HTTP server can become healthy even when its auxiliary KV bootstrap
   # listener failed to bind.  That produces a deceptive half-alive P: every
   # later P->D handshake retries forever behind the first FIFO generation.
@@ -572,7 +719,6 @@ for index in "${!prefill_gpu_groups[@]}"; do
 done
 
 prefill_numa_domains="$(IFS=';'; echo "${prefill_numa_vectors[*]}")"
-export SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT="${#prefill_gpu_groups[@]}"
 export SGLANG_AGENTIC_KV_PREFILL_TP_NUMA_DOMAINS="${prefill_numa_domains}"
 
 decode_pids=()
@@ -614,7 +760,9 @@ for index in "${!decode_gpu_groups[@]}"; do
       --context-length "${MAX_CONTEXT_LENGTH}" \
       --page-size "${PD_PAGE_SIZE}" \
       --mem-fraction-static "${decode_mem_fraction_statics[$index]}" \
-      --enable-metrics \
+      "${mamba_args[@]}" \
+      "${model_parser_args[@]}" \
+      --enable-metrics --skip-server-warmup \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
       --disaggregation-mode decode \
@@ -623,8 +771,13 @@ for index in "${!decode_gpu_groups[@]}"; do
     >"${RUN_DIR}/logs/decode-${index}.log" 2>&1 &
   decode_pids+=("$!")
   pids+=("$!")
-  wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/health" "${decode_pids[$index]}"
+  # Keep model bootstrap non-generative for the same reason as Prefill.  The
+  # Router health check below validates the complete P/D serving topology once
+  # every worker is present.
+  wait_http "decode-${index}" "http://127.0.0.1:${decode_ports[$index]}/model_info" "${decode_pids[$index]}"
 done
+
+wait_registered_host_prewarm
 
 if [[ "${PD_SKIP_SEARCH}" != "1" && "${SEARCH_START_AFTER_MODELS}" == "true" ]]; then
   start_search_server
@@ -670,7 +823,7 @@ done
 router_entry=(python -m sglang_router.launch_router)
 router_policy_args=()
 if [[ "${PD_LATE_BINDING}" == "1" ]]; then
-  router_entry=(python "${PD_DIR}/launch_late_binding_router.py")
+  router_entry=(python "${PD_LATE_BIND_ROUTER_ENTRY:-${PD_DIR}/launch_late_binding_router.py}")
   router_policy_args=(--policy random)
 fi
 setsid env \
@@ -698,6 +851,7 @@ setsid env \
   >"${RUN_DIR}/logs/router.log" 2>&1 &
 router_pid=$!
 pids+=("${router_pid}")
+frontend_pids+=("${router_pid}")
 
 if (( ${#local_ports[@]} > 0 )); then
   local_worker_args=()
@@ -711,6 +865,7 @@ if (( ${#local_ports[@]} > 0 )); then
     >"${RUN_DIR}/logs/local-router.log" 2>&1 &
   local_router_pid=$!
   pids+=("${local_router_pid}")
+  frontend_pids+=("${local_router_pid}")
 fi
 
 wait_http router "http://127.0.0.1:${ROUTER_PORT}/health" "${router_pid}" 120

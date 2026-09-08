@@ -16,3 +16,4 @@ sglang-router>=0.2.3
 tensorboard
 transformers
 wandb
+websockets>=15.0.1

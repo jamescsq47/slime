@@ -1,0 +1,33 @@
+schema_version: 1
+datasets:
+  - id: swe_bench_verified
+    harness: swe_bench
+    path: ${PD_DATA_ROOT}/swe-bench-verified/test.jsonl
+    weight: 1
+    options:
+      max_response_tokens: 40960
+      max_tokens_per_turn: 8192
+      enable_thinking: true
+      step_limit: 250
+      # mini-SWE-agent defines zero as unlimited wall-clock time per task.
+      wall_time_limit_seconds: 0
+      max_consecutive_format_errors: 3
+      agent_workers: 128
+      # Keep the official operational safety limits; neither limits total
+      # experiment duration nor total per-task duration.
+      command_timeout_seconds: 60
+      container_start_timeout_seconds: 600
+      container_network: none
+      sandbox_backend: docker
+      verifier_mode: inline
+      verifier_timeout_seconds: 2400
+      verifier_max_concurrent: 16
+      verifier_output_tail_chars: 12000
+      store_model_patch: true
+sampling:
+  policy: random
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1

@@ -1,0 +1,82 @@
+schema_version: 1
+
+# Qwen3.5-only BrowseComp harness profile.  This is intentionally separate
+# from the prompt embedded in bc_train.jsonl so Qwen3 baselines are unchanged.
+system_prompt: |-
+  You are a research agent. Answer the user's question using the available
+  search, open_page, and finish tools.
+
+  Work as a bounded ReAct loop. On each turn, do exactly one of these actions:
+  1. Search once for the single most useful query.
+  2. Open one promising result to inspect its evidence.
+  3. Finish as soon as the evidence supports a specific answer, or when the
+     tool budget is exhausted. Do not keep searching merely because unused
+     budget remains.
+
+  Search broadly once, then refine only when the current evidence leaves a
+  concrete unresolved fact. Prefer opening promising sources over repeating
+  near-duplicate searches. Follow the model's native tool-call format exactly
+  and never emit multiple tool_call blocks in one turn.
+
+native_tool_template: true
+tools:
+  - type: function
+    function:
+      name: search
+      description: Search the web for one focused query and return ranked snippets with docids and URLs.
+      parameters:
+        type: object
+        properties:
+          query:
+            type: string
+            description: One focused web-search query.
+          topk:
+            type: integer
+            description: Number of ranked results to return.
+        required: [query]
+  - type: function
+    function:
+      name: open_page
+      description: Open one result from an earlier search by docid or URL and return its content.
+      parameters:
+        type: object
+        properties:
+          docid:
+            type: string
+            description: Document ID from a previous search result.
+          url:
+            type: string
+            description: URL from a previous search result.
+        anyOf:
+          - required: [docid]
+          - required: [url]
+  - type: function
+    function:
+      name: finish
+      description: Submit the concise final answer and a brief evidence-grounded explanation.
+      parameters:
+        type: object
+        properties:
+          answer:
+            type: string
+          explanation:
+            type: string
+            description: Brief explanation citing source docids in square brackets.
+          confidence:
+            type: string
+            description: Confidence from 0% to 100%.
+        required: [answer, explanation]
+
+max_tool_calls_per_turn: 1
+search_call_budget: 12
+open_page_call_budget: 6
+
+followup_prompt: |-
+  Tool budget status: search {search_used}/{search_budget}, open_page
+  {open_used}/{open_budget}. If the evidence is sufficient, call finish now.
+  Otherwise make exactly one highest-value search or open_page call. Do not
+  repeat a query or continue searching only to consume the remaining budget.
+
+budget_exhausted_prompt: |-
+  The search/open_page budget is exhausted. Call finish now with the best
+  evidence-supported answer available; do not issue another research call.

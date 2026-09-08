@@ -15,12 +15,14 @@ import asyncio
 import hashlib
 import logging
 import os
+import random
 import time
 import urllib.parse
+import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 import orjson
@@ -28,6 +30,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.disaggregation.agentic_early_claim import AgenticEarlyClaimStore
 from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
+    RequestGeneration,
     unpack_agentic_extra_key,
 )
 from sglang.srt.disaggregation.agentic_host_staging import (
@@ -46,6 +49,22 @@ from sglang_router.mini_lb import (
 
 
 logger = logging.getLogger(__name__)
+
+# Complete-snapshot Host eviction is optional.  The Router must also run
+# against environments that implement the core staging lifecycle but predate
+# the EVICTING/RECOMPUTE_REQUIRED extension.
+_HOST_STAGE_EVICTING = getattr(HostStageState, "EVICTING", None)
+_HOST_STAGE_RECOMPUTE_REQUIRED = getattr(
+    HostStageState, "RECOMPUTE_REQUIRED", None
+)
+
+
+def _sync_json_get(url: str, timeout: float) -> Any:
+    """Fetch one tiny control-plane JSON document outside the ASGI loop."""
+
+    request = urllib.request.Request(url, headers={"Connection": "close"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return orjson.loads(response.read())
 
 
 def _env_float(name: str, default: float) -> float:
@@ -100,6 +119,7 @@ class _PrefillWorkReservation:
     domain: int
     tokens: int
     requests: int = 1
+    direct_workset_tokens: int = 0
     released: bool = False
     route_pending: bool = False
 
@@ -109,6 +129,42 @@ class _PrefillAdmissionWaiter:
     parent_turn: bool
     enqueued_at: float
     sequence: int
+
+
+@dataclass(eq=False)
+class _PReadyAdmission:
+    """One immutable Prefill completion waiting for ordered D admission.
+
+    Request coroutines produce these records and then sleep on ``future``.
+    A single admission broker consumes the head of every logical P queue,
+    reserves several feasible Decode destinations from one load snapshot, and
+    commits each P in ``ready_sequence`` order.  Slow/capacity-bound heads keep
+    one explicit owner without blocking the other P queues.
+    """
+
+    domain: int
+    sequence: int
+    submitted_key: Any
+    enqueued_at: float
+    dispatch: Callable[[], Awaitable[Any]]
+    future: asyncio.Future
+    finished: asyncio.Event
+    request: Optional[dict[str, Any]] = None
+    rooms: tuple[int, ...] = ()
+    prompt_tokens: int = 0
+    commit: Optional[Callable[[DecodeReservation], Awaitable[Any]]] = None
+    prepare: Optional[
+        Callable[[], Awaitable[Optional[DecodeReservation]]]
+    ] = None
+    dispatch_task: Optional[asyncio.Task] = None
+    cancel_requested: bool = False
+    initial_reservation: Optional[DecodeReservation] = None
+    prepare_complete: bool = False
+    host_staged: bool = False
+    ownership_started: bool = False
+    commit_started: bool = False
+    commit_predecessor: Optional[asyncio.Future] = None
+    commit_done: Optional[asyncio.Future] = None
 
 
 @dataclass(frozen=True)
@@ -128,31 +184,22 @@ class _PrefillRedirect(RuntimeError):
 class _PrefillAdmissionGate:
     """Bound hidden HTTP/bootstrap work before requests reach P.
 
-    Parent turns always precede initial requests.  This is intentionally a
-    strict agentic-serving priority boundary: a New request must never consume
-    the short D-HBM Direct deadline of a returned parent turn.  FIFO is kept
-    within each class.
+    This gate is FIFO across parent and initial turns. KV source affects only
+    the independent Direct/Slow I/O credits inside P, never request admission.
     """
 
-    def __init__(self, limit: int, new_aging_seconds: float):
+    def __init__(self, limit: int):
         if limit <= 0:
             raise ValueError("P admission limit must be positive")
         self.limit = limit
-        self.new_aging_seconds = max(0.0, new_aging_seconds)
         self.active = 0
         self._sequence = 0
         self._waiters: list[_PrefillAdmissionWaiter] = []
         self._condition = asyncio.Condition()
 
     def _next_waiter(self, now: float) -> _PrefillAdmissionWaiter:
-        def key(waiter: _PrefillAdmissionWaiter):
-            # Never promote an aged New request above a parent.  GPU-side
-            # admission has its own P-ready soft caps, while this gate only
-            # orders the small HTTP/tokenizer work window in front of P.
-            queue_class = 0 if waiter.parent_turn else 1
-            return queue_class, waiter.enqueued_at, waiter.sequence
-
-        return min(self._waiters, key=key)
+        del now
+        return min(self._waiters, key=lambda waiter: waiter.sequence)
 
     async def acquire(self, *, parent_turn: bool) -> float:
         waiter = _PrefillAdmissionWaiter(
@@ -173,14 +220,7 @@ class _PrefillAdmissionGate:
                         self.active += 1
                         self._condition.notify_all()
                         return time.monotonic() - waiter.enqueued_at
-                    # Aging changes priority even when no admission completes.
-                    try:
-                        await asyncio.wait_for(
-                            self._condition.wait(),
-                            timeout=max(0.01, self.new_aging_seconds),
-                        )
-                    except asyncio.TimeoutError:
-                        continue
+                    await self._condition.wait()
             except BaseException:
                 if waiter in self._waiters:
                     self._waiters.remove(waiter)
@@ -220,16 +260,11 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self.prefill_queue_timeout = _env_float(
             "SGLANG_PD_LATE_BIND_QUEUE_TIMEOUT_S", 3600.0
         )
-        self.prefill_new_aging_seconds = _env_float(
-            "SGLANG_PD_LATE_BIND_NEW_AGING_S", 10.0
-        )
         # Admission bounds the small HTTP/tokenizer bootstrap window in front
         # of each P.  A single global gate unnecessarily couples independent P
         # workers: pressure on P0 must not consume P1's admission capacity.
         self._prefill_admissions = [
-            _PrefillAdmissionGate(
-                self.max_prefill_inflight, self.prefill_new_aging_seconds
-            )
+            _PrefillAdmissionGate(self.max_prefill_inflight)
             for _ in self.prefill_urls
         ]
         # Retain the legacy attribute for single-P users and lightweight test
@@ -261,7 +296,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             "SGLANG_PD_LATE_BIND_WAIT_FOR_FEASIBLE", True
         )
         self.target_decode_kv_fraction = _env_float(
-            "SGLANG_PD_LATE_BIND_TARGET_KV_FRACTION", 0.90
+            "SGLANG_PD_LATE_BIND_TARGET_KV_FRACTION", 1.0
         )
         if not (0.0 < self.target_decode_kv_fraction <= 1.0):
             raise ValueError(
@@ -270,25 +305,35 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self.no_capacity_poll_interval = _env_float(
             "SGLANG_PD_LATE_BIND_NO_CAPACITY_POLL_S", 0.01
         )
-        self.soft_reservation_delay = _env_float(
-            "SGLANG_PD_LATE_BIND_SOFT_RESERVATION_DELAY_S", 30.0
-        )
-        self.soft_reservation_min_tokens = _env_int(
-            "SGLANG_PD_LATE_BIND_SOFT_RESERVATION_MIN_TOKENS", 20_000
-        )
-        self.soft_reservation_force_after = _env_float(
-            "SGLANG_PD_LATE_BIND_SOFT_RESERVATION_FORCE_AFTER_S", 120.0
-        )
         self.load_cache_ttl = _env_float(
             "SGLANG_PD_LATE_BIND_LOAD_CACHE_TTL_S", 0.20
         )
         self._selection_lock = asyncio.Lock()
-        # Serialize P-ready submission order without serializing D admission.
-        # Submitted sequences remain visible in the filesystem until D has
-        # allocated KV, so track them separately from not-yet-submitted work.
-        self._p_ready_fifo_lock = asyncio.Lock()
-        self._p_ready_fifo_locks: dict[int, asyncio.Lock] = {}
+        # Request coroutines only publish immutable P-ready admissions.  One
+        # broker owns D-capacity accounting for every P, scans in completion
+        # order, and pipelines multiple capacity-feasible generations.  The
+        # sequence is a fairness hint: one Host-staged generation must not
+        # block an unrelated generation that can enter D immediately.
         self._p_ready_submitted_sequences: set[Any] = set()
+        self._p_ready_fifo_waiters: dict[
+            int, dict[int, _PReadyAdmission]
+        ] = {}
+        self._p_ready_fifo_events: dict[int, asyncio.Event] = {}
+        self._p_ready_fifo_dispatchers: dict[int, asyncio.Task] = {}
+        self._p_ready_fifo_active: dict[int, dict[int, _PReadyAdmission]] = {}
+        self._p_ready_broker_event = asyncio.Event()
+        self._p_ready_broker_task: Optional[asyncio.Task] = None
+        self._p_ready_commit_tails: dict[int, asyncio.Future] = {}
+        self._p_ready_admission_window_per_p = _env_int(
+            "SGLANG_PD_LATE_BIND_ADMISSION_WINDOW_PER_P", 32
+        )
+        self._p_ready_stage_lanes_per_p = _env_int(
+            "SGLANG_AGENTIC_KV_P2D_D2H_WORKERS", 4
+        )
+        self._p_ready_stage_semaphores: dict[int, asyncio.Semaphore] = {}
+        # P->D Host ownership is request-local.  Capacity-bound completions may
+        # enter a bounded multi-lane staging pipeline, while a separate commit
+        # chain keeps their eventual D admission strictly FIFO.
         # Multi-P runs can have hundreds of HTTP handlers waiting for P-ready.
         # Polling and JSON-decoding the same /dev/shm directory independently
         # in every handler creates an avoidable O(waiters * ready_files) control
@@ -298,10 +343,22 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self._p_ready_monitor_task: Optional[asyncio.Task] = None
         self._p_ready_waiters: dict[int, set[asyncio.Future]] = {}
         self._p_ready_snapshot: dict[int, dict[str, Any]] = {}
+        # Only an attempt currently owned by a Router coroutine may
+        # participate in the P-ready FIFO.  A redirected P request can race
+        # with abort and publish a late marker after Router has moved the
+        # generation to another P.  Such an orphan must never become the FIFO
+        # head and stop every later P->D handoff.
+        self._active_prefill_attempts: dict[int, str] = {}
         self._reservations: dict[str, DecodeReservation] = {}
         self._last_loads: dict[str, DecodeLoad] = {}
         self._load_cache: list[DecodeLoad] = []
+        # ``_load_cache_at`` is the publication time used only for TTL.
+        # Reservation accounting uses the causal sampling epoch below: a D
+        # admission can be considered observed only by a poll that started
+        # after that admission completed.
         self._load_cache_at = 0.0
+        self._load_cache_sample_started_at = 0.0
+        self._load_sample_started_at_by_url: dict[str, float] = {}
         self._load_refresh_task: Optional[asyncio.Task] = None
         # A reservation remains charged after D consumes its P-ready marker
         # until a newer load snapshot includes that allocation.  This lets the
@@ -313,15 +370,34 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             else set()
         )
         self._prefill_index = 0
-        # Router-owned shadow queues are the only load signal used to choose a
-        # P worker.  Selection never performs an HTTP request or waits for a P
-        # scheduler: the counters are charged at routing time and released as
-        # soon as P publishes its ready marker.
+        # Ablation-only policy: preserve all capacity/ownership checks, but
+        # replace both load-aware P and D choices with deterministic random
+        # choices among the currently feasible workers.
+        self.ablation_random_routing = _env_bool(
+            "SGLANG_PD_ABLATION_RANDOM_ROUTING"
+        )
+        self._routing_rng = random.Random(
+            _env_int("SGLANG_PD_ABLATION_RANDOM_SEED", 2026)
+        )
+        # Router-owned shadow queues model Prefill compute work.  A cached P
+        # pressure snapshot additionally prevents Direct from targeting a P
+        # that cannot fit the complete parent+suffix workset.  Selection never
+        # performs an HTTP request or waits for a P scheduler.
         self._prefill_work_lock = asyncio.Lock()
         self._prefill_pending_tokens = [0] * len(self.prefill_urls)
         self._prefill_pending_requests = [0] * len(self.prefill_urls)
+        self._prefill_direct_pending_tokens = [0] * len(self.prefill_urls)
         self._prefill_work_tiebreak = 0
         self._prefill_pressure_task: Optional[asyncio.Task] = None
+        self._prefill_pressure_domains: list[dict[str, Any]] = []
+        self._prefill_pressure_at = 0.0
+        # Start time of the HTTP sample currently represented by
+        # ``_prefill_pressure_domains``.  Direct shadow credit is retained
+        # until a sample started after the physical Direct completion has
+        # observed the new P allocation.  This makes the hand-off from Router
+        # accounting to allocator accounting atomic from later selectors'
+        # point of view.
+        self._prefill_pressure_sample_started_at = 0.0
         self._prefill_pressure_interval = _env_float(
             "SGLANG_AGENTIC_KV_PREFILL_LOAD_INTERVAL_S", 0.20
         )
@@ -344,6 +420,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             str, asyncio.Task[tuple[dict[str, Any], int]]
         ] = {}
         self._generation_results: dict[str, _GenerationResponse] = {}
+        # All long-lived generation tasks share one connector.  Creating and
+        # tearing down a ClientSession per request is unsafe at c512: each
+        # generation keeps both P and D HTTP transports alive for its whole
+        # serving lifetime, and rapid session teardown/retry can recycle a
+        # socket fd while uvloop still owns its previous transport.
+        self._backend_session: Optional[aiohttp.ClientSession] = None
+        # Load sampling is a control plane and must not share connector
+        # queues/sockets with hundreds of long-lived P/D generation requests.
+        # One small persistent pool isolates /get_load progress without
+        # returning to unsafe per-request ClientSession creation.
+        self._load_session: Optional[aiohttp.ClientSession] = None
         self.generation_result_ttl = _env_float(
             "SGLANG_PD_GENERATION_RESULT_TTL_S", 3600.0
         )
@@ -359,9 +446,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             "SGLANG_AGENTIC_KV_P2D_HOST_STAGING"
         )
         self.p2d_host_spill_delay = _env_float(
-            "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS", 0.05
+            "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS", 0.5
         )
         self.p2d_host_ledger = None
+        self._p2d_host_offered_snapshots: set[str] = set()
         if self.p2d_host_staging:
             p2d_ledger_path = os.getenv(
                 "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH",
@@ -370,6 +458,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             if not p2d_ledger_path or p2d_ledger_path == ".p2d":
                 raise ValueError("P->D Host staging requires a ledger path")
             self.p2d_host_ledger = SharedHostStagingLedger(p2d_ledger_path)
+            # Preserve ownership across a Router restart.  The hot broker can
+            # then reject Host-owned snapshots without parsing the complete
+            # ledger for every ordinary Direct admission.
+            self._p2d_host_offered_snapshots.update(
+                self.p2d_host_ledger.snapshot_entries()
+            )
         if self.numa_domains and (
             len(self.prefill_urls) < 2
             or len(self.decode_urls) % len(self.prefill_urls) != 0
@@ -402,12 +496,34 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         """Select only P here; the endpoint passes the D placeholder to us."""
         if not self.prefill_urls:
             raise RuntimeError("No prefill servers available")
-        index = self._prefill_index % len(self.prefill_urls)
+        if getattr(self, "ablation_random_routing", False):
+            index = self._routing_rng.randrange(len(self.prefill_urls))
+        else:
+            index = self._prefill_index % len(self.prefill_urls)
         self._prefill_index += 1
         return (
             self.prefill_urls[index],
             self.prefill_bootstrap_ports[index],
             None,
+        )
+
+    def _choose_decode_score(self, candidates, *, drain: bool = False):
+        """Choose one capacity-accounted D score for normal or ablation runs."""
+
+        if getattr(self, "ablation_random_routing", False):
+            # Sort first so a fixed ablation seed is independent of response
+            # arrival order from the asynchronous load probes.
+            return self._routing_rng.choice(
+                sorted(candidates, key=lambda item: item[4].url)
+            )
+        if drain:
+            return min(
+                candidates,
+                key=lambda item: (item[2], item[1], item[4].url),
+            )
+        return min(
+            candidates,
+            key=lambda item: (item[1], item[2], item[4].url),
         )
 
     @staticmethod
@@ -434,6 +550,21 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     def _request_input_tokens(request: dict[str, Any]) -> int:
         input_ids = request.get("input_ids")
         if not isinstance(input_ids, list):
+            custom_params = request.get("custom_params")
+            hint = (
+                custom_params.get("agentic_prompt_token_count")
+                if isinstance(custom_params, dict)
+                else None
+            )
+            # This is only shadow admission accounting.  Bound the hint to a
+            # generous finite range; the model server remains authoritative
+            # for actual tokenization and context-length validation.
+            if (
+                isinstance(hint, int)
+                and not isinstance(hint, bool)
+                and 0 < hint <= 10_000_000
+            ):
+                return hint
             return 1
         if not input_ids:
             return 1
@@ -458,39 +589,169 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         tokens: int,
         *,
         domain: Optional[int] = None,
+        direct_workset_tokens: int = 0,
     ) -> _PrefillWorkReservation:
         tokens = max(1, int(tokens))
+        direct_workset_tokens = max(0, int(direct_workset_tokens))
         async with self._prefill_work_lock:
             if domain is None:
                 count = len(self.prefill_urls)
                 start = self._prefill_work_tiebreak % count
-                domain = min(
-                    range(count),
-                    key=lambda candidate: (
-                        self._prefill_pending_tokens[candidate],
-                        self._prefill_pending_requests[candidate],
-                        (candidate - start) % count,
-                    ),
+                candidates = list(range(count))
+                pressure = getattr(self, "_prefill_pressure_domains", [])
+                pressure_at = float(getattr(self, "_prefill_pressure_at", 0.0))
+                pressure_max_age = max(
+                    1.0,
+                    5.0 * float(getattr(self, "_prefill_pressure_interval", 0.2)),
                 )
+                pressure_by_domain = {
+                    int(row.get("domain", -1)): row for row in pressure
+                }
+                direct_pending = getattr(
+                    self,
+                    "_prefill_direct_pending_tokens",
+                    [0] * count,
+                )
+                pressure_fresh = time.monotonic() - pressure_at <= pressure_max_age
+                remaining_by_domain: dict[int, int] = {}
+                if pressure_fresh:
+                    for candidate in candidates:
+                        row = pressure_by_domain.get(candidate)
+                        if row is None:
+                            continue
+                        capacity = int(row.get("hbm_capacity_tokens", 0))
+                        if capacity <= 0:
+                            continue
+                        remaining_by_domain[candidate] = (
+                            capacity
+                            - int(row.get("hbm_used_tokens", 0))
+                            - direct_pending[candidate]
+                        )
+                    feasible = [
+                        candidate
+                        for candidate, remaining in remaining_by_domain.items()
+                        if remaining >= direct_workset_tokens
+                    ]
+                    if feasible:
+                        candidates = feasible
+                    elif remaining_by_domain:
+                        candidates = list(remaining_by_domain)
+                if getattr(self, "ablation_random_routing", False):
+                    domain = self._routing_rng.choice(sorted(candidates))
+                elif remaining_by_domain:
+                    # D->P routing deliberately uses one cheap signal: choose
+                    # the P with the most uncommitted KV capacity.  Local
+                    # Router-local full-workset reservations are deducted so
+                    # stale samples cannot herd several requests onto one P.
+                    # The exact-size allocator remains authoritative.
+                    domain = max(
+                        candidates,
+                        key=lambda candidate: (
+                            remaining_by_domain[candidate],
+                            -((candidate - start) % count),
+                        ),
+                    )
+                else:
+                    # Startup or a stale/missing P sample has no meaningful
+                    # remaining-capacity ordering.  Preserve the local shadow
+                    # fallback until the next asynchronous sample arrives.
+                    domain = min(
+                        candidates,
+                        key=lambda candidate: (
+                            self._prefill_pending_tokens[candidate],
+                            (candidate - start) % count,
+                        ),
+                    )
                 self._prefill_work_tiebreak = (domain + 1) % count
             if not 0 <= domain < len(self.prefill_urls):
                 raise RuntimeError(f"invalid Prefill domain {domain}")
             self._prefill_pending_tokens[domain] += tokens
             self._prefill_pending_requests[domain] += 1
-            reservation = _PrefillWorkReservation(domain=domain, tokens=tokens)
+            if not hasattr(self, "_prefill_direct_pending_tokens"):
+                self._prefill_direct_pending_tokens = [0] * len(self.prefill_urls)
+            self._prefill_direct_pending_tokens[domain] += direct_workset_tokens
+            reservation = _PrefillWorkReservation(
+                domain=domain,
+                tokens=tokens,
+                direct_workset_tokens=direct_workset_tokens,
+            )
             logger.info(
                 "PD_P_WORK_RESERVE P=%d tokens=%d pending_tokens=%d "
-                "pending_requests=%d",
+                "pending_requests=%d direct_workset_tokens=%d "
+                "direct_pending_tokens=%d",
                 domain,
                 tokens,
                 self._prefill_pending_tokens[domain],
                 self._prefill_pending_requests[domain],
+                direct_workset_tokens,
+                self._prefill_direct_pending_tokens[domain],
             )
             return reservation
 
+    async def _settle_direct_workset(
+        self, reservation: Optional[_PrefillWorkReservation]
+    ) -> None:
+        """Drop Router shadow credit when no physical-accounting bridge is needed.
+
+        Fallback has no Direct allocation on the originally selected P and can
+        settle immediately.  Direct success must instead use
+        ``_settle_direct_workset_after_pressure`` so cached physical pressure
+        and Router shadow accounting cannot both omit the same workset.
+        """
+
+        if reservation is None or reservation.direct_workset_tokens <= 0:
+            return
+        async with self._prefill_work_lock:
+            if reservation.direct_workset_tokens <= 0:
+                return
+            domain = reservation.domain
+            self._prefill_direct_pending_tokens[domain] -= (
+                reservation.direct_workset_tokens
+            )
+            if self._prefill_direct_pending_tokens[domain] < 0:
+                raise RuntimeError("Prefill Direct shadow accounting underflow")
+            reservation.direct_workset_tokens = 0
+
+    async def _settle_direct_workset_after_pressure(
+        self,
+        reservation: Optional[_PrefillWorkReservation],
+        *,
+        direct_terminal_at: float,
+    ) -> None:
+        """Hand Direct credit to a causally newer physical-HBM sample.
+
+        A Direct completion and the periodic ``/get_load`` sampling run in
+        different tasks.  Clearing Router credit immediately would leave a
+        deterministic interval in which the cached sample is still old while
+        the shadow has already disappeared.  Keep the shadow until a sample
+        whose fetch began after completion has been published.  Cancellation
+        is safe: the dispatch owner ultimately calls ``_release_prefill_work``
+        and removes any remaining credit exactly once.
+        """
+
+        if reservation is None or reservation.direct_workset_tokens <= 0:
+            return
+        poll_interval = max(
+            0.01,
+            min(
+                0.05,
+                float(getattr(self, "_prefill_pressure_interval", 0.20)),
+            ),
+        )
+        while not reservation.released and reservation.direct_workset_tokens > 0:
+            if (
+                float(
+                    getattr(self, "_prefill_pressure_sample_started_at", 0.0)
+                )
+                >= direct_terminal_at
+            ):
+                await self._settle_direct_workset(reservation)
+                return
+            await asyncio.sleep(poll_interval)
+
     async def _fetch_prefill_hbm_pressure(
         self, session: aiohttp.ClientSession, url: str
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int]:
         """Read one logical P without putting the query on its GPU loop."""
 
         timeout = aiohttp.ClientTimeout(total=self.load_timeout)
@@ -504,8 +765,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             for row in rows
         )
         capacity = sum(int(row.get("max_total_num_tokens", 0)) for row in rows)
-        waiting = sum(int(row.get("num_waiting_reqs", 0)) for row in rows)
-        return used, capacity, waiting
+        return used, capacity
 
     @staticmethod
     def _write_prefill_pressure(path: Path, payload: dict[str, Any]) -> None:
@@ -524,8 +784,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             HostStageState.HOST_WRITING.value,
             HostStageState.HOST_READY.value,
             HostStageState.H2D_LOADING.value,
-            HostStageState.SPILLING.value,
+            # The Host extent remains authoritative until the recovered HBM
+            # workset has been inserted and pinned, including retry windows.
+            HostStageState.HBM_READY.value,
+            HostStageState.RETRY_PENDING.value,
+            # ABORTING likewise owns its extent until D is quiescent.
+            HostStageState.ABORTING.value,
         }
+        # EVICTING still owns its TP-local extents; RECOMPUTE_REQUIRED does
+        # not.  Add the former only when this environment exposes it.
+        if _HOST_STAGE_EVICTING is not None:
+            live_states.add(_HOST_STAGE_EVICTING.value)
         for entry in ledger.snapshot_entries().values():
             if entry.get("state") not in live_states:
                 continue
@@ -534,8 +803,106 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 used[domain] += int(entry.get("byte_size", 0))
         return used
 
+    def _p2d_pressure_by_domain(
+        self, ledger_entries: Optional[dict[str, dict[str, Any]]] = None
+    ) -> list[dict[str, int]]:
+        """Snapshot P->D delivery work that ordinary P load omits.
+
+        Completed Prefill requests disappear from ``pending_tokens`` before
+        their KV has necessarily reached D.  Count Router inflight/queued work
+        and durable P->D Host ownership separately so D->P routing cannot
+        mistake a delivery-blocked P for an idle one.
+        """
+
+        count = len(self.prefill_urls)
+        rows = [
+            {
+                "p2d_inflight_tokens": 0,
+                "p2d_inflight_requests": 0,
+                "p2d_host_tokens": 0,
+                "p2d_host_requests": 0,
+                "p2d_host_bytes": 0,
+            }
+            for _ in range(count)
+        ]
+        durable_host_snapshots: set[str] = set()
+        ledger = getattr(self, "p2d_host_ledger", None)
+        if ledger_entries is None:
+            ledger_entries = (
+                {} if ledger is None else ledger.snapshot_entries()
+            )
+        if ledger_entries:
+            live_states = {
+                HostStageState.HOST_RESERVED.value,
+                HostStageState.HOST_WRITING.value,
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+            }
+            for snapshot_id, entry in ledger_entries.items():
+                if entry.get("state") not in live_states:
+                    continue
+                domain = int(entry.get("prefill_domain", -1))
+                if not 0 <= domain < count:
+                    continue
+                durable_host_snapshots.add(str(snapshot_id))
+                rows[domain]["p2d_host_tokens"] += max(
+                    0, int(entry.get("token_count", 0))
+                )
+                rows[domain]["p2d_host_requests"] += 1
+                rows[domain]["p2d_host_bytes"] += max(
+                    0, int(entry.get("byte_size", 0))
+                )
+
+        seen: set[tuple[int, int]] = set()
+        for containers in (
+            getattr(self, "_p_ready_fifo_waiters", {}),
+            getattr(self, "_p_ready_fifo_active", {}),
+        ):
+            for domain, admissions in containers.items():
+                if not 0 <= int(domain) < count:
+                    continue
+                for admission in admissions.values():
+                    # Once a D reservation or durable P->D Host owner exists,
+                    # that generation is accounted below by its authoritative
+                    # delivery state.  Counting the queue record as well would
+                    # charge one blocked generation twice and distort P choice.
+                    if admission.initial_reservation is not None:
+                        continue
+                    p2d_snapshot = self._p2d_snapshot_for_rooms(admission.rooms)
+                    if (
+                        p2d_snapshot is not None
+                        and p2d_snapshot in durable_host_snapshots
+                    ):
+                        continue
+                    key = (int(domain), int(admission.sequence))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows[int(domain)]["p2d_inflight_tokens"] += max(
+                        0, int(admission.prompt_tokens)
+                    )
+                    rows[int(domain)]["p2d_inflight_requests"] += max(
+                        1, len(admission.rooms)
+                    )
+        for reservation in getattr(self, "_reservations", {}).values():
+            domain = reservation.prefill_domain
+            if domain is None or not 0 <= int(domain) < count:
+                continue
+            p2d_snapshot = reservation.p2d_host_snapshot_id
+            if p2d_snapshot is None:
+                p2d_snapshot = self._p2d_snapshot_for_rooms(reservation.rooms)
+            if p2d_snapshot in durable_host_snapshots:
+                continue
+            rows[int(domain)]["p2d_inflight_tokens"] += max(
+                0, int(reservation.prompt_tokens)
+            )
+            rows[int(domain)]["p2d_inflight_requests"] += max(
+                1, int(reservation.request_count)
+            )
+        return rows
+
     async def _prefill_pressure_monitor_loop(self) -> None:
-        """Publish a nonblocking shared snapshot for D-rank0 slow routing."""
+        """Publish independent P-HBM and Shared-Host capacity signals."""
 
         tp_size = max(1, int(os.getenv("SGLANG_AGENTIC_KV_TP_SIZE", "1")))
         arena_capacity = int(
@@ -545,6 +912,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         )
         async with aiohttp.ClientSession() as session:
             while True:
+                sample_started_at = time.monotonic()
                 fetched = await asyncio.gather(
                     *(
                         self._fetch_prefill_hbm_pressure(session, url)
@@ -552,22 +920,16 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     ),
                     return_exceptions=True,
                 )
-                async with self._prefill_work_lock:
-                    pending_tokens = list(self._prefill_pending_tokens)
-                    pending_requests = list(self._prefill_pending_requests)
                 arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
                 domains = []
                 for domain, result in enumerate(fetched):
                     if isinstance(result, BaseException):
-                        used = capacity = waiting = 0
+                        used = capacity = 0
                     else:
-                        used, capacity, waiting = result
+                        used, capacity = result
                     domains.append(
                         {
                             "domain": domain,
-                            "pending_tokens": pending_tokens[domain],
-                            "pending_requests": pending_requests[domain],
-                            "scheduler_waiting": waiting,
                             "hbm_used_tokens": used,
                             "hbm_capacity_tokens": capacity,
                             "arena_used_bytes": arena_used[domain],
@@ -579,6 +941,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     "published_at": time.time(),
                     "domains": domains,
                 }
+                # Publish the sample and its causal epoch together, without an
+                # intervening await.  A Direct terminal may therefore either
+                # keep its bridge credit or rely on this physical snapshot,
+                # but selectors can never miss both.
+                self._prefill_pressure_domains = domains
+                self._prefill_pressure_sample_started_at = sample_started_at
+                self._prefill_pressure_at = time.monotonic()
                 try:
                     await asyncio.to_thread(
                         self._write_prefill_pressure,
@@ -594,6 +963,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             return
         if not hasattr(self, "_prefill_pressure_interval"):
             self._prefill_pressure_interval = 0.20
+        if not hasattr(self, "_prefill_pressure_sample_started_at"):
+            self._prefill_pressure_sample_started_at = 0.0
         if not hasattr(self, "_prefill_pressure_path"):
             self._prefill_pressure_path = (
                 self.p_ready_dir / "early-claims" / "prefill-loads.json"
@@ -621,6 +992,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             self._prefill_pending_requests[previous] -= reservation.requests
             self._prefill_pending_tokens[domain] += reservation.tokens
             self._prefill_pending_requests[domain] += reservation.requests
+            if reservation.direct_workset_tokens:
+                self._prefill_direct_pending_tokens[previous] -= (
+                    reservation.direct_workset_tokens
+                )
+                self._prefill_direct_pending_tokens[domain] += (
+                    reservation.direct_workset_tokens
+                )
             reservation.domain = domain
             logger.info(
                 "PD_P_WORK_MOVE from_P=%d to_P=%d tokens=%d pending_tokens=%s",
@@ -629,6 +1007,77 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 reservation.tokens,
                 self._prefill_pending_tokens,
             )
+
+    async def _move_prefill_work_to_max_remaining_kv(
+        self,
+        reservation: _PrefillWorkReservation,
+        required_workset_tokens: int,
+    ) -> int:
+        """Atomically retarget an existing request to the roomiest P HBM."""
+
+        required_workset_tokens = max(1, int(required_workset_tokens))
+        async with self._prefill_work_lock:
+            if reservation.released:
+                raise RuntimeError("cannot route a released Prefill reservation")
+            count = len(self.prefill_urls)
+            pressure = getattr(self, "_prefill_pressure_domains", [])
+            pressure_at = float(getattr(self, "_prefill_pressure_at", 0.0))
+            pressure_max_age = max(
+                1.0,
+                5.0 * float(getattr(self, "_prefill_pressure_interval", 0.2)),
+            )
+            if time.monotonic() - pressure_at > pressure_max_age:
+                pressure = []
+            pressure_by_domain = {
+                int(row.get("domain", -1)): row for row in pressure
+            }
+            remaining = {}
+            for domain in range(count):
+                row = pressure_by_domain.get(domain)
+                if row is None:
+                    continue
+                capacity = int(row.get("hbm_capacity_tokens", 0))
+                if capacity <= 0:
+                    continue
+                pending = self._prefill_direct_pending_tokens[domain]
+                if domain == reservation.domain:
+                    pending -= reservation.direct_workset_tokens
+                remaining[domain] = (
+                    capacity - int(row.get("hbm_used_tokens", 0)) - pending
+                )
+            feasible = [
+                domain
+                for domain, available in remaining.items()
+                if available >= required_workset_tokens
+            ]
+            candidates = feasible or list(remaining)
+            if candidates:
+                domain = max(candidates, key=lambda item: (remaining[item], -item))
+            else:
+                domain = min(
+                    range(count), key=lambda item: self._prefill_pending_tokens[item]
+                )
+            if domain != reservation.domain:
+                previous = reservation.domain
+                self._prefill_pending_tokens[previous] -= reservation.tokens
+                self._prefill_pending_requests[previous] -= reservation.requests
+                self._prefill_direct_pending_tokens[previous] -= (
+                    reservation.direct_workset_tokens
+                )
+                self._prefill_pending_tokens[domain] += reservation.tokens
+                self._prefill_pending_requests[domain] += reservation.requests
+                self._prefill_direct_pending_tokens[domain] += (
+                    reservation.direct_workset_tokens
+                )
+                reservation.domain = domain
+                logger.info(
+                    "PD_P_WORK_MOVE_MAX_REMAINING from_P=%d to_P=%d "
+                    "workset_tokens=%d",
+                    previous,
+                    domain,
+                    required_workset_tokens,
+                )
+            return domain
 
     async def _resize_prefill_work(
         self, reservation: _PrefillWorkReservation, tokens: int
@@ -665,6 +1114,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             domain = reservation.domain
             self._prefill_pending_tokens[domain] -= reservation.tokens
             self._prefill_pending_requests[domain] -= reservation.requests
+            self._prefill_direct_pending_tokens[domain] -= (
+                reservation.direct_workset_tokens
+            )
+            reservation.direct_workset_tokens = 0
             reservation.released = True
             if (
                 self._prefill_pending_tokens[domain] < 0
@@ -718,23 +1171,259 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         width = len(self.decode_urls) // len(self.prefill_urls)
         return set(self.decode_urls[domain * width : (domain + 1) * width])
 
-    def _local_domain_decode_urls(self, domain: int) -> set[str]:
-        """Return the physical NUMA-local D partition, ignoring fast routing."""
-
-        if not getattr(self, "numa_domains", False):
-            return set(self.decode_urls)
-        width = len(self.decode_urls) // len(self.prefill_urls)
-        return set(self.decode_urls[domain * width : (domain + 1) * width])
-
     @staticmethod
     def _set_p2d_host_metadata(
         request: dict[str, Any], snapshot_id: str, prefill_domain: int
     ) -> None:
-        sampling = request.setdefault("sampling_params", {})
-        custom = dict(sampling.get("custom_params") or {})
-        custom[P2D_CUSTOM_SNAPSHOT_ID] = str(snapshot_id)
-        custom[P2D_CUSTOM_PREFILL_DOMAIN] = int(prefill_domain)
-        sampling["custom_params"] = custom
+        values = {
+            P2D_CUSTOM_SNAPSHOT_ID: str(snapshot_id),
+            P2D_CUSTOM_PREFILL_DOMAIN: int(prefill_domain),
+        }
+        # /generate carries custom metadata inside sampling_params, whereas
+        # /v1/chat/completions carries it at the request top level.  Do not
+        # manufacture the other protocol's container: unknown nested fields
+        # can be silently discarded by the Chat schema, which previously made
+        # D construct a native NIXL receiver for a snapshot already released
+        # by P into the Host arena.
+        sampling = request.get("sampling_params")
+        if isinstance(sampling, dict):
+            custom = dict(sampling.get("custom_params") or {})
+            custom.update(values)
+            sampling["custom_params"] = custom
+            return
+        custom = dict(request.get("custom_params") or {})
+        custom.update(values)
+        request["custom_params"] = custom
+
+    def _p2d_snapshot_for_rooms(self, rooms: tuple[int, ...]) -> Optional[str]:
+        """Return the P->D Host identity supported by the current request."""
+
+        if getattr(self, "p2d_host_ledger", None) is None or len(rooms) != 1:
+            return None
+        return p2d_snapshot_id(rooms[0])
+
+    def _publish_p2d_host_offer(
+        self,
+        snapshot_id: str,
+        rooms: tuple[int, ...],
+        prompt_tokens: int,
+        domain: int,
+        *,
+        source: str = "backpressure",
+    ) -> str:
+        """Publish one idempotent P->D Host offer without scheduling delay."""
+
+        offered = self.p2d_host_ledger.offer(
+            {
+                "snapshot_id": snapshot_id,
+                "bootstrap_room": int(rooms[0]),
+                "token_count": int(prompt_tokens),
+                "prefill_domain": int(domain),
+                "request_direction": "p2d",
+                "control_offer": True,
+                "tp_size": int(os.getenv("SGLANG_AGENTIC_KV_TP_SIZE", "1")),
+            }
+        )
+        # The Router is the sole publisher of P->D control offers.  Keep a
+        # process-local index so the hot Direct-admission path can prove that
+        # no Host owner exists without decoding the complete shared ledger for
+        # every P-ready request.  Once present, an id is never removed: the
+        # ledger tombstone remains the physical ownership authority.
+        if not hasattr(self, "_p2d_host_offered_snapshots"):
+            self._p2d_host_offered_snapshots = set()
+        self._p2d_host_offered_snapshots.add(snapshot_id)
+        logger.info(
+            "PD_P2D_HOST_OFFER snapshot=%s rooms=%s P=%d "
+            "prompt_tokens=%d state=%s source=%s",
+            snapshot_id,
+            rooms,
+            domain,
+            prompt_tokens,
+            offered.get("state"),
+            source,
+        )
+        return snapshot_id
+
+    async def _stage_p2d_until_durable(
+        self,
+        rooms: tuple[int, ...],
+        prompt_tokens: int,
+        domain: int,
+    ) -> bool:
+        """Move one blocked P-ready generation under durable Host ownership.
+
+        This is the producer half of the P->D pipeline.  It never waits for or
+        reserves D HBM: once the complete Host snapshot is committed, P may
+        release its source pages and the ordered consumer will admit it to D
+        later.  Returning ``False`` means Host staging is unavailable for this
+        request shape and the caller must retain P HBM while waiting for D.
+        """
+
+        snapshot_id = self._p2d_snapshot_for_rooms(rooms)
+        if snapshot_id is None:
+            return False
+        await self._finish_physical_control_operation(
+            asyncio.to_thread(
+                self._publish_p2d_host_offer,
+                snapshot_id,
+                rooms,
+                prompt_tokens,
+                domain,
+                source="p_ready_pipeline",
+            )
+        )
+
+        deadline = time.monotonic() + self.ready_timeout
+        while True:
+            entry = await asyncio.to_thread(self.p2d_host_ledger.get, snapshot_id)
+            state = None if entry is None else entry.get("state")
+            if state in {
+                HostStageState.HOST_READY.value,
+                HostStageState.H2D_LOADING.value,
+                HostStageState.CONSUMED.value,
+            }:
+                return True
+            if state == HostStageState.REJECTED.value:
+                # No Host writer ever took ownership.  This is the explicit
+                # RETAIN_P result used when one TP producer cannot reserve its
+                # local Arena extent (or native admission wins the offer).
+                # The caller still owns the complete P KV and may safely use
+                # the ordinary Direct/D-capacity path.
+                return False
+            if state in {
+                HostStageState.ABORTING.value,
+                HostStageState.FAILED.value,
+            }:
+                reason = None if entry is None else entry.get("reason")
+                raise RuntimeError(
+                    f"P->D Host staging terminated for {snapshot_id}: "
+                    f"state={state} reason={reason}"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for durable P->D Host snapshot "
+                    f"{snapshot_id}"
+                )
+            await asyncio.sleep(self.ready_poll_interval)
+
+    async def _retry_p_ready_direct_after_grace(
+        self, admission: _PReadyAdmission, *, not_before: float
+    ) -> Optional[DecodeReservation]:
+        """Retry one P-ready generation against a causally fresh D snapshot.
+
+        The P->D grace period is useful only if capacity released during that
+        interval can win before Host ownership is published.  Keep this retry
+        outside the physical staging lane and charge any winning reservation
+        under the same selection lock as the initial broker admission.
+        """
+
+        urls = self._domain_decode_urls(admission.domain)
+        if not await self._observe_decode_load_after(
+            self._load_http_session(), urls=urls, not_before=not_before
+        ):
+            return None
+        loads = list(self._load_cache)
+        async with self._selection_lock:
+            if admission.cancel_requested:
+                return None
+            self._prune_accounted_reservations()
+            return self._try_reserve_direct_ready_locked(admission, loads)
+
+    def _abort_unsubmitted_p2d(self, snapshot_id: Optional[str], reason: str) -> None:
+        """Return attempt-owned P->D storage to its physical owner safely."""
+
+        if snapshot_id is None or getattr(self, "p2d_host_ledger", None) is None:
+            return
+        state = self.p2d_host_ledger.abort_unsubmitted_p2d(
+            snapshot_id, reason=reason
+        )
+        logger.info(
+            "PD_P2D_HOST_ABORT snapshot=%s state=%s reason=%s",
+            snapshot_id,
+            state,
+            reason,
+        )
+
+    async def _commit_slow_recovery_domain(
+        self,
+        parent: RequestGeneration,
+        route: dict[str, Any],
+        domain: int,
+    ) -> Optional[int]:
+        """Commit one Host-independent H2D/Prefill destination.
+
+        ``None`` is the explicit outcome when pressure eviction wins the
+        HOST_READY assignment CAS.  The caller then resizes/releases its
+        provisional incremental-work reservation and performs full Prefill.
+        """
+
+        ledger = getattr(self, "_d2p_host_ledger", None)
+        if ledger is None:
+            raise RuntimeError("dynamic Slow recovery requires a Host ledger")
+        deadline = time.monotonic() + self.ready_timeout
+        while True:
+            assigned = await asyncio.to_thread(
+                ledger.assign_d2p_recovery_domain, parent.snapshot_id, domain
+            )
+            entry = await asyncio.to_thread(ledger.get, parent.snapshot_id)
+            if assigned:
+                break
+            existing = None if entry is None else entry.get("recovery_domain")
+            if existing is not None:
+                domain = int(existing)
+                break
+            state = None if entry is None else entry.get("state")
+            if (
+                _HOST_STAGE_EVICTING is not None
+                and state == _HOST_STAGE_EVICTING.value
+            ):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for Host eviction fence of "
+                        f"{parent.snapshot_id}"
+                    )
+                await asyncio.sleep(self.ready_poll_interval)
+                continue
+            if (
+                _HOST_STAGE_RECOMPUTE_REQUIRED is not None
+                and state == _HOST_STAGE_RECOMPUTE_REQUIRED.value
+            ):
+                self.early_claim_store.publish_route(
+                    parent,
+                    route="recompute",
+                    prefill_domain=int(route.get("prefill_domain", domain)),
+                )
+                self.early_claim_store.remove_arrival(parent)
+                logger.info(
+                    "PD_SLOW_RECOVERY_ROUTE snapshot=%s state=%s "
+                    "action=full_recompute",
+                    parent.snapshot_id,
+                    state,
+                )
+                return None
+            raise RuntimeError(
+                f"cannot assign Slow recovery P for {parent.snapshot_id}: "
+                f"state={state}"
+            )
+        host_domain = route.get("arena_domain")
+        if host_domain is None and entry is not None:
+            host_domain = entry.get("arena_domain")
+        self.early_claim_store.publish_route(
+            parent,
+            route="host_ready",
+            prefill_domain=domain,
+            arena_domain=(None if host_domain is None else int(host_domain)),
+            arena_numa_node=route.get("arena_numa_node"),
+            snapshot_tokens=route.get("snapshot_tokens"),
+        )
+        logger.info(
+            "PD_SLOW_RECOVERY_ROUTE snapshot=%s host=%s P=%d "
+            "policy=max_remaining_kv",
+            parent.snapshot_id,
+            host_domain,
+            domain,
+        )
+        return domain
 
     async def _resolve_dynamic_prefill_work(
         self,
@@ -742,11 +1431,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         metadata: Optional[AgenticRequestMetadata],
         arrival_at: Optional[float],
     ) -> _PrefillWorkReservation:
-        """Choose P as soon as DIRECT_READY is visible.
+        """Choose and account P before publishing physical Direct admission.
 
-        Returning here is intentional: request admission and Direct receive
-        must progress concurrently.  A later NUMA-local Host transition is
-        handled by the dispatch-time redirect watcher.
+        :meth:`_late_dispatch` publishes the targeted arrival immediately
+        after this choice.  P's exact-size workset allocator, rather than the
+        short HTTP/tokenizer admission gate, is the authority that decides
+        whether the parent+suffix KV can occupy HBM.
         """
 
         parent = None if metadata is None else metadata.parent
@@ -775,12 +1465,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             reservation = await self._reserve_prefill_work(
                                 self._estimated_prefill_tokens(
                                     request, snapshot_tokens
-                                )
-                            )
-                            self._publish_parent_arrival(
-                                request,
-                                target_prefill_domain=reservation.domain,
-                                arrived_at=arrival_at,
+                                ),
+                                direct_workset_tokens=self._request_input_tokens(
+                                    request
+                                ),
                             )
                             logger.info(
                                 "PD_PREFILL_ROUTE snapshot=%s route=%s "
@@ -792,11 +1480,77 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             )
                         reservation.route_pending = True
                         return reservation
-                    elif mode in {
-                        "direct_complete",
-                        "host_writing",
-                        "host_ready",
-                    }:
+                    elif mode in {"direct_complete", "host_writing", "host_ready"}:
+                        if mode in {"host_writing", "host_ready"}:
+                            host_ledger = getattr(self, "_d2p_host_ledger", None)
+                            host_entry = (
+                                None
+                                if host_ledger is None
+                                else await asyncio.to_thread(
+                                    host_ledger.get, parent.snapshot_id
+                                )
+                            )
+                            host_state = (
+                                None if host_entry is None else host_entry.get("state")
+                            )
+                            if (
+                                _HOST_STAGE_EVICTING is not None
+                                and host_state == _HOST_STAGE_EVICTING.value
+                            ):
+                                await asyncio.sleep(self.ready_poll_interval)
+                                continue
+                            if (
+                                _HOST_STAGE_RECOMPUTE_REQUIRED is not None
+                                and host_state
+                                == _HOST_STAGE_RECOMPUTE_REQUIRED.value
+                            ):
+                                store.publish_route(
+                                    parent,
+                                    route="recompute",
+                                    prefill_domain=int(route["prefill_domain"]),
+                                )
+                                store.remove_arrival(parent)
+                                await self._release_prefill_work(reservation)
+                                return await self._reserve_prefill_work(
+                                    self._request_input_tokens(request)
+                                )
+                            # Host placement is complete before selecting the
+                            # independent H2D/Prefill P. Do not bind recovery
+                            # to the arena owner while D2H is still running.
+                            if (
+                                mode == "host_writing"
+                                or host_state != HostStageState.HOST_READY.value
+                            ):
+                                await asyncio.sleep(self.ready_poll_interval)
+                                continue
+                            if reservation is None:
+                                reservation = await self._reserve_prefill_work(
+                                    self._estimated_prefill_tokens(
+                                        request, snapshot_tokens
+                                    ),
+                                    direct_workset_tokens=self._request_input_tokens(
+                                        request
+                                    ),
+                                )
+                            domain = await self._commit_slow_recovery_domain(
+                                parent, route, reservation.domain
+                            )
+                            if domain is None:
+                                await self._release_prefill_work(reservation)
+                                reservation = None
+                                return await self._reserve_prefill_work(
+                                    self._request_input_tokens(request)
+                                )
+                            if domain != reservation.domain:
+                                await self._move_prefill_work(reservation, domain)
+                            logger.info(
+                                "PD_PREFILL_ROUTE snapshot=%s route=host_ready "
+                                "P=%d estimated_tokens=%d",
+                                parent.snapshot_id,
+                                domain,
+                                reservation.tokens,
+                            )
+                            return reservation
                         domain = int(route["prefill_domain"])
                         if not 0 <= domain < len(self.prefill_urls):
                             raise RuntimeError(f"invalid Prefill domain {domain}")
@@ -806,14 +1560,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                                     request, snapshot_tokens
                                 ),
                                 domain=domain,
+                                direct_workset_tokens=self._request_input_tokens(
+                                    request
+                                ),
                             )
                         else:
                             await self._move_prefill_work(reservation, domain)
-                        self._publish_parent_arrival(
-                            request,
-                            target_prefill_domain=domain,
-                            arrived_at=arrival_at,
-                        )
                         logger.info(
                             "PD_PREFILL_ROUTE snapshot=%s route=%s P=%d "
                             "estimated_tokens=%d",
@@ -822,6 +1574,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             domain,
                             reservation.tokens,
                         )
+                        if mode == "direct_complete":
+                            reservation.route_pending = True
                         return reservation
                     elif mode == "recompute":
                         store.remove_arrival(parent)
@@ -870,9 +1624,112 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             if route is not None:
                 mode = route.get("route")
                 if mode in {"direct_complete", "host_writing", "host_ready"}:
+                    if mode in {"host_writing", "host_ready"}:
+                        host_ledger = getattr(self, "_d2p_host_ledger", None)
+                        host_entry = (
+                            None
+                            if host_ledger is None
+                            else await asyncio.to_thread(
+                                host_ledger.get, parent.snapshot_id
+                            )
+                        )
+                        host_state = (
+                            None if host_entry is None else host_entry.get("state")
+                        )
+                        if (
+                            _HOST_STAGE_EVICTING is not None
+                            and host_state == _HOST_STAGE_EVICTING.value
+                        ):
+                            await asyncio.sleep(self.ready_poll_interval)
+                            continue
+                        if (
+                            _HOST_STAGE_RECOMPUTE_REQUIRED is not None
+                            and host_state
+                            == _HOST_STAGE_RECOMPUTE_REQUIRED.value
+                        ):
+                            store.publish_route(
+                                parent,
+                                route="recompute",
+                                prefill_domain=int(route["prefill_domain"]),
+                            )
+                            store.remove_arrival(parent)
+                            await self._settle_direct_workset(reservation)
+                            await self._resize_prefill_work(
+                                reservation, self._request_input_tokens(request)
+                            )
+                            return {"action": "recompute", "route": "host_evicted"}
+                        if (
+                            mode == "host_writing"
+                            or host_state != HostStageState.HOST_READY.value
+                        ):
+                            await asyncio.sleep(self.ready_poll_interval)
+                            continue
+                        original_domain = reservation.domain
+                        domain = await self._move_prefill_work_to_max_remaining_kv(
+                            reservation, self._request_input_tokens(request)
+                        )
+                        domain = await self._commit_slow_recovery_domain(
+                            parent, route, domain
+                        )
+                        if domain is None:
+                            # Max-KV selection moved only Router accounting;
+                            # eviction won before any redirect was committed.
+                            # The existing HTTP request still targets the
+                            # original P, so move its full-recompute charge
+                            # back there before resizing it.
+                            if reservation.domain != original_domain:
+                                await self._move_prefill_work(
+                                    reservation, original_domain
+                                )
+                            await self._settle_direct_workset(reservation)
+                            await self._resize_prefill_work(
+                                reservation, self._request_input_tokens(request)
+                            )
+                            return {
+                                "action": "recompute",
+                                "route": "host_evicted",
+                            }
+                        if domain != reservation.domain:
+                            await self._move_prefill_work(reservation, domain)
+                        if domain != original_domain:
+                            logger.info(
+                                "PD_PREFILL_REDIRECT snapshot=%s route=host_ready "
+                                "from_P=%d to_P=%d",
+                                parent.snapshot_id,
+                                original_domain,
+                                domain,
+                            )
+                        if domain != reservation.domain:
+                            raise RuntimeError("Slow recovery reservation move lost")
+                        # The request was already submitted for Direct. Make
+                        # the HTTP attempt follow the newly selected recovery
+                        # P whenever it differs from that original domain.
+                        return (
+                            {
+                                "action": "redirect",
+                                "route": "host_ready",
+                                "domain": domain,
+                            }
+                            if domain != original_domain
+                            else {
+                                "action": "settled",
+                                "route": "host_ready",
+                                "domain": domain,
+                            }
+                        )
                     domain = int(route["prefill_domain"])
                     if not 0 <= domain < len(self.prefill_urls):
                         raise RuntimeError(f"invalid Prefill domain {domain}")
+                    if mode == "direct_complete" and domain == reservation.domain:
+                        await self._settle_direct_workset_after_pressure(
+                            reservation,
+                            direct_terminal_at=time.monotonic(),
+                        )
+                    else:
+                        # Host fallback has no physical allocation on the
+                        # originally selected P.  A cross-domain terminal also
+                        # cannot hand that domain's shadow to this reservation.
+                        await self._settle_direct_workset(reservation)
                     if domain != reservation.domain:
                         logger.info(
                             "PD_PREFILL_REDIRECT snapshot=%s route=%s "
@@ -890,6 +1747,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     return {"action": "settled", "route": mode, "domain": domain}
                 if mode == "recompute":
                     store.remove_arrival(parent)
+                    await self._settle_direct_workset(reservation)
                     await self._resize_prefill_work(
                         reservation, self._request_input_tokens(request)
                     )
@@ -898,6 +1756,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 parent, not_before=0.0, max_age_seconds=self.ready_timeout
             ) is not None:
                 store.remove_arrival(parent)
+                await self._settle_direct_workset(reservation)
                 await self._resize_prefill_work(
                     reservation, self._request_input_tokens(request)
                 )
@@ -919,12 +1778,23 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     @staticmethod
     def _set_prefill_attempt_rid(request: dict[str, Any], *, replace: bool) -> None:
         rid = request.get("rid")
-        batch = isinstance(request.get("bootstrap_room"), list)
-        if not replace and rid is not None:
-            return
+        rooms = request.get("bootstrap_room")
+        batch = isinstance(rooms, list)
         if batch:
-            request["rid"] = [uuid.uuid4().hex for _ in request["bootstrap_room"]]
-        else:
+            size = len(rooms)
+            if replace or rid is None:
+                request["rid"] = [uuid.uuid4().hex for _ in range(size)]
+            elif isinstance(rid, list):
+                if len(rid) != size:
+                    raise ValueError("rid/bootstrap_room batch size mismatch")
+            else:
+                # Mirror GenerateReqInput._normalize_rid(): a scalar batch rid
+                # is a supported shorthand, not a malformed request.
+                request["rid"] = [f"{rid}_{index}" for index in range(size)]
+            return
+        if isinstance(rid, list):
+            raise ValueError("rid list requires batched bootstrap_room")
+        if replace or rid is None:
             request["rid"] = uuid.uuid4().hex
 
     @staticmethod
@@ -936,6 +1806,59 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             ]
         else:
             request["bootstrap_room"] = uuid.uuid4().int & ((1 << 63) - 1)
+
+    @staticmethod
+    def _attempt_rids(
+        request: dict[str, Any], rooms: tuple[int, ...]
+    ) -> tuple[str, ...]:
+        value = request.get("rid")
+        if isinstance(value, list):
+            if len(value) != len(rooms):
+                raise ValueError("rid/bootstrap_room batch size mismatch")
+            return tuple(str(item) for item in value)
+        if len(rooms) != 1 or value is None:
+            raise ValueError("missing rid for Prefill attempt")
+        return (str(value),)
+
+    def _activate_prefill_attempt(
+        self, request: dict[str, Any], rooms: tuple[int, ...]
+    ) -> None:
+        owners = getattr(self, "_active_prefill_attempts", None)
+        if owners is None:
+            owners = {}
+            self._active_prefill_attempts = owners
+        claims = tuple(zip(rooms, self._attempt_rids(request, rooms)))
+        # Validate the complete TP group before publishing any ownership. A
+        # duplicate room must fail atomically rather than stealing one rank of
+        # an already-live attempt.
+        pending: dict[int, str] = {}
+        for room, rid in claims:
+            room = int(room)
+            existing = owners.get(room, pending.get(room))
+            if existing is not None and existing != rid:
+                raise RuntimeError(
+                    f"bootstrap_room {room} already owned by rid={existing}"
+                )
+            pending[room] = rid
+        owners.update(pending)
+
+    def _deactivate_prefill_attempt(
+        self, request: dict[str, Any], rooms: tuple[int, ...]
+    ) -> None:
+        owners = getattr(self, "_active_prefill_attempts", None)
+        if owners is None:
+            return
+        for room, rid in zip(rooms, self._attempt_rids(request, rooms)):
+            if owners.get(int(room)) == rid:
+                owners.pop(int(room), None)
+
+    def _p_ready_marker_is_owned(self, room: int, payload: dict[str, Any]) -> bool:
+        owners = getattr(self, "_active_prefill_attempts", None)
+        # Compatibility for focused tests/embedders constructed via __new__.
+        if owners is None:
+            return True
+        expected_rid = owners.get(int(room))
+        return expected_rid is not None and str(payload.get("rid", "")) == expected_rid
 
     async def _abort_prefill_attempt(
         self,
@@ -971,10 +1894,82 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     prefill_server,
                     rid,
                 )
-        if prefill_task is not None and not prefill_task.done():
-            prefill_task.cancel()
-            await asyncio.gather(prefill_task, return_exceptions=True)
+        await self._dispose_response_task(prefill_task)
         return aborted
+
+    async def _abort_decode_attempt(
+        self,
+        session: aiohttp.ClientSession,
+        decode_server: str,
+        request: dict[str, Any],
+    ) -> bool:
+        """Cancel one submitted D attempt before releasing Router ownership.
+
+        Cancelling the aiohttp response task alone only closes the HTTP client;
+        it does not guarantee that SGLang removes a request which is still in
+        Decode prealloc or transfer.  Explicitly abort every TP request id so
+        D can fence/clear its receiver and return any destination allocation.
+        """
+
+        rids = request.get("rid")
+        if not isinstance(rids, list):
+            rids = [] if rids is None else [rids]
+        aborted = bool(rids)
+        for rid in rids:
+            try:
+                response = await session.post(
+                    f"{decode_server}/abort_request", json={"rid": rid}
+                )
+                if response.status >= 400:
+                    aborted = False
+                    logger.warning(
+                        "PD_DECODE_ABORT failed D=%s rid=%s status=%d",
+                        decode_server,
+                        rid,
+                        response.status,
+                    )
+                release = getattr(response, "release", None)
+                if release is not None:
+                    release()
+            except Exception:
+                aborted = False
+                logger.exception(
+                    "PD_DECODE_ABORT request failed D=%s rid=%s",
+                    decode_server,
+                    rid,
+                )
+        return aborted
+
+    @staticmethod
+    async def _dispose_response_task(task: Optional[asyncio.Task]) -> None:
+        """Cancel an HTTP task or return its completed response to the pool."""
+
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        results = await asyncio.gather(task, return_exceptions=True)
+        if results and isinstance(results[0], aiohttp.ClientResponse):
+            results[0].release()
+
+    @staticmethod
+    async def _finish_physical_control_operation(awaitable: Awaitable[Any]) -> Any:
+        """Join a non-cancellable ledger write before propagating cancellation."""
+
+        task = asyncio.create_task(awaitable)
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                # ``to_thread`` keeps running.  Cleanup must observe its final
+                # state, so defer logical cancellation until it is joined.
+                cancelled = True
+                continue
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     def _scheduled_path(self, room: int) -> Path:
         return self.p_ready_dir / f"{room}.scheduled"
@@ -1071,6 +2066,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             payload = store.publish_arrival(
                 metadata.parent,
                 target_prefill_domain=target_prefill_domain,
+                prompt_token_count=self._request_input_tokens(request),
                 arrived_at=arrived_at,
             )
         except OSError:
@@ -1082,10 +2078,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             )
             return None
         logger.info(
-            "PD_EARLY_CLAIM_ARRIVAL snapshot=%s generation=%d arrived_at=%.6f P=%s",
+            "PD_EARLY_CLAIM_ARRIVAL snapshot=%s generation=%d arrived_at=%.6f "
+            "prompt_tokens=%d P=%s",
             metadata.parent.snapshot_id,
             metadata.generation,
             payload["arrived_at"],
+            payload["prompt_token_count"],
             target_prefill_domain,
         )
         return payload
@@ -1149,12 +2147,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         async with self._generation_lock:
             if self._generation_tasks.get(key) is task:
                 self._generation_tasks.pop(key, None)
-                self._generation_results[key] = _GenerationResponse(
-                    payload=payload,
-                    status=status,
-                    completed_at=time.monotonic(),
-                )
-                self._prune_generation_results(time.monotonic())
+                # Cache only successful logical generations. A transport 5xx
+                # is an attempt failure, not the result of the agent turn. If
+                # cached, all later HTTP retries replay the same stale wire
+                # generation and can never recover after D has torn it down.
+                if status < 400:
+                    self._generation_results[key] = _GenerationResponse(
+                        payload=payload,
+                        status=status,
+                        completed_at=time.monotonic(),
+                    )
+                    self._prune_generation_results(time.monotonic())
 
     async def _generate_once(
         self,
@@ -1162,13 +2165,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         prefill_server: str,
         endpoint: str,
     ) -> tuple[dict[str, Any], int]:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.timeout)
-        ) as session:
-            prefill_response, decode_response = await self._late_dispatch(
-                session, modified_request, prefill_server, endpoint, {}
-            )
-            if "return_logprob" in modified_request:
+        session = self._backend_http_session()
+        prefill_response, decode_response = await self._late_dispatch(
+            session, modified_request, prefill_server, endpoint, {}
+        )
+        try:
+            if modified_request.get("return_logprob", False):
+                assert prefill_response is not None
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
                 if (
@@ -1182,6 +2185,107 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             else:
                 ret_json = await decode_response.json()
             return ret_json, decode_response.status
+        finally:
+            if prefill_response is not None:
+                prefill_response.release()
+            decode_response.release()
+
+    def _backend_http_session(self) -> aiohttp.ClientSession:
+        """Return the Router-owned backend pool without an await-time race."""
+
+        session = getattr(self, "_backend_session", None)
+        if session is None or session.closed:
+            # Construction contains no await, so event-loop tasks cannot both
+            # install different sessions between the check and assignment.
+            connector = aiohttp.TCPConnector(
+                limit=_env_int("SGLANG_PD_ROUTER_HTTP_CONNECTION_LIMIT", 2048),
+                limit_per_host=_env_int(
+                    "SGLANG_PD_ROUTER_HTTP_CONNECTION_LIMIT_PER_HOST", 512
+                ),
+                # The generation path can have hundreds of concurrent P/D
+                # requests.  Reusing a bounded pool is essential: forcing one
+                # new socket per turn creates an FD-close/reuse storm in
+                # uvloop at c512.  The launch script keeps the SGLang server
+                # timeout longer than this client-side idle lifetime.
+                keepalive_timeout=_env_float(
+                    "SGLANG_PD_ROUTER_HTTP_KEEPALIVE_S", 30.0
+                ),
+            )
+            session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            )
+            self._backend_session = session
+        return session
+
+    def _load_http_session(self) -> aiohttp.ClientSession:
+        """Return the persistent, generation-independent load-control pool."""
+
+        session = getattr(self, "_load_session", None)
+        if session is None or session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=_env_int("SGLANG_PD_ROUTER_LOAD_CONNECTION_LIMIT", 32),
+                limit_per_host=_env_int(
+                    "SGLANG_PD_ROUTER_LOAD_CONNECTION_LIMIT_PER_HOST", 4
+                ),
+                # SGLang's scheduler-backed load endpoint can close an idle
+                # keep-alive socket while saturated.  A later reuse then
+                # spends the whole control timeout on a dead transport and
+                # leaves Router with a stale full-D view.  Load replies are
+                # tiny and loopback-local, so use one fresh short connection
+                # per sample while retaining one bounded connector/session.
+                force_close=True,
+            )
+            session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=self.load_timeout),
+            )
+            self._load_session = session
+        return session
+
+    async def close(self) -> None:
+        """Close Router-owned HTTP resources during ASGI shutdown."""
+
+        for waiters in getattr(self, "_p_ready_fifo_waiters", {}).values():
+            for admission in waiters.values():
+                if not admission.future.done():
+                    admission.future.cancel()
+                admission.finished.set()
+        for task in getattr(self, "_p_ready_fifo_dispatchers", {}).values():
+            task.cancel()
+        broker = getattr(self, "_p_ready_broker_task", None)
+        if broker is not None:
+            broker.cancel()
+        active_tasks: list[asyncio.Task] = []
+        for active in getattr(self, "_p_ready_fifo_active", {}).values():
+            for admission in active.values():
+                if not admission.future.done():
+                    admission.future.cancel()
+                if admission.dispatch_task is not None:
+                    admission.dispatch_task.cancel()
+                    active_tasks.append(admission.dispatch_task)
+        monitor = getattr(self, "_p_ready_monitor_task", None)
+        if monitor is not None:
+            monitor.cancel()
+        tasks = list(getattr(self, "_p_ready_fifo_dispatchers", {}).values())
+        if broker is not None:
+            tasks.append(broker)
+        tasks.extend(active_tasks)
+        if monitor is not None:
+            tasks.append(monitor)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        refresh = getattr(self, "_load_refresh_task", None)
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+        sessions = (
+            getattr(self, "_backend_session", None),
+            getattr(self, "_load_session", None),
+        )
+        for session in sessions:
+            if session is not None and not session.closed:
+                await session.close()
 
     async def _generate_singleflight(
         self,
@@ -1203,6 +2307,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 # The request is mutated while binding its P/NUMA destination;
                 # isolate the elected producer from a retry's request object.
                 request_copy = orjson.loads(orjson.dumps(modified_request))
+                # A newly elected producer is a new physical wire attempt even
+                # when its logical request-generation key is unchanged. Never
+                # reuse a bootstrap room or TP mailbox identity from a failed
+                # transfer whose DMA may still be fenced or quarantined.
+                self._replace_prefill_attempt_rooms(request_copy)
+                self._set_prefill_attempt_rid(request_copy, replace=True)
                 task = asyncio.create_task(
                     self._generate_once(request_copy, prefill_server, endpoint)
                 )
@@ -1288,6 +2398,11 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             while True:
                 snapshot = await asyncio.to_thread(self._scan_p_ready_markers)
                 self._p_ready_snapshot = snapshot
+                for event in getattr(self, "_p_ready_fifo_events", {}).values():
+                    event.set()
+                broker_event = getattr(self, "_p_ready_broker_event", None)
+                if broker_event is not None:
+                    broker_event.set()
                 for room, futures in list(self._p_ready_waiters.items()):
                     payload = snapshot.get(room)
                     if payload is None:
@@ -1411,6 +2526,42 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     payload.get("prefill_domain", -1)
                 ) != domain:
                     continue
+                room = int(path.stem) if path is not None else -1
+                if not self._p_ready_marker_is_owned(room, payload):
+                    # A successful redirect can still race with the old P
+                    # scheduler for a few milliseconds.  Ignore and remove
+                    # its late marker; strict FIFO applies only to attempts
+                    # that still have a Router owner.
+                    if path is None:
+                        self._p_ready_snapshot.pop(room, None)
+                        continue
+                    try:
+                        current = orjson.loads(path.read_bytes())
+                    except (OSError, orjson.JSONDecodeError, TypeError):
+                        self._p_ready_snapshot.pop(room, None)
+                        continue
+                    if not self._p_ready_marker_is_owned(room, current):
+                        # Re-check the on-disk rid immediately before unlink:
+                        # the monitor snapshot may predate an atomic marker
+                        # replacement for a newly active attempt.
+                        try:
+                            latest = orjson.loads(path.read_bytes())
+                        except (OSError, orjson.JSONDecodeError, TypeError):
+                            latest = None
+                        if latest is not None and self._p_ready_marker_is_owned(
+                            room, latest
+                        ):
+                            payload = latest
+                            payload["_path"] = path
+                            self._p_ready_snapshot[room] = payload
+                        else:
+                            path.unlink(missing_ok=True)
+                            self._p_ready_snapshot.pop(room, None)
+                            continue
+                    else:
+                        payload = current
+                        payload["_path"] = path
+                        self._p_ready_snapshot[room] = payload
                 # SGLang's startup/health probes are real Prefill requests and
                 # therefore publish normal P-ready markers.  They have no
                 # matching Router generation coroutine, so admitting them to
@@ -1435,29 +2586,518 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 continue
         return min(sequences) if sequences else None
 
-    async def _acquire_p_ready_fifo(
-        self, sequence: int, domain: int = 0
-    ) -> asyncio.Lock:
-        """Acquire the dispatch lock only for the oldest published P result."""
+    def _ensure_p_ready_admission_state(self) -> None:
+        """Initialize broker state for lightweight/test-created routers."""
 
-        if getattr(self, "dynamic_prefill_domains", False):
-            locks = getattr(self, "_p_ready_fifo_locks", None)
-            if locks is None:
-                self._p_ready_fifo_locks = {}
-                locks = self._p_ready_fifo_locks
-            lock = locks.setdefault(domain, asyncio.Lock())
-            key: Any = (domain, sequence)
+        if not hasattr(self, "_p_ready_fifo_waiters"):
+            self._p_ready_fifo_waiters = {}
+        if not hasattr(self, "_p_ready_fifo_events"):
+            self._p_ready_fifo_events = {}
+        if not hasattr(self, "_p_ready_fifo_dispatchers"):
+            self._p_ready_fifo_dispatchers = {}
+        if not hasattr(self, "_p_ready_fifo_active"):
+            self._p_ready_fifo_active = {}
+        if not hasattr(self, "_p_ready_broker_event"):
+            self._p_ready_broker_event = asyncio.Event()
+        if not hasattr(self, "_p_ready_broker_task"):
+            self._p_ready_broker_task = None
+        if not hasattr(self, "_p_ready_commit_tails"):
+            self._p_ready_commit_tails = {}
+        if not hasattr(self, "_p_ready_admission_window_per_p"):
+            self._p_ready_admission_window_per_p = 32
+        if not hasattr(self, "_p_ready_stage_lanes_per_p"):
+            self._p_ready_stage_lanes_per_p = 4
+        if not hasattr(self, "_p_ready_stage_semaphores"):
+            self._p_ready_stage_semaphores = {}
+        if not hasattr(self, "_p2d_host_offered_snapshots"):
+            self._p2d_host_offered_snapshots = set()
+
+    def _p_ready_stage_semaphore(self, domain: int) -> asyncio.Semaphore:
+        """Bound concurrent P-HBM -> Host ownership transitions per P."""
+
+        self._ensure_p_ready_admission_state()
+        semaphore = self._p_ready_stage_semaphores.get(domain)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(max(1, self._p_ready_stage_lanes_per_p))
+            self._p_ready_stage_semaphores[domain] = semaphore
+        return semaphore
+
+    def _wake_p_ready_fifo(self, domain: int) -> None:
+        self._ensure_p_ready_admission_state()
+        events = getattr(self, "_p_ready_fifo_events", None)
+        if events is None:
+            self._p_ready_fifo_events = {}
+            events = self._p_ready_fifo_events
+        events.setdefault(domain, asyncio.Event()).set()
+        broker_event = getattr(self, "_p_ready_broker_event", None)
+        if broker_event is not None:
+            broker_event.set()
+
+    def _try_reserve_direct_ready_locked(
+        self,
+        admission: _PReadyAdmission,
+        loads_snapshot: list[DecodeLoad],
+    ) -> Optional[DecodeReservation]:
+        """Reserve one ordinary P-ready request without control-plane I/O.
+
+        This is the common path.  The caller owns ``_selection_lock`` and has
+        already obtained one cluster load snapshot for the whole broker batch.
+        Host-owned or capacity-bound heads return ``None`` and retain the
+        existing full state machine as their single slow-path owner.
+        """
+
+        if admission.request is None or admission.commit is None:
+            return None
+        if admission.cancel_requested:
+            return None
+        p2d_snapshot = self._p2d_snapshot_for_rooms(admission.rooms)
+        if (
+            p2d_snapshot is not None
+            and p2d_snapshot
+            in getattr(self, "_p2d_host_offered_snapshots", set())
+        ):
+            return None
+
+        loads = [
+            load
+            for load in loads_snapshot
+            if load.url in self._domain_decode_urls(admission.domain)
+        ]
+        if not loads:
+            return None
+
+        requested_decode = self._requested_decode_tokens(admission.request)
+        decode_headroom = self.decode_headroom_tokens
+        if requested_decode is not None:
+            decode_headroom = min(
+                requested_decode, self.max_decode_admission_tokens
+            )
+        admission_tokens = admission.prompt_tokens + decode_headroom * len(
+            admission.rooms
+        )
+        average_context = self._average_running_context(loads)
+        transfer_weight = max(1.0, getattr(self, "transfer_request_weight", 2.0))
+        scored: list[tuple[bool, float, float, int, DecodeLoad]] = []
+        for load in loads:
+            reserved_prompt, reserved_admission, reserved_reqs = self._reserved_for(
+                load.url
+            )
+            free_after_pending = (
+                load.capacity_tokens - load.used_tokens - reserved_admission
+            )
+            projected_kv = (
+                load.used_tokens + reserved_admission + admission_tokens
+            ) / load.capacity_tokens
+            feasible = (
+                free_after_pending >= admission_tokens
+                and projected_kv
+                <= getattr(self, "target_decode_kv_fraction", 1.0)
+            )
+            queued_or_handoff_reqs = max(
+                load.waiting, load.prealloc + load.transfer
+            )
+            projected_decode_reqs = (
+                load.running
+                + queued_or_handoff_reqs
+                + reserved_reqs
+                + len(admission.rooms)
+            )
+            projected_compute_kv = (
+                load.running_kv_tokens
+                + load.prealloc_tokens
+                + load.transfer_tokens
+                + reserved_prompt
+                + admission.prompt_tokens
+            )
+            work_score = (
+                projected_decode_reqs
+                + projected_compute_kv / average_context
+                + (transfer_weight - 1.0) * load.transfer
+            )
+            scored.append(
+                (
+                    not feasible,
+                    work_score,
+                    projected_kv,
+                    projected_decode_reqs,
+                    load,
+                )
+            )
+
+        feasible = [item for item in scored if not item[0]]
+        if not feasible and self.wait_for_feasible_decode:
+            return None
+        candidates = feasible or scored
+        _, work_score, projected_kv, projected_decode_reqs, selected = (
+            self._choose_decode_score(candidates)
+        )
+        reservation = DecodeReservation(
+            reservation_id=uuid.uuid4().hex,
+            url=selected.url,
+            prompt_tokens=admission.prompt_tokens,
+            admission_tokens=admission_tokens,
+            request_count=len(admission.rooms),
+            rooms=admission.rooms,
+            created_at=time.monotonic(),
+            prefill_domain=admission.domain,
+        )
+        self._reservations[reservation.reservation_id] = reservation
+        logger.info(
+            "PD_LATE_BIND_BATCH rooms=%s P=%d D=%s prompt_tokens=%d "
+            "admission_tokens=%d D_used=%d/%d running=%d waiting=%d "
+            "prealloc=%d transfer=%d projected_decode_reqs=%d "
+            "average_context=%.1f work_score=%.4f projected_kv=%.4f",
+            admission.rooms,
+            admission.domain,
+            selected.url,
+            admission.prompt_tokens,
+            admission_tokens,
+            selected.used_tokens,
+            selected.capacity_tokens,
+            selected.running,
+            selected.waiting,
+            selected.prealloc,
+            selected.transfer,
+            projected_decode_reqs,
+            average_context,
+            work_score,
+            projected_kv,
+        )
+        return reservation
+
+    async def _reserve_p_ready_direct_batch(
+        self, admissions: list[_PReadyAdmission]
+    ) -> dict[_PReadyAdmission, Optional[DecodeReservation]]:
+        """Reserve the next fair-scan candidate per P from one D snapshot."""
+
+        eligible = [
+            admission
+            for admission in admissions
+            if admission.request is not None
+            and admission.commit is not None
+        ]
+        reservations = {admission: None for admission in admissions}
+        if not eligible:
+            return reservations
+        try:
+            loads = await self._all_decode_loads(self._load_http_session())
+        except Exception:
+            logger.warning(
+                "P-ready batch load snapshot failed; falling back to the "
+                "per-request capacity state machine",
+                exc_info=True,
+            )
+            return reservations
+        async with self._selection_lock:
+            self._prune_accounted_reservations()
+            reservations.update(
+                {
+                    admission: self._try_reserve_direct_ready_locked(
+                        admission, loads
+                    )
+                    for admission in eligible
+                }
+            )
+            return reservations
+
+    def _activate_p_ready_admission(self, admission: _PReadyAdmission) -> None:
+        waiters = self._p_ready_fifo_waiters.setdefault(admission.domain, {})
+        waiters.pop(admission.sequence, None)
+        self._p_ready_submitted_sequences.add(admission.submitted_key)
+        active = self._p_ready_fifo_active.setdefault(admission.domain, {})
+        active[admission.sequence] = admission
+        loop = asyncio.get_running_loop()
+        # ``ready_sequence`` remains the fair scan order, not a cross-request
+        # correctness dependency.  A Host-staged or temporarily infeasible
+        # generation must not block a later generation that can enter D now.
+        admission.commit_predecessor = None
+        admission.commit_done = loop.create_future()
+
+        waited = time.monotonic() - admission.enqueued_at
+        if waited >= 0.5:
+            logger.info(
+                "PD_P_READY_FIFO_DISPATCH P=%d sequence=%d wait_s=%.3f "
+                "submitted=%d queued=%d broker_batch=true",
+                admission.domain,
+                admission.sequence,
+                waited,
+                len(self._p_ready_submitted_sequences),
+                len(waiters),
+            )
+
+    async def _run_p_ready_admission(
+        self,
+        admission: _PReadyAdmission,
+        reservation: Optional[DecodeReservation],
+    ) -> None:
+        prepared_reservation: Optional[DecodeReservation] = None
+        try:
+            prepared_reservation = reservation
+            admission.initial_reservation = reservation
+            admission.ownership_started = bool(
+                reservation is not None or admission.prepare is not None
+            )
+            if prepared_reservation is None and admission.prepare is not None:
+                spill_delay = max(
+                    0.0, float(getattr(self, "p2d_host_spill_delay", 0.0))
+                )
+                if spill_delay > 0:
+                    grace_started_at = time.monotonic()
+                    await asyncio.sleep(spill_delay)
+                    if admission.cancel_requested:
+                        raise asyncio.CancelledError
+                    prepared_reservation = (
+                        await self._retry_p_ready_direct_after_grace(
+                            admission, not_before=grace_started_at
+                        )
+                    )
+                # Preparation owns only the physical handoff boundary.  Up to
+                # the number of real D2H lanes may run concurrently; after a
+                # complete Host snapshot is durable, P can immediately release
+                # the request-generation HBM even while ordered D admission is
+                # still waiting for capacity.
+                if prepared_reservation is None:
+                    async with self._p_ready_stage_semaphore(admission.domain):
+                        prepared_reservation = await admission.prepare()
+            admission.prepare_complete = True
+            admission.host_staged = (
+                admission.prepare is not None and prepared_reservation is None
+            )
+            if admission.cancel_requested:
+                raise asyncio.CancelledError
+            admission.commit_started = True
+            if prepared_reservation is None:
+                result = await admission.dispatch()
+            else:
+                assert admission.commit is not None
+                result = await admission.commit(prepared_reservation)
+        except BaseException as exc:
+            self._p_ready_submitted_sequences.discard(admission.submitted_key)
+            if not admission.future.done():
+                if isinstance(exc, asyncio.CancelledError):
+                    admission.future.cancel()
+                else:
+                    admission.future.set_exception(exc)
         else:
-            lock = self._p_ready_fifo_lock
-            key = sequence
-        while True:
-            await lock.acquire()
+            if not admission.future.done():
+                admission.future.set_result(result)
+        finally:
+            # A D reservation is only handed off when commit starts.  Router
+            # shutdown/caller cancellation can otherwise strand capacity while
+            # this admission waits behind its FIFO predecessor.  Host-owned
+            # snapshots need the matching fence-aware abort instead: their P
+            # pages or D2H may already be under physical staging ownership.
+            if not admission.commit_started:
+                if prepared_reservation is not None:
+                    async with self._selection_lock:
+                        self._reservations.pop(
+                            prepared_reservation.reservation_id, None
+                        )
+                        self._admitted_reservation_at.pop(
+                            prepared_reservation.reservation_id, None
+                        )
+                        self._load_cache_at = 0.0
+                elif admission.prepare is not None:
+                    self._abort_unsubmitted_p2d(
+                        self._p2d_snapshot_for_rooms(admission.rooms),
+                        "p_ready_commit_cancelled",
+                    )
+            if admission.commit_done is not None and not admission.commit_done.done():
+                admission.commit_done.set_result(None)
+            active = self._p_ready_fifo_active.get(admission.domain)
+            if active is not None:
+                active.pop(admission.sequence, None)
+                if not active:
+                    self._p_ready_fifo_active.pop(admission.domain, None)
+            admission.finished.set()
+            self._p_ready_broker_event.set()
+
+    def _cancel_unowned_p_ready_admission(
+        self, admission: _PReadyAdmission
+    ) -> bool:
+        """Cancel an active FIFO record before it owns any physical state."""
+
+        if admission.ownership_started or admission.commit_started:
+            return False
+        admission.cancel_requested = True
+        if not admission.future.done():
+            admission.future.cancel()
+        if admission.commit_done is not None and not admission.commit_done.done():
+            admission.commit_done.set_result(None)
+        active = self._p_ready_fifo_active.get(admission.domain)
+        if active is not None:
+            active.pop(admission.sequence, None)
+            if not active:
+                self._p_ready_fifo_active.pop(admission.domain, None)
+        self._p_ready_submitted_sequences.discard(admission.submitted_key)
+        task = admission.dispatch_task
+        if task is not None and not task.done():
+            task.cancel()
+        admission.finished.set()
+        self._p_ready_broker_event.set()
+        return True
+
+    def _next_p_ready_heads(self) -> list[_PReadyAdmission]:
+        """Return the next authoritative fair-scan candidate per P."""
+
+        heads: list[_PReadyAdmission] = []
+        domains = sorted(self._p_ready_fifo_waiters)
+        for domain in domains:
+            waiters = self._p_ready_fifo_waiters.get(domain, {})
+            if not waiters:
+                continue
+            if len(self._p_ready_fifo_active.get(domain, {})) >= max(
+                1, self._p_ready_admission_window_per_p
+            ):
+                continue
             oldest = self._oldest_p_ready_sequence(domain)
-            if oldest is None or sequence <= oldest:
-                self._p_ready_submitted_sequences.add(key)
-                return lock
-            lock.release()
-            await asyncio.sleep(self.ready_poll_interval)
+            sequence = min(waiters) if oldest is None else oldest
+            admission = waiters.get(sequence)
+            if admission is not None:
+                heads.append(admission)
+        return heads
+
+    async def _p_ready_admission_broker_loop(self) -> None:
+        """Batch D admission while keeping each P's commit order strict."""
+
+        try:
+            while True:
+                heads = self._next_p_ready_heads()
+                if not heads:
+                    self._p_ready_broker_event.clear()
+                    # Close the race with a producer that enqueued immediately
+                    # before clear().
+                    if self._next_p_ready_heads():
+                        self._p_ready_broker_event.set()
+                        continue
+                    await self._p_ready_broker_event.wait()
+                    continue
+
+                reservations = await self._reserve_p_ready_direct_batch(heads)
+                for admission in heads:
+                    if admission.cancel_requested:
+                        continue
+                    reservation = reservations.get(admission)
+                    admission.initial_reservation = reservation
+                    # Capacity-bound generations prepare independently in a
+                    # bounded lane pool.  They do not gate later feasible
+                    # generations from the same P.
+                    self._activate_p_ready_admission(admission)
+                    admission.dispatch_task = asyncio.create_task(
+                        self._run_p_ready_admission(
+                            admission,
+                            reservation,
+                        ),
+                        name=(
+                            f"pd-p-ready-admission-{admission.domain}-"
+                            f"{admission.sequence}"
+                        ),
+                    )
+                # Let commit tasks issue their D POSTs, then scan the next
+                # candidates without waiting for receiver completion.
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("P-ready admission broker failed")
+            for waiters in self._p_ready_fifo_waiters.values():
+                for admission in waiters.values():
+                    if not admission.future.done():
+                        admission.future.set_exception(exc)
+            raise
+
+    async def _dispatch_p_ready_in_order(
+        self,
+        sequence: int,
+        domain: int,
+        dispatch: Callable[[], Awaitable[Any]],
+        *,
+        request: Optional[dict[str, Any]] = None,
+        rooms: tuple[int, ...] = (),
+        prompt_tokens: int = 0,
+        commit: Optional[Callable[[DecodeReservation], Awaitable[Any]]] = None,
+        prepare: Optional[
+            Callable[[], Awaitable[Optional[DecodeReservation]]]
+        ] = None,
+    ) -> Any:
+        """Publish an immutable admission and await the shared broker."""
+
+        self._ensure_p_ready_admission_state()
+        waiters = self._p_ready_fifo_waiters.setdefault(domain, {})
+        if sequence in waiters:
+            raise RuntimeError(
+                f"duplicate P-ready sequence P={domain} sequence={sequence}"
+            )
+        key: Any = (
+            (domain, sequence)
+            if getattr(self, "dynamic_prefill_domains", False)
+            else sequence
+        )
+        future = asyncio.get_running_loop().create_future()
+        admission = _PReadyAdmission(
+            domain=domain,
+            sequence=sequence,
+            submitted_key=key,
+            enqueued_at=time.monotonic(),
+            dispatch=dispatch,
+            future=future,
+            finished=asyncio.Event(),
+            request=request,
+            rooms=rooms,
+            prompt_tokens=prompt_tokens,
+            commit=commit,
+            prepare=prepare,
+        )
+        waiters[sequence] = admission
+        task = getattr(self, "_p_ready_broker_task", None)
+        if task is None or task.done():
+            self._p_ready_broker_task = asyncio.create_task(
+                self._p_ready_admission_broker_loop(),
+                name="pd-p-ready-admission-broker",
+            )
+        self._p_ready_broker_event.set()
+        try:
+            # Shielding keeps caller cancellation from silently cancelling the
+            # shared Future while the dispatcher continues mutating transport
+            # state.  Cancellation is handled explicitly below.
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if waiters.get(sequence) is admission:
+                waiters.pop(sequence, None)
+                admission.cancel_requested = True
+                if not admission.future.done():
+                    admission.future.cancel()
+                admission.finished.set()
+                self._wake_p_ready_fifo(domain)
+            else:
+                # Once the dispatcher starts an admission it owns a small
+                # transaction: choose Direct/Host, bind one D reservation and
+                # submit the Decode request.  A transient client cancellation
+                # must not abort that transaction halfway through a Host D2H
+                # write.  Doing so invalidates the producer grant and turns a
+                # physically recoverable P-ready snapshot into a retry/full
+                # recompute.  Defer cancellation until the dispatcher reaches
+                # its commit boundary; the outer request cleanup can then
+                # dispose the already-submitted Decode response safely.
+                # If no reservation, Host offer or commit has started, this
+                # active record is only waiting behind its FIFO predecessor
+                # and is still safe to cancel immediately.
+                cancelled_unowned = self._cancel_unowned_p_ready_admission(
+                    admission
+                )
+                if not cancelled_unowned:
+                    while not admission.finished.is_set():
+                        try:
+                            await asyncio.shield(admission.finished.wait())
+                        except asyncio.CancelledError:
+                            continue
+            raise
+        except BaseException:
+            if waiters.get(sequence) is admission:
+                waiters.pop(sequence, None)
+                admission.finished.set()
+                self._wake_p_ready_fifo(domain)
+            raise
 
     @staticmethod
     def _requested_decode_tokens(request: dict[str, Any]) -> Optional[int]:
@@ -1543,10 +3183,15 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     async def _fetch_decode_load_legacy(
         self, session: aiohttp.ClientSession, url: str
     ) -> DecodeLoad:
-        timeout = aiohttp.ClientTimeout(total=self.load_timeout)
-        async with session.get(f"{url}/get_load", timeout=timeout) as response:
-            response.raise_for_status()
-            rows = await response.json()
+        # /get_load is a tiny scheduler-control RPC.  Under c512 the Router's
+        # ASGI loop also owns hundreds of long-lived generation coroutines and
+        # synchronous tmpfs lifecycle operations; driving this RPC on the same
+        # loop caused false 2s timeouts while a separate client reached every
+        # D immediately.  Move only the network wait/JSON read to a worker;
+        # publication and reservation accounting remain on the Router loop.
+        rows = await asyncio.to_thread(
+            _sync_json_get, f"{url}/get_load", self.load_timeout
+        )
         if isinstance(rows, dict):
             rows = [rows]
         if not rows:
@@ -1566,9 +3211,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             capacity = cached.capacity_tokens
             max_running = cached.max_running
         else:
-            async with session.get(f"{url}/server_info", timeout=timeout) as response:
-                response.raise_for_status()
-                server_info = await response.json()
+            server_info = await asyncio.to_thread(
+                _sync_json_get, f"{url}/server_info", self.load_timeout
+            )
             internal = server_info.get("internal_states") or []
             capacity = sum(
                 int((state.get("memory_usage") or {}).get("token_capacity", 0))
@@ -1619,11 +3264,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     async def _refresh_decode_loads(
         self, session: aiohttp.ClientSession
     ) -> list[DecodeLoad]:
+        sample_started_at = time.monotonic()
         results = await asyncio.gather(
             *(self._fetch_decode_load(session, url) for url in self.decode_urls),
             return_exceptions=True,
         )
         loads: list[DecodeLoad] = []
+        fresh_loads: dict[str, DecodeLoad] = {}
         for url, result in zip(self.decode_urls, results):
             if isinstance(result, Exception):
                 cached = self._last_loads.get(url)
@@ -1633,20 +3280,45 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 logger.warning("Using last load snapshot for D %s: %s", url, result)
                 loads.append(cached)
             else:
-                self._last_loads[url] = result
+                fresh_loads[url] = result
                 loads.append(result)
         if not loads:
             raise RuntimeError("No decode server has a usable /v1/loads response")
-        self._load_cache = loads
-        self._load_cache_at = time.monotonic()
-        return loads
+        if not fresh_loads:
+            # Reusing old rows is safe only as a conservative fallback.  It is
+            # not a fresh observation and must not renew the cache TTL or its
+            # causal epoch; otherwise repeated control-plane failures can pin
+            # a once-full D snapshot forever after the real GPU drains.
+            if self._load_cache:
+                return self._load_cache
+            raise RuntimeError("No decode server returned a fresh load snapshot")
+        published_at = time.monotonic()
+        # Concurrent polls may complete out of order. Publish only the newest
+        # sampling epoch; otherwise a slow old response could move the causal
+        # watermark backwards and overwrite newer D state.
+        if sample_started_at >= getattr(
+            self, "_load_cache_sample_started_at", 0.0
+        ):
+            self._last_loads.update(fresh_loads)
+            epochs = getattr(self, "_load_sample_started_at_by_url", None)
+            if epochs is None:
+                self._load_sample_started_at_by_url = {}
+                epochs = self._load_sample_started_at_by_url
+            for url in fresh_loads:
+                epochs[url] = sample_started_at
+            self._load_cache = loads
+            self._load_cache_sample_started_at = sample_started_at
+            self._load_cache_at = published_at
+            return loads
+        # This poll lost an out-of-order publication race. Returning its old
+        # rows while reservation accounting uses the newer global epoch would
+        # combine two incompatible views and could double-spend D capacity.
+        # The caller must use the same authoritative snapshot as accounting.
+        return self._load_cache
 
     async def _refresh_decode_loads_background(self) -> None:
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.load_timeout)
-            ) as session:
-                await self._refresh_decode_loads(session)
+            await self._refresh_decode_loads(self._load_http_session())
         except Exception:
             # The current cached snapshot plus local reservations remains a
             # conservative admission view.  A later dispatch will retry.
@@ -1655,6 +3327,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     async def _all_decode_loads(
         self, session: aiohttp.ClientSession, *, force: bool = False
     ) -> list[DecodeLoad]:
+        # ``session`` remains in the signature for lightweight tests and old
+        # callers, but production load RPCs always use their isolated control
+        # connector rather than the long-lived generation data plane.
+        load_session = None if session is None else self._load_http_session()
         now = time.monotonic()
         fresh = (
             self._load_cache
@@ -1662,6 +3338,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         )
         if not force and fresh:
             return self._load_cache
+
+        if not force and not self._load_cache:
+            # The first c512 burst can otherwise launch one four-endpoint poll
+            # per request before any cache exists. Share exactly one initial
+            # sample; shielding keeps a cancelled HTTP request from cancelling
+            # the cluster-wide bootstrap result for every other waiter.
+            task = self._load_refresh_task
+            if task is None or task.done():
+                task = asyncio.create_task(self._refresh_decode_loads(load_session))
+                self._load_refresh_task = task
+            return await asyncio.shield(task)
 
         if not force and self._load_cache:
             # Never put HTTP load polling in the per-request reservation
@@ -1675,7 +3362,56 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 )
             return self._load_cache
 
-        return await self._refresh_decode_loads(session)
+        return await self._refresh_decode_loads(load_session)
+
+    def _decode_loads_are_fresh_since(
+        self, urls: set[str], not_before: float
+    ) -> bool:
+        """Return whether every candidate D was sampled after ``not_before``.
+
+        P->D Host spill costs an extra Host round trip even though recovery can
+        now target any D domain.  Do not choose that path from a cached
+        all-full observation that predates the P-ready snapshot itself.
+        """
+
+        epochs = getattr(self, "_load_sample_started_at_by_url", {})
+        return bool(urls) and all(
+            float(epochs.get(url, 0.0)) >= not_before for url in urls
+        )
+
+    async def _observe_decode_load_after(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        urls: set[str],
+        not_before: float,
+    ) -> bool:
+        """Single-flight one causal D-load observation before Host spill.
+
+        The ordinary stale-while-revalidate path already starts a shared
+        refresh.  Await that task first; if it began too early, start exactly
+        one newer shared refresh.  Failure returns ``False`` so Host spill can
+        still guarantee progress instead of retaining P HBM indefinitely.
+        """
+
+        for _ in range(2):
+            if self._decode_loads_are_fresh_since(urls, not_before):
+                return True
+            task = self._load_refresh_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._refresh_decode_loads(self._load_http_session())
+                )
+                self._load_refresh_task = task
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                logger.warning(
+                    "Fresh D load observation failed before P->D Host spill",
+                    exc_info=True,
+                )
+                return False
+        return self._decode_loads_are_fresh_since(urls, not_before)
 
     def _reserved_for(
         self, url: str, *, exclude_id: Optional[str] = None
@@ -1685,7 +3421,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             if reservation_id == exclude_id:
                 continue
             admitted_at = self._admitted_reservation_at.get(reservation_id)
-            if admitted_at is not None and self._load_cache_at >= admitted_at:
+            sample_epoch = getattr(
+                self, "_load_sample_started_at_by_url", {}
+            ).get(
+                reservation.url,
+                getattr(self, "_load_cache_sample_started_at", 0.0),
+            )
+            if admitted_at is not None and sample_epoch >= admitted_at:
                 continue
             if reservation.url == url:
                 prompt += reservation.prompt_tokens
@@ -1694,11 +3436,16 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         return prompt, admission, requests
 
     def _prune_accounted_reservations(self) -> None:
-        accounted = [
-            reservation_id
-            for reservation_id, admitted_at in self._admitted_reservation_at.items()
-            if self._load_cache_at >= admitted_at
-        ]
+        accounted = []
+        epochs = getattr(self, "_load_sample_started_at_by_url", {})
+        global_epoch = getattr(self, "_load_cache_sample_started_at", 0.0)
+        for reservation_id, admitted_at in self._admitted_reservation_at.items():
+            reservation = self._reservations.get(reservation_id)
+            if reservation is None:
+                accounted.append(reservation_id)
+                continue
+            if epochs.get(reservation.url, global_epoch) >= admitted_at:
+                accounted.append(reservation_id)
         for reservation_id in accounted:
             self._admitted_reservation_at.pop(reservation_id, None)
             self._reservations.pop(reservation_id, None)
@@ -1711,6 +3458,65 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         ceiling = max(floor, getattr(self, "context_token_ceiling", 8192))
         return min(float(ceiling), max(float(floor), observed))
 
+    def _finalize_p2d_route(
+        self,
+        reservation: DecodeReservation,
+        *,
+        snapshot_id: Optional[str],
+        state: Optional[str],
+        domain: int,
+    ) -> Optional[DecodeReservation]:
+        """Atomically bind one capacity credit to Direct or Host input.
+
+        A future D credit can be created before P->D Host ownership settles.
+        Finalization is therefore shared by both immediately-feasible and
+        draining admissions.  ``None`` means a concurrent Host claim won and
+        the selector must observe its final locality/readiness before submit.
+        """
+
+        if snapshot_id is None:
+            return reservation
+        if state is None or state == HostStageState.REJECTED.value:
+            return reservation
+        if state == HostStageState.OFFERED.value:
+            cancelled = self.p2d_host_ledger.reject_unclaimed_offer(
+                snapshot_id,
+                reason="decode_capacity_available",
+            )
+            if not cancelled:
+                return None
+            return reservation
+        if state in {
+            HostStageState.HOST_RESERVED.value,
+            HostStageState.HOST_WRITING.value,
+            HostStageState.ABORTING.value,
+            HostStageState.H2D_LOADING.value,
+        }:
+            return None
+        if state == HostStageState.HOST_READY.value:
+            return replace(
+                reservation,
+                p2d_host_snapshot_id=snapshot_id,
+                prefill_domain=domain,
+            )
+        if state == HostStageState.FAILED.value:
+            entry = self.p2d_host_ledger.get(snapshot_id) or {}
+            raise RuntimeError(
+                f"P->D Host snapshot {snapshot_id} failed after taking "
+                f"exclusive ownership: {entry.get('reason', 'unknown')}"
+            )
+        if state == HostStageState.CONSUMED.value:
+            raise RuntimeError(
+                f"P->D Host snapshot {snapshot_id} was already consumed before "
+                "this Router attempt submitted Decode"
+            )
+        # Custom P->D staging has no lower storage tier.  Seeing a D->P-only
+        # or unknown state here is a control-plane invariant violation, never
+        # permission to resurrect the native sender.
+        raise RuntimeError(
+            f"P->D Host snapshot {snapshot_id} has invalid route state {state!r}"
+        )
+
     async def _select_and_reserve_decode(
         self,
         session: aiohttp.ClientSession,
@@ -1722,339 +3528,428 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         requested_decode = self._requested_decode_tokens(request)
         decode_headroom = self.decode_headroom_tokens
         if requested_decode is not None:
-            decode_headroom = min(requested_decode, self.max_decode_admission_tokens)
+            decode_headroom = min(
+                requested_decode, self.max_decode_admission_tokens
+            )
         admission_tokens = prompt_tokens + decode_headroom * len(rooms)
-
-        # This lock makes load observation + local reservation atomic for all
-        # concurrent requests handled by this router process.  When every D is
-        # full, retain the request as cheap P-ready state and retry; do not turn
-        # it into an expensive D preallocation that blocks Decode KV capacity.
         deadline = time.monotonic() + self.ready_timeout
         wait_started = time.monotonic()
         next_wait_log = time.monotonic() + 5.0
+        next_missing_domain_log = time.monotonic()
         draining_reservation: Optional[DecodeReservation] = None
-        p2d_snapshot = (
-            p2d_snapshot_id(rooms[0])
-            if getattr(self, "p2d_host_ledger", None) is not None
-            and len(rooms) == 1
-            else None
+        p2d_snapshot = self._p2d_snapshot_for_rooms(rooms)
+        p2d_offer_published = bool(
+            p2d_snapshot is not None
+            and p2d_snapshot
+            in getattr(self, "_p2d_host_offered_snapshots", set())
         )
-        p2d_offer_published = False
+        host_freshness_attempted = False
+        force_load_refresh = False
+
         try:
             while True:
+                # Both network sampling and the flock/JSON Host ledger live
+                # outside the cluster-wide D capacity lock.  A provisional D
+                # credit protects capacity while the Host CAS is finalized.
+                loads_snapshot = await self._all_decode_loads(
+                    session, force=force_load_refresh
+                )
+                force_load_refresh = False
+                p2d_entry = (
+                    await asyncio.to_thread(
+                        self.p2d_host_ledger.get, p2d_snapshot
+                    )
+                    if p2d_snapshot is not None
+                    else None
+                )
+                if p2d_entry is not None and p2d_snapshot is not None:
+                    p2d_offer_published = True
+                    if not hasattr(self, "_p2d_host_offered_snapshots"):
+                        self._p2d_host_offered_snapshots = set()
+                    self._p2d_host_offered_snapshots.add(p2d_snapshot)
+                p2d_state = (
+                    None if p2d_entry is None else p2d_entry.get("state")
+                )
+                p2d_claimed = p2d_state in {
+                    HostStageState.HOST_RESERVED.value,
+                    HostStageState.HOST_WRITING.value,
+                    HostStageState.HOST_READY.value,
+                    HostStageState.H2D_LOADING.value,
+                    HostStageState.CONSUMED.value,
+                }
+                p2d_ready = p2d_state == HostStageState.HOST_READY.value
+
+                candidate: Optional[DecodeReservation] = None
+                candidate_is_new = False
+                candidate_stats: Optional[
+                    tuple[DecodeLoad, float, float, int, float]
+                ] = None
+                publish_host_offer = False
+                refresh_before_host_offer = False
+                refresh_urls: set[str] = set()
+                missing_loads = False
+                stale_ownership = False
+
                 async with self._selection_lock:
-                    loads = await self._all_decode_loads(session)
                     self._prune_accounted_reservations()
-                    p2d_entry = (
-                        None
-                        if p2d_snapshot is None
-                        else self.p2d_host_ledger.get(p2d_snapshot)
-                    )
-                    p2d_state = (
-                        None if p2d_entry is None else p2d_entry.get("state")
-                    )
-                    p2d_claimed = p2d_state in {
-                        HostStageState.HOST_RESERVED.value,
-                        HostStageState.HOST_WRITING.value,
-                        HostStageState.HOST_READY.value,
-                        HostStageState.H2D_LOADING.value,
-                        HostStageState.CONSUMED.value,
-                    }
-                    p2d_ready = p2d_state == HostStageState.HOST_READY.value
-                    allowed_urls = (
-                        self._local_domain_decode_urls(domain)
-                        if p2d_claimed
-                        else self._domain_decode_urls(domain)
-                    )
-                    loads = [load for load in loads if load.url in allowed_urls]
-                    if not loads:
-                        raise RuntimeError(f"No usable D worker in domain {domain}")
-                    if draining_reservation is not None:
-                        selected = next(
-                            (
-                                load
-                                for load in loads
-                                if load.url == draining_reservation.url
-                            ),
-                            None,
-                        )
-                        if selected is not None:
-                            _, reserved_admission, _ = self._reserved_for(
-                                selected.url,
-                                exclude_id=draining_reservation.reservation_id,
-                            )
-                            free_after_others = (
-                                selected.capacity_tokens
-                                - selected.used_tokens
-                                - reserved_admission
-                            )
-                            if free_after_others >= admission_tokens:
-                                logger.info(
-                                    "PD_LATE_BIND_DRAIN_READY rooms=%s D=%s "
-                                    "admission_tokens=%d D_used=%d/%d wait_s=%.3f",
-                                    rooms,
-                                    selected.url,
-                                    admission_tokens,
-                                    selected.used_tokens,
-                                    selected.capacity_tokens,
-                                    time.monotonic() - wait_started,
-                                )
-                                return draining_reservation
-
-                    # Capacity is a hard admission constraint.  Among workers
-                    # that can fit the request, compare request-equivalent
-                    # Decode work: population + running/handoff KV normalized
-                    # by the cluster's current average context.  A transfer is
-                    # counted once as future Decode work and once more as DMA /
-                    # scheduler interference (default total weight: 2).
-                    average_context = self._average_running_context(loads)
-                    transfer_weight = max(
-                        1.0, getattr(self, "transfer_request_weight", 2.0)
-                    )
-                    scored: list[
-                        tuple[bool, float, float, int, DecodeLoad]
-                    ] = []
-                    for load in loads:
-                        reserved_prompt, reserved_admission, reserved_reqs = (
-                            self._reserved_for(load.url)
-                        )
-                        free_after_pending = (
-                            load.capacity_tokens - load.used_tokens - reserved_admission
-                        )
-                        projected_kv = (
-                            load.used_tokens
-                            + reserved_admission
-                            + admission_tokens
-                        ) / load.capacity_tokens
-                        # Preserve a small D-side growth/egress margin.
-                        # P remains work-conserving and may accumulate complete
-                        # P-ready snapshots; only P->D admission pauses here.
-                        # The default 90% target leaves room for Decode growth
-                        # and completed-parent egress without unnecessarily
-                        # suppressing D running concurrency.
-                        target_kv = getattr(
-                            self, "target_decode_kv_fraction", 1.0
-                        )
-                        feasible = (
-                            free_after_pending >= admission_tokens
-                            and projected_kv <= target_kv
-                        )
-                        # /get_load reports prealloc as waiting, whereas the
-                        # richer endpoint exposes handoff queues separately.
-                        # max() avoids double-counting either representation.
-                        queued_or_handoff_reqs = max(
-                            load.waiting, load.prealloc + load.transfer
-                        )
-                        projected_decode_reqs = (
-                            load.running
-                            + queued_or_handoff_reqs
-                            + reserved_reqs
-                            + len(rooms)
-                        )
-                        projected_compute_kv = (
-                            load.running_kv_tokens
-                            + load.prealloc_tokens
-                            + load.transfer_tokens
-                            + reserved_prompt
-                            + prompt_tokens
-                        )
-                        kv_request_equivalents = (
-                            projected_compute_kv / average_context
-                        )
-                        work_score = (
-                            projected_decode_reqs
-                            + kv_request_equivalents
-                            + (transfer_weight - 1.0) * load.transfer
-                        )
-                        scored.append(
-                            (
-                                not feasible,
-                                work_score,
-                                projected_kv,
-                                projected_decode_reqs,
-                                load,
-                            )
-                        )
-
-                    feasible = [item for item in scored if not item[0]]
-                    if draining_reservation is None and not (
-                        p2d_claimed and not p2d_ready
-                    ) and (
-                        feasible or not self.wait_for_feasible_decode
-                    ):
-                        if p2d_state == HostStageState.OFFERED.value:
-                            # D capacity won the race.  Cancel the unclaimed
-                            # Host offer atomically; if P claimed concurrently,
-                            # retry and commit to the same-NUMA Host route.
-                            cancelled = self.p2d_host_ledger.reject_unclaimed_offer(
-                                p2d_snapshot,
-                                reason="decode_capacity_available",
-                            )
-                            if not cancelled:
-                                continue
-                            p2d_state = HostStageState.REJECTED.value
-                        candidates = feasible or scored
-                        (
-                            _,
-                            work_score,
-                            projected_kv,
-                            projected_decode_reqs,
-                            selected,
-                        ) = min(
-                            candidates,
-                            key=lambda item: (item[1], item[2], item[4].url),
-                        )
-                        reservation = DecodeReservation(
-                            reservation_id=uuid.uuid4().hex,
-                            url=selected.url,
-                            prompt_tokens=prompt_tokens,
-                            admission_tokens=admission_tokens,
-                            request_count=len(rooms),
-                            rooms=rooms,
-                            created_at=time.monotonic(),
-                            p2d_host_snapshot_id=(
-                                p2d_snapshot if p2d_ready else None
-                            ),
-                            prefill_domain=(domain if p2d_ready else None),
-                        )
-                        self._reservations[reservation.reservation_id] = reservation
-                        logger.info(
-                            "PD_LATE_BIND rooms=%s D=%s prompt_tokens=%d admission_tokens=%d "
-                            "D_used=%d/%d running=%d waiting=%d prealloc=%d transfer=%d "
-                            "running_kv_tokens=%d prealloc_tokens=%d transfer_tokens=%d "
-                            "projected_decode_reqs=%d average_context=%.1f "
-                            "work_score=%.4f projected_kv=%.4f "
-                            "policy=feasible_least_work",
-                            rooms,
-                            selected.url,
-                            prompt_tokens,
-                            admission_tokens,
-                            selected.used_tokens,
-                            selected.capacity_tokens,
-                            selected.running,
-                            selected.waiting,
-                            selected.prealloc,
-                            selected.transfer,
-                            selected.running_kv_tokens,
-                            selected.prealloc_tokens,
-                            selected.transfer_tokens,
-                            projected_decode_reqs,
-                            average_context,
-                            work_score,
-                            projected_kv,
-                        )
-                        if p2d_ready:
-                            logger.info(
-                                "PD_P2D_HOST_BIND snapshot=%s rooms=%s P=%d D=%s "
-                                "policy=same_numa_feasible_least_work",
-                                p2d_snapshot,
-                                rooms,
-                                domain,
-                                selected.url,
-                            )
-                        return reservation
-
-                    # Reserve future, not current, D capacity for one old
-                    # request per worker.  This prevents a large P-ready request
-                    # from starving forever while later short requests consume
-                    # every small gap.  No KV is allocated on D at this point.
-                    waited = time.monotonic() - wait_started
-                    should_soft_reserve = not p2d_claimed and (
-                        (
-                        admission_tokens >= self.soft_reservation_min_tokens
-                        and waited >= self.soft_reservation_delay
-                        )
-                        or waited >= self.soft_reservation_force_after
-                    )
-                    if draining_reservation is None and should_soft_reserve:
-                        draining_urls = {
-                            reservation.url
-                            for reservation in self._reservations.values()
-                            if reservation.draining
-                        }
-                        drain_candidates = [
-                            item for item in scored if item[4].url not in draining_urls
-                        ]
-                        if drain_candidates:
-                            (
-                                _,
-                                work_score,
-                                projected_kv,
-                                projected_decode_reqs,
-                                selected,
-                            ) = min(
-                                drain_candidates,
-                                # Preserve the old KV-pressure-oriented drain
-                                # target so the anti-starvation mechanism is
-                                # unchanged by the normal admission policy.
-                                key=lambda item: (item[2], item[1], item[4].url),
-                            )
-                            draining_reservation = DecodeReservation(
-                                reservation_id=uuid.uuid4().hex,
-                                url=selected.url,
-                                prompt_tokens=prompt_tokens,
-                                admission_tokens=admission_tokens,
-                                request_count=len(rooms),
-                                rooms=rooms,
-                                created_at=time.monotonic(),
-                                draining=True,
-                            )
-                            self._reservations[
-                                draining_reservation.reservation_id
-                            ] = draining_reservation
-                            logger.info(
-                                "PD_LATE_BIND_DRAIN_RESERVE rooms=%s D=%s "
-                                "admission_tokens=%d D_used=%d/%d "
-                                "projected_decode_reqs=%d projected_kv=%.4f "
-                                "work_score=%.4f",
-                                rooms,
-                                selected.url,
-                                admission_tokens,
-                                selected.used_tokens,
-                                selected.capacity_tokens,
-                                projected_decode_reqs,
-                                projected_kv,
-                                work_score,
-                            )
-
+                    # The event-loop publisher records the id synchronously
+                    # with ledger.offer().  If it ran while the lock was being
+                    # acquired, discard the stale lock-free ledger read.
                     if (
                         p2d_snapshot is not None
-                        and not p2d_offer_published
-                        and waited >= self.p2d_host_spill_delay
+                        and p2d_entry is None
+                        and p2d_snapshot
+                        in getattr(self, "_p2d_host_offered_snapshots", set())
                     ):
-                        offered = self.p2d_host_ledger.offer(
-                            {
-                                "snapshot_id": p2d_snapshot,
-                                "bootstrap_room": int(rooms[0]),
-                                "token_count": int(prompt_tokens),
-                                "prefill_domain": int(domain),
-                                "request_direction": "p2d",
-                                "control_offer": True,
-                                "tp_size": int(
-                                    os.getenv("SGLANG_AGENTIC_KV_TP_SIZE", "1")
-                                ),
-                            }
+                        stale_ownership = True
+                        loads: list[DecodeLoad] = []
+                    else:
+                        # Host ownership describes where the durable bytes
+                        # live, not which Decode domain must consume them.
+                        # Keep late binding global after spill as well: a D on
+                        # another NUMA node can read the shared tmpfs extent
+                        # through its independent Host->HBM worker.  The Host
+                        # owner is released only after the group-level H2D
+                        # completion, so this does not change ownership or TP
+                        # atomicity.
+                        allowed_urls = self._domain_decode_urls(domain)
+                        loads = [
+                            load
+                            for load in loads_snapshot
+                            if load.url in allowed_urls
+                        ]
+                        missing_loads = not loads
+
+                    if not stale_ownership and loads:
+                        if draining_reservation is not None:
+                            if not any(
+                                load.url == draining_reservation.url
+                                for load in loads
+                            ):
+                                self._reservations.pop(
+                                    draining_reservation.reservation_id, None
+                                )
+                                draining_reservation = None
+
+                        average_context = self._average_running_context(loads)
+                        transfer_weight = max(
+                            1.0,
+                            getattr(self, "transfer_request_weight", 2.0),
                         )
-                        p2d_offer_published = True
+                        scored: list[
+                            tuple[bool, float, float, int, DecodeLoad]
+                        ] = []
+                        for load in loads:
+                            # A draining reservation is only a future-capacity
+                            # hint.  Re-score every D without counting that
+                            # hint so an observation made while all D workers
+                            # were full cannot pin this request to a now-heavier
+                            # destination.
+                            draining_id = (
+                                draining_reservation.reservation_id
+                                if draining_reservation is not None
+                                else None
+                            )
+                            (
+                                reserved_prompt,
+                                reserved_admission,
+                                reserved_reqs,
+                            ) = self._reserved_for(
+                                load.url, exclude_id=draining_id
+                            )
+                            free_after_pending = (
+                                load.capacity_tokens
+                                - load.used_tokens
+                                - reserved_admission
+                            )
+                            projected_kv = (
+                                load.used_tokens
+                                + reserved_admission
+                                + admission_tokens
+                            ) / load.capacity_tokens
+                            feasible = (
+                                free_after_pending >= admission_tokens
+                                and projected_kv
+                                <= getattr(
+                                    self, "target_decode_kv_fraction", 1.0
+                                )
+                            )
+                            queued_or_handoff_reqs = max(
+                                load.waiting, load.prealloc + load.transfer
+                            )
+                            projected_decode_reqs = (
+                                load.running
+                                + queued_or_handoff_reqs
+                                + reserved_reqs
+                                + len(rooms)
+                            )
+                            projected_compute_kv = (
+                                load.running_kv_tokens
+                                + load.prealloc_tokens
+                                + load.transfer_tokens
+                                + reserved_prompt
+                                + prompt_tokens
+                            )
+                            work_score = (
+                                projected_decode_reqs
+                                + projected_compute_kv / average_context
+                                + (transfer_weight - 1.0) * load.transfer
+                            )
+                            scored.append(
+                                (
+                                    not feasible,
+                                    work_score,
+                                    projected_kv,
+                                    projected_decode_reqs,
+                                    load,
+                                )
+                            )
+
+                        feasible = [item for item in scored if not item[0]]
+                        if (
+                            candidate is None
+                            and not (p2d_claimed and not p2d_ready)
+                            and (feasible or not self.wait_for_feasible_decode)
+                        ):
+                            choice = self._choose_decode_score(feasible or scored)
+                            _, work_score, projected_kv, projected_reqs, selected = (
+                                choice
+                            )
+                            if (
+                                draining_reservation is not None
+                                and selected.url == draining_reservation.url
+                            ):
+                                candidate = draining_reservation
+                            else:
+                                if draining_reservation is not None:
+                                    old_url = draining_reservation.url
+                                    self._reservations.pop(
+                                        draining_reservation.reservation_id, None
+                                    )
+                                    draining_reservation = None
+                                    logger.info(
+                                        "PD_LATE_BIND_DRAIN_RESELECT rooms=%s "
+                                        "old_D=%s new_D=%s reason=least_work",
+                                        rooms,
+                                        old_url,
+                                        selected.url,
+                                    )
+                                candidate = DecodeReservation(
+                                    reservation_id=uuid.uuid4().hex,
+                                    url=selected.url,
+                                    prompt_tokens=prompt_tokens,
+                                    admission_tokens=admission_tokens,
+                                    request_count=len(rooms),
+                                    rooms=rooms,
+                                    created_at=time.monotonic(),
+                                )
+                                candidate_is_new = True
+                                self._reservations[
+                                    candidate.reservation_id
+                                ] = candidate
+                            candidate_stats = (
+                                selected,
+                                work_score,
+                                projected_kv,
+                                projected_reqs,
+                                average_context,
+                            )
+
+                        if candidate is None:
+                            waited = time.monotonic() - wait_started
+                            if draining_reservation is None:
+                                draining_urls = {
+                                    item.url
+                                    for item in self._reservations.values()
+                                    if item.draining
+                                }
+                                drain_choices = [
+                                    item
+                                    for item in scored
+                                    if item[4].url not in draining_urls
+                                ]
+                                if drain_choices:
+                                    choice = self._choose_decode_score(
+                                        drain_choices, drain=True
+                                    )
+                                    (
+                                        _,
+                                        work_score,
+                                        projected_kv,
+                                        projected_reqs,
+                                        selected,
+                                    ) = choice
+                                    draining_reservation = DecodeReservation(
+                                        reservation_id=uuid.uuid4().hex,
+                                        url=selected.url,
+                                        prompt_tokens=prompt_tokens,
+                                        admission_tokens=admission_tokens,
+                                        request_count=len(rooms),
+                                        rooms=rooms,
+                                        created_at=time.monotonic(),
+                                        draining=True,
+                                    )
+                                    self._reservations[
+                                        draining_reservation.reservation_id
+                                    ] = draining_reservation
+                                    logger.info(
+                                        "PD_LATE_BIND_DRAIN_RESERVE rooms=%s "
+                                        "D=%s admission_tokens=%d D_used=%d/%d "
+                                        "projected_decode_reqs=%d "
+                                        "projected_kv=%.4f work_score=%.4f",
+                                        rooms,
+                                        selected.url,
+                                        admission_tokens,
+                                        selected.used_tokens,
+                                        selected.capacity_tokens,
+                                        projected_reqs,
+                                        projected_kv,
+                                        work_score,
+                                    )
+                            wants_host_offer = bool(
+                                p2d_snapshot is not None
+                                and not p2d_offer_published
+                                and waited >= self.p2d_host_spill_delay
+                            )
+                            if wants_host_offer:
+                                refresh_urls = self._domain_decode_urls(domain)
+                                # In production ``_all_decode_loads`` owns the
+                                # authoritative cache.  Lightweight tests may
+                                # inject loads directly without causal epochs.
+                                causal_tracking = bool(self._load_cache)
+                                refresh_before_host_offer = bool(
+                                    causal_tracking
+                                    and not host_freshness_attempted
+                                    and not self._decode_loads_are_fresh_since(
+                                        refresh_urls, wait_started
+                                    )
+                                )
+                                publish_host_offer = not refresh_before_host_offer
+
+                if stale_ownership:
+                    continue
+                if missing_loads:
+                    now = time.monotonic()
+                    if now >= next_missing_domain_log:
+                        logger.warning(
+                            "No current D load sample in domain %d; waiting "
+                            "for the local endpoint",
+                            domain,
+                        )
+                        next_missing_domain_log = now + 5.0
+                    if now >= deadline:
+                        raise TimeoutError(
+                            f"No usable D worker in domain {domain} before "
+                            "P-ready admission deadline"
+                        )
+                    self._load_cache_at = 0.0
+                    force_load_refresh = True
+                    await asyncio.sleep(self.no_capacity_poll_interval)
+                    continue
+
+                if refresh_before_host_offer:
+                    host_freshness_attempted = True
+                    await self._observe_decode_load_after(
+                        session,
+                        urls=refresh_urls,
+                        not_before=wait_started,
+                    )
+                    # Re-run global feasibility against the causally fresh
+                    # snapshot.  Only a still-full result may become the
+                    # NUMA-local P->D Host owner.
+                    continue
+
+                if candidate is not None:
+                    candidate_settled = False
+                    try:
+                        finalized = await asyncio.to_thread(
+                            self._finalize_p2d_route,
+                            candidate,
+                            snapshot_id=p2d_snapshot,
+                            state=p2d_state,
+                            domain=domain,
+                        )
+                        async with self._selection_lock:
+                            if finalized is None:
+                                if candidate_is_new:
+                                    self._reservations.pop(
+                                        candidate.reservation_id, None
+                                    )
+                            else:
+                                self._reservations[
+                                    finalized.reservation_id
+                                ] = finalized
+                            candidate_settled = True
+                    except BaseException:
+                        if candidate_is_new and not candidate_settled:
+                            # No await is needed for rollback: Router state is
+                            # event-loop local, so this runs before another
+                            # selector can observe the stale credit.
+                            self._reservations.pop(candidate.reservation_id, None)
+                        raise
+                    if finalized is None:
+                        continue
+
+                    selected, work_score, projected_kv, projected_reqs, average = (
+                        candidate_stats
+                    )
+                    logger.info(
+                        "PD_LATE_BIND rooms=%s D=%s prompt_tokens=%d "
+                        "admission_tokens=%d D_used=%d/%d running=%d "
+                        "waiting=%d prealloc=%d transfer=%d "
+                        "projected_decode_reqs=%d average_context=%.1f "
+                        "work_score=%.4f projected_kv=%.4f "
+                        "policy=feasible_least_work",
+                        rooms,
+                        selected.url,
+                        prompt_tokens,
+                        admission_tokens,
+                        selected.used_tokens,
+                        selected.capacity_tokens,
+                        selected.running,
+                        selected.waiting,
+                        selected.prealloc,
+                        selected.transfer,
+                        projected_reqs,
+                        average,
+                        work_score,
+                        projected_kv,
+                    )
+                    if finalized.p2d_host_snapshot_id is not None:
                         logger.info(
-                            "PD_P2D_HOST_OFFER snapshot=%s rooms=%s P=%d "
-                            "prompt_tokens=%d state=%s",
+                            "PD_P2D_HOST_BIND snapshot=%s rooms=%s P=%d D=%s "
+                            "policy=global_host_feasible_least_work",
                             p2d_snapshot,
                             rooms,
                             domain,
-                            prompt_tokens,
-                            offered.get("state"),
+                            selected.url,
                         )
+                    return finalized
+
+                if publish_host_offer and p2d_snapshot is not None:
+                    await self._finish_physical_control_operation(
+                        asyncio.to_thread(
+                            self._publish_p2d_host_offer,
+                            p2d_snapshot,
+                            rooms,
+                            prompt_tokens,
+                            domain,
+                            source="selector_backpressure",
+                        )
+                    )
+                    p2d_offer_published = True
 
                 now = time.monotonic()
                 if now >= deadline:
                     raise TimeoutError(
-                        f"Timed out waiting {self.ready_timeout}s for feasible Decode "
-                        f"capacity for P-ready rooms {rooms} ({admission_tokens} tokens)"
+                        f"Timed out waiting {self.ready_timeout}s for feasible "
+                        f"Decode capacity for P-ready rooms {rooms} "
+                        f"({admission_tokens} tokens)"
                     )
                 if now >= next_wait_log:
                     logger.info(
-                        "PD_LATE_BIND_WAIT rooms=%s admission_tokens=%d: all D workers full",
+                        "PD_LATE_BIND_WAIT rooms=%s admission_tokens=%d: "
+                        "all D workers full",
                         rooms,
                         admission_tokens,
                     )
@@ -2068,21 +3963,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     )
                     self._load_cache_at = 0.0
             if p2d_snapshot is not None:
-                entry = self.p2d_host_ledger.get(p2d_snapshot)
-                if entry is not None and entry.get("state") not in {
-                    HostStageState.CONSUMED.value,
-                    HostStageState.REJECTED.value,
-                    HostStageState.FAILED.value,
-                }:
-                    owner = entry.get("p_owner")
-                    terminal = (
-                        HostStageState.REJECTED
-                        if entry.get("state") == HostStageState.OFFERED.value
-                        else HostStageState.FAILED
-                    )
-                    self.p2d_host_ledger.transition(
-                        p2d_snapshot, terminal, owner=owner
-                    )
+                self._abort_unsubmitted_p2d(
+                    p2d_snapshot, "decode_selection_aborted"
+                )
             raise
 
     async def _release_reservation_when_admitted(
@@ -2126,11 +4009,30 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         custom_params = sampling.get("custom_params") if isinstance(sampling, dict) else None
         try:
             metadata = AgenticRequestMetadata.from_custom_params(custom_params)
+            # Chat Completions carries lifecycle metadata at the request top
+            # level and in the router-safe extra_key envelope, rather than in
+            # Generate's sampling_params.  All later route watching depends on
+            # recognizing the parent here; otherwise Router chooses an
+            # arbitrary P while D may publish the Slow snapshot to a different
+            # NUMA-local P, leaving both sides waiting forever.
+            if metadata is None:
+                envelope = unpack_agentic_extra_key(modified_request.get("extra_key"))
+                if envelope is not None:
+                    _, envelope_params = envelope
+                    metadata = AgenticRequestMetadata.from_custom_params(
+                        envelope_params
+                    )
         except (TypeError, ValueError):
             metadata = None
         parent_turn = metadata is not None and metadata.parent is not None
         prefill_work: Optional[_PrefillWorkReservation] = None
-        arrival_at: Optional[float] = None
+        # Preserve the application-visible tool-return time independently of
+        # the short HTTP/tokenizer admission gate.  Dynamic routing publishes
+        # an untargeted marker immediately so D can observe the tool ACK; once
+        # a P is selected, the targeted marker is published before admission
+        # so that P's exact-size workset allocator can claim Direct KV without
+        # waiting behind unrelated HTTP requests.
+        arrival_at: Optional[float] = time.time() if parent_turn else None
         if getattr(self, "dynamic_prefill_domains", False):
             self._ensure_prefill_pressure_monitor()
             # Notify D immediately that the tool result has returned.  The
@@ -2138,9 +4040,8 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             # queues and targets the lighter P for Direct.  A failed Direct is
             # moved to the D worker's NUMA-local P when host_ready appears.
             arrival = self._publish_parent_arrival(modified_request)
-            arrival_at = (
-                None if arrival is None else float(arrival["arrived_at"])
-            )
+            if arrival is not None:
+                arrival_at = float(arrival["arrived_at"])
             prefill_work = await self._resolve_dynamic_prefill_work(
                 modified_request,
                 metadata,
@@ -2148,29 +4049,30 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             )
             domain = prefill_work.domain
         else:
-            self._publish_parent_arrival(modified_request)
             domain = self._request_domain(metadata, rooms)
         self._set_prefill_attempt_rid(modified_request, replace=False)
         route_task: Optional[asyncio.Task] = None
-        if (
-            prefill_work is not None
-            and prefill_work.route_pending
-            and metadata is not None
-        ):
-            route_task = asyncio.create_task(
-                self._watch_dynamic_prefill_route(
-                    modified_request,
-                    metadata,
-                    prefill_work,
-                )
-            )
         prefill_task: Optional[asyncio.Task] = None
         decode_task: Optional[asyncio.Task] = None
         admission_task: Optional[asyncio.Task] = None
+        p2d_attempt_snapshot: Optional[str] = None
         reservation: Optional[DecodeReservation] = None
         ready_sequence: Optional[int] = None
         ready_key: Optional[Any] = None
-        fifo_lock: Optional[asyncio.Lock] = None
+        parent_admission: Optional[_PrefillAdmissionGate] = None
+        parent_admission_domain: Optional[int] = None
+        pressure_handoff_task: Optional[asyncio.Task] = None
+
+        async def release_parent_admission() -> None:
+            nonlocal parent_admission
+            nonlocal parent_admission_domain
+            if parent_admission is None:
+                return
+            gate = parent_admission
+            parent_admission = None
+            parent_admission_domain = None
+            await gate.release()
+
         try:
             while True:
                 if getattr(self, "numa_domains", False):
@@ -2178,10 +4080,54 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         modified_request, domain
                     )
                 rooms = self._rooms(modified_request)
+                self._activate_prefill_attempt(modified_request, rooms)
                 prefill_admission = self._prefill_admission_for_domain(domain)
-                admission_wait = await prefill_admission.acquire(
-                    parent_turn=parent_turn
-                )
+                if parent_turn:
+                    # Physical KV admission and HTTP/tokenizer admission have
+                    # deliberately separate lifetimes.  Publishing the target
+                    # first is safe because P claims DIRECT_READY only after
+                    # atomically leasing the complete parent+suffix workset.
+                    # If that lease is unavailable, P leaves the manifest
+                    # untouched and D takes the ordinary timeout-to-Slow path.
+                    self._publish_parent_arrival(
+                        modified_request,
+                        target_prefill_domain=(
+                            domain
+                            if getattr(self, "dynamic_prefill_domains", False)
+                            else None
+                        ),
+                        arrived_at=arrival_at,
+                    )
+                    if (
+                        route_task is None
+                        and prefill_work is not None
+                        and prefill_work.route_pending
+                        and metadata is not None
+                    ):
+                        route_task = asyncio.create_task(
+                            self._watch_dynamic_prefill_route(
+                                modified_request,
+                                metadata,
+                                prefill_work,
+                            )
+                        )
+                    if parent_admission is not None:
+                        if parent_admission_domain != domain:
+                            raise RuntimeError(
+                                "parent admission cannot move before the old "
+                                "Prefill attempt is quiescent"
+                            )
+                        admission_wait = 0.0
+                    else:
+                        admission_wait = await prefill_admission.acquire(
+                            parent_turn=True
+                        )
+                        parent_admission = prefill_admission
+                        parent_admission_domain = domain
+                else:
+                    admission_wait = await prefill_admission.acquire(
+                        parent_turn=False
+                    )
                 if admission_wait >= 1.0:
                     logger.info(
                         "PD_P_ADMISSION rooms=%s parent_turn=%s wait_s=%.3f "
@@ -2213,18 +4159,49 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             self.max_prefill_inflight,
                         )
                 finally:
-                    await prefill_admission.release()
+                    # This gate protects only the short HTTP/tokenizer accept
+                    # window.  Parent KV remains protected independently by
+                    # its complete-workset lease through Prefill and P->D
+                    # handoff, so retaining the admission slot for that whole
+                    # lifetime would only delay later Direct claims.
+                    if parent_turn:
+                        await release_parent_admission()
+                    else:
+                        await prefill_admission.release()
                 try:
                     await self._wait_until_prefill_scheduled(
                         rooms, prefill_task, route_task
                     )
+                    # The scheduled marker is published only after P owns the
+                    # complete parent+suffix workset.  Keep Router shadow
+                    # credit until a pressure fetch that began after this
+                    # physical allocation, then remove it exactly once.  This
+                    # applies equally to Direct and Slow H2D admission.
+                    if (
+                        prefill_work is not None
+                        and prefill_work.direct_workset_tokens > 0
+                        and pressure_handoff_task is None
+                    ):
+                        pressure_handoff_task = asyncio.create_task(
+                            self._settle_direct_workset_after_pressure(
+                                prefill_work,
+                                direct_terminal_at=time.monotonic(),
+                            )
+                        )
                     prompt_tokens = await self._wait_until_prefill_ready(
                         rooms, prefill_task, route_task
+                    )
+                    logger.info(
+                        "PD_ROUTER_READY_OBSERVED rooms=%s P=%d prompt_tokens=%d",
+                        rooms,
+                        domain,
+                        prompt_tokens,
                     )
                     break
                 except _PrefillRedirect as redirect:
                     old_rooms = rooms
                     old_server = prefill_server
+                    self._deactivate_prefill_attempt(modified_request, old_rooms)
                     aborted = await self._abort_prefill_attempt(
                         session, old_server, modified_request, prefill_task
                     )
@@ -2234,17 +4211,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             f"acknowledged by {old_server}"
                         )
                     prefill_task = None
+                    # The explicit abort acknowledgement is the quiescence
+                    # boundary for the old P.  The short admission lease has
+                    # normally already been released at HTTP acceptance; this
+                    # remains idempotent for failures before acceptance.
+                    await release_parent_admission()
                     for room in old_rooms:
                         self._accepted_path(room).unlink(missing_ok=True)
                         self._scheduled_path(room).unlink(missing_ok=True)
                         self._ready_path(room).unlink(missing_ok=True)
                         self._p_ready_snapshot.pop(room, None)
                     await self._move_prefill_work(prefill_work, redirect.domain)
-                    self._publish_parent_arrival(
-                        modified_request,
-                        target_prefill_domain=redirect.domain,
-                        arrived_at=arrival_at,
-                    )
                     domain = redirect.domain
                     route_task = None
                     self._replace_prefill_attempt_rooms(modified_request)
@@ -2263,21 +4240,31 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 route_task.cancel()
                 await asyncio.gather(route_task, return_exceptions=True)
             await self._release_prefill_work(prefill_work)
-            # Keep Router reservations and P's transfer queue in the same
-            # FIFO order.  Without this gate, later requests can consume D
-            # prealloc KV while P correctly refuses to let them overtake the
-            # head, producing a cross-order deadlock.
+            if pressure_handoff_task is not None:
+                await asyncio.gather(
+                    pressure_handoff_task, return_exceptions=True
+                )
+            # Host staging is owned independently by each admission state
+            # machine; it cannot gate the path choice of later P-ready work.
+            p2d_attempt_snapshot = self._p2d_snapshot_for_rooms(rooms)
+            # The request coroutine now becomes a pure producer.  The per-P
+            # dispatcher owns FIFO order, future D-capacity credit and the
+            # actual Decode POST as one state transition.
             ready_sequence = self._p_ready_sequence(rooms)
             ready_key = (
                 (domain, ready_sequence)
                 if getattr(self, "dynamic_prefill_domains", False)
                 else ready_sequence
             )
-            fifo_lock = await self._acquire_p_ready_fifo(ready_sequence, domain)
-            try:
-                reservation = await self._select_and_reserve_decode(
-                    session, modified_request, rooms, prompt_tokens, domain
-                )
+
+            async def commit_ready_reservation(
+                selected_reservation: DecodeReservation,
+            ) -> DecodeReservation:
+                nonlocal admission_task
+                nonlocal decode_task
+                nonlocal p2d_attempt_snapshot
+                nonlocal reservation
+                reservation = selected_reservation
                 if reservation.p2d_host_snapshot_id is not None:
                     self._set_p2d_host_metadata(
                         modified_request,
@@ -2291,6 +4278,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         headers=headers,
                     )
                 )
+                # Decode now owns either the native transfer or the Host
+                # restore. Its reservation cleanup is the sole lifecycle
+                # authority from this point onward.
+                p2d_attempt_snapshot = None
                 # Preserve P-ready submission order, but never hold the global
                 # FIFO lock while one D waits to allocate destination KV.  The
                 # independent reservation task keeps capacity charged until D
@@ -2302,24 +4293,89 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     )
                 )
                 await asyncio.sleep(0)
-            finally:
-                fifo_lock.release()
-            prefill_response, decode_response = await asyncio.gather(
-                prefill_task, decode_task
+                return reservation
+
+            async def dispatch_ready_snapshot() -> DecodeReservation:
+                logger.info(
+                    "PD_ROUTER_SELECT_ENTER rooms=%s P=%d sequence=%d",
+                    rooms,
+                    domain,
+                    ready_sequence,
+                )
+                selected_reservation = await self._select_and_reserve_decode(
+                    session, modified_request, rooms, prompt_tokens, domain
+                )
+                if selected_reservation is None:
+                    raise RuntimeError(
+                        "P->D admission returned without a Decode reservation"
+                    )
+                return await commit_ready_reservation(selected_reservation)
+
+            async def prepare_ready_snapshot() -> Optional[DecodeReservation]:
+                """Persist one blocked P completion without waiting for D."""
+
+                await self._stage_p2d_until_durable(
+                    rooms, prompt_tokens, domain
+                )
+                # Both outcomes continue at the request-local commit boundary:
+                # HOST_READY means P pages may already be released; REJECTED
+                # means the complete P KV is retained.  In neither case may
+                # this bounded D2H preparation lane wait for D capacity.
+                # ``dispatch_ready_snapshot`` selects Direct versus Host from
+                # the authoritative manifest after the FIFO predecessor.
+                return None
+
+            await self._dispatch_p_ready_in_order(
+                ready_sequence,
+                domain,
+                dispatch_ready_snapshot,
+                request=modified_request,
+                rooms=rooms,
+                prompt_tokens=prompt_tokens,
+                commit=commit_ready_reservation,
+                prepare=prepare_ready_snapshot,
             )
+            # P has finished its part once its HTTP response arrives.  Unless
+            # prompt logprobs were explicitly requested, consume that small
+            # response immediately and return its connection to the pool
+            # instead of pinning one P socket for the entire Decode lifetime.
+            # ``decode_task`` is already running, so this does not serialize P
+            # and D execution.
+            prefill_response = await prefill_task
+            if not modified_request.get("return_logprob", False):
+                try:
+                    read = getattr(prefill_response, "read", None)
+                    if read is not None:
+                        await read()
+                finally:
+                    release = getattr(prefill_response, "release", None)
+                    if release is not None:
+                        release()
+                prefill_response = None
+            decode_response = await decode_task
             await admission_task
             return prefill_response, decode_response
         except BaseException:
             await self._release_prefill_work(prefill_work)
+            if pressure_handoff_task is not None:
+                await asyncio.gather(
+                    pressure_handoff_task, return_exceptions=True
+                )
             if route_task is not None and not route_task.done():
                 route_task.cancel()
                 await asyncio.gather(route_task, return_exceptions=True)
             if ready_key is not None:
                 self._p_ready_submitted_sequences.discard(ready_key)
-            if prefill_task is not None and not prefill_task.done():
-                prefill_task.cancel()
-            if decode_task is not None and not decode_task.done():
-                decode_task.cancel()
+            # Once the Decode POST has been submitted, closing its HTTP task is
+            # not a destination cleanup fence. Explicit abort makes D remove a
+            # request still parked in prealloc/transfer before Router drops the
+            # reservation and a retry starts a fresh physical generation.
+            if reservation is not None and decode_task is not None:
+                await self._abort_decode_attempt(
+                    session, reservation.url, modified_request
+                )
+            await self._dispose_response_task(prefill_task)
+            await self._dispose_response_task(decode_task)
             if admission_task is not None and not admission_task.done():
                 admission_task.cancel()
                 await asyncio.gather(admission_task, return_exceptions=True)
@@ -2330,19 +4386,15 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     reservation.p2d_host_snapshot_id is not None
                     and getattr(self, "p2d_host_ledger", None) is not None
                 ):
-                    entry = self.p2d_host_ledger.get(
-                        reservation.p2d_host_snapshot_id
+                    # The Host receiver may already own an H2D DMA even when
+                    # the HTTP task is cancelled.  Use the same fence-aware
+                    # abort protocol as selection cleanup: HOST_READY may
+                    # close immediately, while H2D_LOADING/CONSUMED remain
+                    # solely under Decode's physical completion authority.
+                    self._abort_unsubmitted_p2d(
+                        reservation.p2d_host_snapshot_id,
+                        "router_dispatch_failed",
                     )
-                    if entry is not None and entry.get("state") not in {
-                        HostStageState.CONSUMED.value,
-                        HostStageState.FAILED.value,
-                    }:
-                        self.p2d_host_ledger.transition(
-                            reservation.p2d_host_snapshot_id,
-                            HostStageState.FAILED,
-                            owner=entry.get("p_owner"),
-                            reason="router_dispatch_failed",
-                        )
             for room in rooms:
                 try:
                     self._accepted_path(room).unlink(missing_ok=True)
@@ -2350,7 +4402,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     self._ready_path(room).unlink(missing_ok=True)
                 except OSError:
                     pass
+            await release_parent_admission()
             raise
+        finally:
+            self._abort_unsubmitted_p2d(
+                p2d_attempt_snapshot, "router_attempt_ended_before_d_submit"
+            )
+            self._deactivate_prefill_attempt(modified_request, rooms)
+            await release_parent_admission()
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -2374,13 +4433,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         assert decode_server is None, "Late-binding D must not be selected early"
 
         async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as session:
+            session = self._backend_http_session()
+            prefill_response = decode_response = None
+            try:
                 prefill_response, decode_response = await self._late_dispatch(
                     session, modified_request, prefill_server, endpoint, {}
                 )
                 if modified_request.get("return_logprob", False):
+                    assert prefill_response is not None
                     prefill_chunks = [chunk async for chunk in prefill_response.content]
                     first = orjson.loads(prefill_chunks[0].decode("utf-8")[5:].strip())
                     async for chunk in decode_response.content:
@@ -2399,5 +4459,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
+            finally:
+                if prefill_response is not None:
+                    prefill_response.release()
+                if decode_response is not None:
+                    decode_response.release()
 
         return StreamingResponse(stream_results(), media_type="text/event-stream")

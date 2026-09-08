@@ -35,10 +35,35 @@ pd_stop_group() {
 }
 
 pd_cleanup_all() {
-  local index
+  local index pgid deadline any_live
   trap - EXIT INT TERM
+  # Stop every service first, then share one grace period.  Waiting up to the
+  # full grace period for each group serially can outlive the parent launcher;
+  # later groups would then be adopted by pid 1 and survive as GPU orphans.
   for ((index=${#PD_SERVICE_PGIDS[@]} - 1; index >= 0; index--)); do
-    pd_stop_group "${PD_SERVICE_PGIDS[index]}"
+    pgid="${PD_SERVICE_PGIDS[index]}"
+    if pd_group_has_live_members "${pgid}"; then
+      kill -TERM -- "-${pgid}" 2>/dev/null || true
+    fi
+  done
+  deadline=$((SECONDS + ${PD_CLEANUP_GRACE_SECONDS:-30}))
+  while (( SECONDS < deadline )); do
+    any_live=0
+    for pgid in "${PD_SERVICE_PGIDS[@]}"; do
+      if pd_group_has_live_members "${pgid}"; then
+        any_live=1
+        break
+      fi
+    done
+    (( any_live == 0 )) && break
+    sleep 1
+  done
+  for ((index=${#PD_SERVICE_PGIDS[@]} - 1; index >= 0; index--)); do
+    pgid="${PD_SERVICE_PGIDS[index]}"
+    if pd_group_has_live_members "${pgid}"; then
+      kill -KILL -- "-${pgid}" 2>/dev/null || true
+    fi
+    wait "${pgid}" 2>/dev/null || true
   done
   PD_SERVICE_PGIDS=()
 }
@@ -85,4 +110,3 @@ pd_check_port_free() {
     return 1
   fi
 }
-

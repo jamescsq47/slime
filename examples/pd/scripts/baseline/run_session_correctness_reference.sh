@@ -25,7 +25,7 @@ pd_check_port_free "${PORT}"
 
 setsid env CUDA_VISIBLE_DEVICES="${GPU}" "${PD_ENV_BIN}/python" -m sglang.launch_server \
   --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${PORT}" \
-  --context-length 40960 --page-size 64 --mem-fraction-static 0.85 --enable-metrics \
+  --context-length 40960 --page-size 64 --mem-fraction-static 0.80 --enable-metrics \
   --enable-deterministic-inference --attention-backend triton --random-seed 2026 \
   >"${RUN_DIR}/logs/server.log" 2>&1 &
 server_pid=$!

@@ -71,3 +71,20 @@ arguments.
 
 The `terminal_bench` package is a concrete third example. Its OpenEnv service
 must be started manually and its endpoint passed as `environment_url`.
+
+`swe_bench` is a shell-agent example whose environment is inherently
+per-trajectory. It accepts official SWE-bench JSONL, JSON, or Parquet rows and
+starts one isolated Docker container per active agent. Each row may provide an
+explicit `image_name`; otherwise the official
+`docker.io/swebench/sweb.eval.x86_64.<instance>:latest` name is derived from
+`instance_id`. Host shell interpolation is never used for model commands.
+`sandbox_backend` selects local `docker` or optional remote `daytona` without
+changing the agent loop. `verifier_mode=inline` runs the hidden Miles/Harbor
+SWE-bench verifier after generation, `capture` only saves the complete patch,
+and `disabled` avoids verifier overhead during serving-only profiling.
+
+`swe_bench_openenv` reuses the same loader, sandbox transports, baseline
+validation, patch capture, and canonical verifier, but uses the Miles PR #51
+OpenEnv-style episode protocol. It intentionally lives in a separate plugin so
+old mini-SWE-agent artifacts remain reproducible. New correctness experiments
+should select `harness: swe_bench_openenv`.

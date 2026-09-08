@@ -4,6 +4,7 @@ import logging
 import sys
 
 import sglang_router.mini_lb as mini_lb_module
+import uvicorn
 from sglang_router.launch_router import parse_router_args
 
 from late_binding_router import LateBindingMiniLoadBalancer
@@ -19,9 +20,27 @@ def main() -> None:
     router = LateBindingMiniLoadBalancer(args)
     # The FastAPI handlers in sglang_router.mini_lb resolve this module-global.
     mini_lb_module.lb = router
-    router.start()
+    # FastAPI 0.1xx exposes lifecycle registration on its APIRouter rather
+    # than directly on the application object.
+    mini_lb_module.app.router.add_event_handler("shutdown", router.close)
+    if router.enable_trace:
+        mini_lb_module.process_tracing_init(router.otlp_traces_endpoint, "sglang")
+        mini_lb_module.trace_set_thread_info("Mini lb")
+    # This Router is both an ASGI server and a high-concurrency aiohttp client.
+    # Under c512, uvloop can reuse an fd that it still associates with an
+    # inbound ASGI transport while aiohappyeyeballs is opening a backend
+    # connection.  The resulting cross-wired socket first raises
+    # ``fd is used by transport`` and can then parse our outbound POST as an
+    # inbound response.  Keeping only the Router on the standard asyncio loop
+    # avoids that unsafe mixed server/client fd lifecycle; P and D workers keep
+    # their normal event-loop configuration.
+    uvicorn.run(
+        mini_lb_module.app,
+        host=router.host,
+        port=router.port,
+        loop="asyncio",
+    )
 
 
 if __name__ == "__main__":
     main()
-

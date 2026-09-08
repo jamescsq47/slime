@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -21,7 +22,7 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
-from .client import Tbench2Client
+from .client import Tbench2Client, TerminalEnvironmentError
 
 
 _BASH_BLOCK = re.compile(r"```(?:bash|sh)\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
@@ -106,10 +107,7 @@ async def generate(
         )
 
     state = GenerateState(args)
-    client = Tbench2Client(
-        base_url,
-        message_timeout=float(options.get("environment_timeout_seconds", 4200)),
-    )
+    client = None
     started_at = time.monotonic()
     prompt_tokens: list[int] = []
     response_tokens: list[int] = []
@@ -120,8 +118,38 @@ async def generate(
     stop_reason = "max_turns"
     reward = None
     try:
-        await client.connect()
-        reset = await client.reset(task_id)
+        # In a closed-loop run, a replacement coroutine can start a few
+        # milliseconds before the previous OpenEnv container has finished
+        # teardown.  CAPACITY_REACHED is therefore backpressure, not a
+        # completed/failed benchmark sample.  Reconnect because OpenEnv closes
+        # the WebSocket after reporting this error, and retain the same rollout
+        # slot until a real environment is available.
+        capacity_deadline = time.monotonic() + float(
+            options.get("environment_capacity_wait_seconds", 1800)
+        )
+        capacity_attempt = 0
+        while True:
+            client = Tbench2Client(
+                base_url,
+                message_timeout=float(
+                    options.get("environment_timeout_seconds", 4200)
+                ),
+            )
+            try:
+                await client.connect()
+                reset = await client.reset(task_id)
+                break
+            except TerminalEnvironmentError as exc:
+                await client.close()
+                client = None
+                if (
+                    exc.code
+                    not in {"CAPACITY_REACHED", "RESET_CONNECTION_CLOSED_OK"}
+                    or time.monotonic() >= capacity_deadline
+                ):
+                    raise
+                capacity_attempt += 1
+                await asyncio.sleep(0.25 + 0.05 * (capacity_attempt % 16))
         prompt_tokens = _render_initial_prompt(
             state.tokenizer,
             list(sample.prompt) if isinstance(sample.prompt, list) else [],
@@ -134,12 +162,14 @@ async def generate(
             or 40960
         )
         max_turns = int(options.get("max_turns", 64))
-        per_turn_cap = int(options.get("max_tokens_per_turn", 2048))
+        per_turn_cap = int(options.get("max_tokens_per_turn", 8192))
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
         for turn in range(max_turns):
             input_ids = prompt_tokens + response_tokens
-            remaining = max_context - len(input_ids)
+            # SGLang rejects prompt + max_new_tokens == context_length, so keep
+            # one token of headroom at the model boundary for every layout.
+            remaining = max_context - len(input_ids) - 1
             if remaining <= 0:
                 status = Sample.Status.TRUNCATED
                 stop_reason = "budget"
@@ -230,7 +260,7 @@ async def generate(
                     "or TASK_COMPLETE when the task is finished."
                 )
             observation_ids = _observation_tokens(state.tokenizer, observation)
-            remaining = max_context - len(prompt_tokens) - len(response_tokens)
+            remaining = max_context - len(prompt_tokens) - len(response_tokens) - 1
             if len(observation_ids) > remaining:
                 observation_ids = observation_ids[: max(0, remaining)]
                 status = Sample.Status.TRUNCATED
@@ -252,7 +282,8 @@ async def generate(
         stop_reason = f"environment_error:{type(exc).__name__}"
         metadata["environment_error"] = str(exc)
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
     sample.status = status
     sample.tokens = prompt_tokens + response_tokens

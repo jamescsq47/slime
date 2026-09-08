@@ -12,12 +12,14 @@ SLIME_ROOT="/workspace/slime"           # slime repo root (where tools/ lives)
 
 # ── Model paths to convert (edit this list) ──────────────────────────────────
 MODEL_DIRS=(
-    "/workspace/Qwen3-8B-retool-mask51200-collocate-partial"
-    "/workspace/Qwen3-8B-browsecomp-mask51200-collocate-partial"
+    "/workspace/math-qa-terminal/qwen3-8B-async-decoupled-uncapped-gpu224"
+    "/workspace/math-qa-terminal/qwen3-8B-async-decoupled-uncapped-gpu256"
     # "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-collocate-partial"
     # "/workspace/Qwen3-8B-mixed-browsecomp-retool0.5-mask51200-51200-block4-qafirst"
 )
 # ─────────────────────────────────────────────────────────────────────────────
+# slime/examples/mixed/hybrid_qwen3_4b_multi.sh
+
 
 if [ ${#MODEL_DIRS[@]} -eq 0 ]; then
     echo "No model paths configured. Please edit MODEL_DIRS in this script."

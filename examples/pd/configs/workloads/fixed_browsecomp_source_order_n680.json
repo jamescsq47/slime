@@ -1,0 +1,9 @@
+{
+  "format": "seeded_fixed_v1",
+  "name": "fixed-browsecomp-source-order-n680",
+  "measured_count": 680,
+  "math_count": 0,
+  "qa_count": 680,
+  "sample_pool_seed": 2026,
+  "task_order_seed": 2027
+}

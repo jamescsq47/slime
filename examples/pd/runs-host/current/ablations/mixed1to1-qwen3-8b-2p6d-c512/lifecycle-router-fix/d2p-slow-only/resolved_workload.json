@@ -1,0 +1,33 @@
+{
+  "datasets": [
+    {
+      "id": "math",
+      "harness": "retool",
+      "path": "/homes/siqic/data/dapo-math-17k/dapo-math-17k.jsonl",
+      "weight": 0.5,
+      "options": {
+        "max_response_tokens": 8192
+      }
+    },
+    {
+      "id": "qa",
+      "harness": "browsecomp",
+      "path": "/homes/siqic/data/browsecomp/bc_train.jsonl",
+      "weight": 0.5,
+      "options": {
+        "max_response_tokens": 36864
+      }
+    }
+  ],
+  "sampling": {
+    "policy": "fixed",
+    "seed": 2026,
+    "preserve_source_order": false,
+    "shuffle_algorithm": "legacy_two_stage_v1",
+    "count_algorithm": "legacy_two_dataset_round_v1",
+    "pool_reuse_algorithm": "cover_all_cycle_v1",
+    "schedule_file": "/homes/siqic/slime/examples/pd/configs/workloads/fixed_random_s2026_n8192.json"
+  },
+  "schema_version": 1,
+  "source": null
+}

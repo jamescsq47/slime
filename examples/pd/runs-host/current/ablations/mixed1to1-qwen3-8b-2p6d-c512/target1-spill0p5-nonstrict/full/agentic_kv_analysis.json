@@ -1,0 +1,53 @@
+{
+  "direct": {
+    "fallbacks": 286,
+    "hit_rate_per_offer": 0.0,
+    "hits": 0,
+    "mean_fallback_seconds": 2.1508856468531468,
+    "mean_send_complete_seconds": null,
+    "offers": 13870,
+    "pending_at_log_end": 13584
+  },
+  "events": {
+    "app_final_release": 872,
+    "d_generation_release": 16466,
+    "d_release_after_p_host": 269,
+    "decode_radix_reuse": 16927,
+    "direct_fallback": 286,
+    "direct_offer": 13870,
+    "direct_rank_send_complete": 12705,
+    "early_direct_admit": 12705,
+    "early_direct_bind": 12705,
+    "early_direct_complete": 12705,
+    "early_direct_start": 12705,
+    "fast_arrival": 6,
+    "fast_arrival_released": 12691,
+    "fast_arrival_seen": 12691,
+    "final_skip": 2621,
+    "host_staging_offer": 284,
+    "p2d_host_d2h_complete": 1324,
+    "p2d_host_d2h_queued": 1325,
+    "p2d_host_h2d_complete": 1322,
+    "p2d_host_prefill_release": 1324,
+    "p2d_host_release": 1322,
+    "p_rematch": 15290,
+    "p_to_d_release": 16948,
+    "request_seen": 16491,
+    "shared_host_d2h_complete": 269,
+    "shared_host_d2h_start": 280,
+    "shared_host_extent_ready": 280,
+    "shared_host_h2d_complete": 246,
+    "shared_host_h2d_release": 246,
+    "shared_host_h2d_start": 246,
+    "shared_host_materialize_complete": 246,
+    "shared_host_ready": 265,
+    "slow_prefill_select": 281,
+    "slow_prefill_select_fallback": 5
+  },
+  "mooncake": {
+    "consumed_snapshots": 0,
+    "mean_ready_seconds": null,
+    "mean_snapshot_gib": null,
+    "ready_snapshots": 0
+  }
+}

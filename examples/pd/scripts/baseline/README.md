@@ -12,6 +12,8 @@ The reusable baseline entry points are:
 | `run_four_gpu_comparison_suite.sh` | 4 colocated / 1P:3D | colocated, no reverse KV, native Mooncake |
 | `run_two_p_two_d_comparison_suite.sh` | 2P:2D | no reverse KV, native Mooncake |
 | `run_comparison_suite.sh` | 6 colocated / 1P:5D / 2P:4D | larger architecture sweep |
+| `run_qwen3_32b_tp2_swe_bench_colocated.sh` | 4 colocated TP=2 replicas | SWE-bench Docker shell-agent validation |
+| `run_qwen35_27b_tp2_swe_bench_openenv_colocated.sh` | 4 colocated TP=2 replicas | Qwen3.5-27B + OpenEnv-style SWE-bench + official verifier |
 
 The four-GPU formal cases use Mixed 1:1, fixed seed 2026, the same c256 request
 sequence, a 300-second warmup, and a 1200-second measurement.
@@ -30,4 +32,13 @@ CASE_MODE=no_reverse PREFILL_GPUS='0 1' PREFILL_PORTS='27500 27501' \
 PREFILL_BOOTSTRAP_PORTS='28500 28501' DECODE_GPUS='2 3 4 5' \
 DECODE_PORTS='27502 27503 27504 27505' \
 bash scripts/baseline/run_pd_case.sh
+```
+
+The SWE-bench launcher additionally requires `PD_DATA_ROOT` and the official
+task images referenced by the selected dataset rows. It uses random dispatch
+rather than a legacy Retool/BrowseComp fixed schedule:
+
+```bash
+PD_DATA_ROOT=/path/to/pd-data \
+bash examples/pd/scripts/baseline/run_qwen3_32b_tp2_swe_bench_colocated.sh
 ```

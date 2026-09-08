@@ -73,7 +73,18 @@ cleanup_pipeline() {
   local deadline
   if [[ -n "${service_runner_pid}" ]] && kill -0 "${service_runner_pid}" 2>/dev/null; then
     kill -TERM -- "-${service_runner_pid}" 2>/dev/null || true
-    deadline=$((SECONDS + 45))
+    # The service runner owns the dependency-ordered shutdown of Router, D,
+    # P, and search processes.  Do not kill that supervisor before its own
+    # bounded TERM/KILL/reap windows have elapsed, or a reparented Router can
+    # survive the experiment even though the GPU workers were stopped.
+    deadline=$((
+      SECONDS
+      + ${PD_FRONTEND_GRACEFUL_SHUTDOWN_SECONDS:-10}
+      + ${PD_SERVICE_GRACEFUL_SHUTDOWN_SECONDS:-120}
+      + ${PD_SERVICE_KILL_WAIT_SECONDS:-30}
+      + ${PD_SERVICE_FINAL_KILL_WAIT_SECONDS:-60}
+      + 15
+    ))
     while kill -0 "${service_runner_pid}" 2>/dev/null && (( SECONDS < deadline )); do
       sleep 1
     done
@@ -94,6 +105,11 @@ else
 fi
 
 export SGLANG_AGENTIC_KV_LIFECYCLE=true
+# The new method owns its complete request-generation storage lifecycle.
+# Native HiCache/Mooncake write-back, prefetch, and Decode offload are
+# baseline-only behavior.
+export SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY=true
+export SGLANG_AGENTIC_KV_METADATA_DIR="${SGLANG_AGENTIC_KV_METADATA_DIR:-${PD_P_READY_DIR}/snapshot-metadata}"
 export SGLANG_AGENTIC_KV_CAPACITY_GIB="${SGLANG_AGENTIC_KV_CAPACITY_GIB:-256}"
 export SGLANG_AGENTIC_KV_D_WRITERS="${SGLANG_AGENTIC_KV_D_WRITERS:-${decode_writers}}"
 export SGLANG_AGENTIC_KV_LEDGER_PATH
@@ -102,13 +118,25 @@ export SGLANG_AGENTIC_KV_D_HOSTLESS="${SGLANG_AGENTIC_KV_D_HOSTLESS:-true}"
 export SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR
 export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB:-128}"
+export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_BACKEND="${SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_BACKEND:-memfd}"
+export SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA="${SGLANG_AGENTIC_KV_REGISTERED_EXTENT_DMA:-1}"
+export SGLANG_AGENTIC_KV_REGISTER_WINDOW_GIB="${SGLANG_AGENTIC_KV_REGISTER_WINDOW_GIB:-8}"
+export SGLANG_AGENTIC_KV_REGISTER_CACHE_GIB="${SGLANG_AGENTIC_KV_REGISTER_CACHE_GIB:-64}"
+export SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA="${SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA:-0}"
+export SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER="${SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER:-${SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA}}"
+export SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR="${SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR:-${PD_P_READY_DIR}/host-register-prewarm}"
+export SGLANG_AGENTIC_KV_REGISTER_PREWARM_TIMEOUT_SECONDS="${SGLANG_AGENTIC_KV_REGISTER_PREWARM_TIMEOUT_SECONDS:-1800}"
 export SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH="${SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH:-${PD_P_READY_DIR}/early-claims/prefill-loads.json}"
 export SGLANG_AGENTIC_KV_P2D_HOST_STAGING="${SGLANG_AGENTIC_KV_P2D_HOST_STAGING:-false}"
+export SGLANG_AGENTIC_KV_P2D_HOST_ARENA_BACKEND="${SGLANG_AGENTIC_KV_P2D_HOST_ARENA_BACKEND:-memfd}"
 if [[ "${SGLANG_AGENTIC_KV_P2D_HOST_STAGING}" == "true" ]]; then
   export SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH
   export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR
 fi
 export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB="${SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB:-32}"
+export SGLANG_PD_LATE_BIND_FORCE_LEGACY_LOADS="${SGLANG_PD_LATE_BIND_FORCE_LEGACY_LOADS:-1}"
+export SGLANG_AGENTIC_KV_P2D_D2H_WORKERS="${SGLANG_AGENTIC_KV_P2D_D2H_WORKERS:-4}"
+export SGLANG_AGENTIC_KV_P2D_H2D_WORKERS="${SGLANG_AGENTIC_KV_P2D_H2D_WORKERS:-4}"
 export SGLANG_AGENTIC_KV_RELAY_ENABLED="${SGLANG_AGENTIC_KV_RELAY_ENABLED:-true}"
 export SGLANG_AGENTIC_KV_RELAY_D2H_GIBPS="${SGLANG_AGENTIC_KV_RELAY_D2H_GIBPS:-21.0}"
 export SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS="${SGLANG_AGENTIC_KV_DIRECT_CROSS_NUMA_GIBPS:-7.45}"
@@ -119,9 +147,9 @@ export SGLANG_AGENTIC_KV_RELAY_STALE_SECONDS="${SGLANG_AGENTIC_KV_RELAY_STALE_SE
 # of D HBM while reducing that control-plane amplification by roughly 4x.
 export SGLANG_AGENTIC_KV_STAGING_SLOT_MIB="${SGLANG_AGENTIC_KV_STAGING_SLOT_MIB:-256}"
 export SGLANG_AGENTIC_KV_STAGING_SLOTS="${SGLANG_AGENTIC_KV_STAGING_SLOTS:-2}"
-export SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK="${SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK:-0.80}"
-export SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK="${SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK:-0.70}"
-export SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK="${SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK:-0.90}"
+export SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK="${SGLANG_AGENTIC_KV_P_HOST_HIGH_WATERMARK:-0.90}"
+export SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK="${SGLANG_AGENTIC_KV_P_HOST_LOW_WATERMARK:-0.75}"
+export SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK="${SGLANG_AGENTIC_KV_P_HOST_HARD_WATERMARK:-0.95}"
 export SGLANG_AGENTIC_KV_HIGH_WATERMARK="${SGLANG_AGENTIC_KV_HIGH_WATERMARK:-0.90}"
 if [[ -z "${SGLANG_AGENTIC_KV_TOOL_MEAN_SECONDS+x}" ]]; then
   SGLANG_AGENTIC_KV_TOOL_MEAN_SECONDS='{}'
@@ -131,27 +159,23 @@ export SGLANG_AGENTIC_KV_READY_TIMEOUT="${SGLANG_AGENTIC_KV_READY_TIMEOUT:-120}"
 export SGLANG_AGENTIC_KV_STALE_SECONDS="${SGLANG_AGENTIC_KV_STALE_SECONDS:-300}"
 export SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD="${SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD:-2.0}"
 export SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT="${SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT:-2.0}"
-# Split the fast-path deadline into the two phases required by the agentic
-# pipeline.  The first deadline classifies the tool as fast; only after the
-# parent turn actually returns does D start the P-admission deadline.  Once P
-# immediately allocates exact-size P pages from the arrival marker;
-# DIRECT_HANDSHAKE_TIMEOUT bounds receiver setup/DMA, not request scheduling.
+export SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE="${SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE:-false}"
+# The fast-tool window ends when the tool returns.  From that arrival onward,
+# DIRECT_HANDSHAKE_TIMEOUT is one shared budget for P admission plus Direct
+# receiver/transfer setup; a later P claim must not restart the clock.
 export SGLANG_AGENTIC_KV_EARLY_CLAIM="${SGLANG_AGENTIC_KV_EARLY_CLAIM:-true}"
-export SGLANG_AGENTIC_KV_EARLY_CLAIM_POST_TIMEOUT="${SGLANG_AGENTIC_KV_EARLY_CLAIM_POST_TIMEOUT:-${SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT}}"
 export SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK="${SGLANG_AGENTIC_KV_DIRECT_D_HBM_HIGH_WATERMARK:-0.85}"
 export SGLANG_AGENTIC_KV_DIRECT_MANIFEST_POLL_INTERVAL="${SGLANG_AGENTIC_KV_DIRECT_MANIFEST_POLL_INTERVAL:-0.10}"
-export SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT="${SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT:-8}"
+export SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT="${SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT:-4}"
 # Do not impose an artificial request/token credit on Prefill.  Native SGLang
-# admission remains the final HBM-safety boundary, while the waiting queue
-# still preserves Direct > slow recovery > new priority.  Experiments can
-# explicitly restore continuous/hysteresis backpressure through the env var.
+# admission remains the final HBM-safety boundary. Direct, Slow and new work
+# share native compute admission; only their physical I/O credits are separate.
+# Experiments can explicitly restore continuous/hysteresis backpressure.
 export SGLANG_PD_P_READY_BACKPRESSURE_MODE="${SGLANG_PD_P_READY_BACKPRESSURE_MODE:-disabled}"
 export SGLANG_PD_P_READY_REQUEST_CAP="${SGLANG_PD_P_READY_REQUEST_CAP:-0}"
-# Direct receives use independent, exact-size page allocations.  They outrank
-# slow recovery and new Prefill; eight concurrent rooms absorb short bursts
-# without reserving a permanent HBM buffer.
+# Direct receives use exact-size full-workset allocations from ordinary P HBM.
+# Eight concurrent rooms absorb short bursts without a permanent transit pool.
 export SGLANG_AGENTIC_KV_DIRECT_IO_CAP="${SGLANG_AGENTIC_KV_DIRECT_IO_CAP:-8}"
-export SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS="${SGLANG_AGENTIC_KV_P_DIRECT_RESERVE_TOKENS:-40000}"
 export SGLANG_PD_DECODE_ENABLE_RADIX_CACHE="${SGLANG_PD_DECODE_ENABLE_RADIX_CACHE:-true}"
 # Bound slow-path pressure on Decode.  Only one gather+D2H chunk is submitted
 # at a time on each D; the background worker returns to Decode before issuing
@@ -189,22 +213,14 @@ export SGLANG_PD_LATE_BIND_MAX_PREFILL_INFLIGHT="${SGLANG_PD_LATE_BIND_MAX_PREFI
 # the same lifecycle horizon as P-ready, otherwise the router returns a 500
 # every 30 seconds while the original request is still valid in P's queue.
 export SGLANG_PD_LATE_BIND_ACCEPT_TIMEOUT_S="${SGLANG_PD_LATE_BIND_ACCEPT_TIMEOUT_S:-${PD_LATE_BIND_READY_TIMEOUT_S:-600}}"
-# Mooncake's TCP transport connection pool exists in the installed 0.3.12
-# build but is opt-in.  Agentic request-generation manifests are updated
-# frequently; without pooling every tiny update creates a short-lived TCP
-# connection and a sustained run can exhaust the kernel ephemeral-port range.
-export MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
-
 setsid env \
   BOOTSTRAP_PORT="${BOOTSTRAP_PORT}" \
   DECODE_GPUS="${DECODE_GPUS}" \
   PD_PAGE_SIZE="${PD_PAGE_SIZE:-64}" \
   PD_PREFILL_HICACHE_WRITE_POLICY="${PD_PREFILL_HICACHE_WRITE_POLICY:-write_back}" \
-  PD_ENABLE_DECODE_OFFLOAD_KVCACHE=1 \
+  PD_ENABLE_DECODE_OFFLOAD_KVCACHE=0 \
   PD_MAX_TRANSFER_INFLIGHT="${PD_MAX_TRANSFER_INFLIGHT:-8}" \
   PD_P_READY_DIR="${PD_P_READY_DIR}" \
-  MOONCAKE_EVICTION_HIGH_WATERMARK_RATIO="${MOONCAKE_EVICTION_HIGH_WATERMARK_RATIO:-0.98}" \
-  MOONCAKE_EVICTION_RATIO="${MOONCAKE_EVICTION_RATIO:-0.02}" \
   bash "${SCRIPT_DIR}/run_hicache_services.sh" &
 service_runner_pid=$!
 wait "${service_runner_pid}"

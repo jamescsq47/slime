@@ -410,6 +410,195 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-sample-completion-backfill",
+                action="store_true",
+                default=False,
+                help=(
+                    "Replenish one new prompt group after n_samples_per_prompt individual sample slots complete, "
+                    "instead of waiting for one whole group to finish. Disabled by default so the existing "
+                    "group-level rollout scheduler is unchanged."
+                ),
+            )
+            parser.add_argument(
+                "--decoupled-gpu-tool-scheduling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Limit actual SGLang /generate requests with a request-level GPU slot pool. "
+                    "Tool work uses no GPU slot; completed tools resume in FIFO order before fresh samples."
+                ),
+            )
+            parser.add_argument(
+                "--gpu-generation-slots",
+                type=int,
+                default=None,
+                help=(
+                    "Request-level SGLang concurrency for decoupled GPU/tool scheduling. "
+                    "Defaults to rollout_batch_size * n_samples_per_prompt."
+                ),
+            )
+            parser.add_argument(
+                "--terminal-live-session-limit",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of persistent Terminal-Bench sessions held by rollout samples. "
+                    "Excess samples wait FIFO instead of opening another environment."
+                ),
+            )
+            parser.add_argument(
+                "--terminal-concurrent-resets",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of Terminal-Bench reset/container-creation operations in flight. "
+                    "This is independent of SGLang generation slots."
+                ),
+            )
+            parser.add_argument(
+                "--max-inflight-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Hard cap on active plus weight-update-deferred rollout groups. "
+                    "Used as a safety bound for decoupled GPU/tool scheduling."
+                ),
+            )
+            parser.add_argument(
+                "--inflight-group-soft-limit",
+                type=int,
+                default=None,
+                help=(
+                    "Preferred inflight-group limit for decoupled scheduling. When all prefetched "
+                    "samples are activated but GPU slots still need fresh supply, the scheduler may "
+                    "open one additional group container at a time up to --max-inflight-groups; "
+                    "sample activation remains exact-demand."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling",
+                "--elastic-group-window",
+                dest="adaptive_group_oversampling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep rollout_batch_size as the collection size while dynamically adjusting an "
+                    "independent inflight prompt-group target between configured minimum and maximum "
+                    "bounds from smoothed SGLang pressure."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-min-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Minimum elastic inflight group target. Defaults to rollout_batch_size; set below "
+                    "it to allow natural draining under sustained pressure."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-running-threshold",
+                type=float,
+                default=180.0,
+                help="Increase group-level oversampling while total SGLang running requests stay below this value.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-queue-threshold",
+                type=float,
+                default=4.0,
+                help="Only increase group-level oversampling while total SGLang queued requests stay below this value.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-expansion-kv-threshold",
+                type=float,
+                default=0.65,
+                help="Only expand while smoothed average KV-cache usage stays below this value.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-window-seconds",
+                type=float,
+                default=15.0,
+                help="Sliding-window duration used to smooth SGLang pressure metrics.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-cooldown-seconds",
+                type=float,
+                default=15.0,
+                help="Minimum time between elastic group-window adjustments.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-post-resume-expansion-grace-seconds",
+                type=float,
+                default=30.0,
+                help=(
+                    "After rollout resumes from a weight update, suppress expansion for this many "
+                    "seconds while still allowing pressure-driven contraction."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-recovery-seconds",
+                type=float,
+                default=10.0,
+                help=(
+                    "Seconds of sustained queued-request and KV-cache pressure before reducing "
+                    "the inflight group target."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-step-groups",
+                type=int,
+                default=2,
+                help="Number of whole prompt groups added or removed per adaptive adjustment.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-pressure-queue-threshold",
+                type=float,
+                default=12.0,
+                help=(
+                    "Global queued-request threshold used by soft pressure and required alongside "
+                    "the average-KV hard-pressure condition."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-pressure-kv-threshold",
+                type=float,
+                default=0.65,
+                help="Soft-pressure average KV-cache threshold for reducing adaptive oversampling.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-hard-max-engine-kv-threshold",
+                type=float,
+                default=0.95,
+                help="Hard-pressure KV-cache threshold for the most occupied SGLang engine.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-hard-engine-queue-threshold",
+                type=float,
+                default=4.0,
+                help="Required local queue on the max-KV engine for max-engine hard pressure.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-hard-pressure-kv-threshold",
+                type=float,
+                default=0.78,
+                help=(
+                    "Hard-pressure average KV-cache threshold for faster oversampling reduction; "
+                    "the global queued-request pressure threshold must also be exceeded."
+                ),
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-hard-pressure-seconds",
+                type=float,
+                default=5.0,
+                help="Seconds of sustained hard pressure before reducing the inflight group target.",
+            )
+            parser.add_argument(
+                "--adaptive-group-oversampling-hard-step-groups",
+                type=int,
+                default=4,
+                help="Number of whole prompt groups removed per hard-pressure adjustment.",
+            )
+            parser.add_argument(
                 "--mask-offpolicy-in-partial-rollout",
                 action="store_true",
                 default=False,
@@ -436,6 +625,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Mask off-policy tokens in QA samples when lag_sample_qa >= this value. "
                     "lag_sample_qa is the total QA samples across the lagging versions. "
                     "Requires partial_rollout to be enabled."
+                ),
+            )
+            parser.add_argument(
+                "--mask-offpolicy-terminal",
+                type=int,
+                default=None,
+                help=(
+                    "Mask off-policy tokens in Terminal-Bench samples when lag_sample_terminal "
+                    "reaches this value. Requires partial_rollout."
                 ),
             )
             parser.add_argument(
@@ -715,6 +913,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--terminal-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to Terminal-Bench prompt data (JSONL). Each row contains a prompt "
+                    "and metadata.task_id; the local environment supplies the task instruction."
+                ),
+            )
+            parser.add_argument(
                 "--math-ratio",
                 type=float,
                 default=0.7,
@@ -723,18 +930,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Valid range: [0.0, 1.0]. Default: 0.7 means 70% math and 30% QA."
                 ),
             )
+            parser.add_argument(
+                "--terminal-ratio",
+                type=float,
+                default=0.0,
+                help=(
+                    "Absolute Terminal-Bench fraction in normal mixed dispatch. "
+                    "QA receives 1 - math_ratio - terminal_ratio."
+                ),
+            )
+            parser.add_argument(
+                "--token-load-adaptive-reordering",
+                action="store_true",
+                default=False,
+                help=(
+                    "After each collected rollout batch, compare its full train-sequence token count "
+                    "with the previous 16-batch moving average and reorder the next rollout_batch_size "
+                    "normal mixed prompts: Terminal first above 1.1x, QA first below 0.9x, random "
+                    "otherwise. The first 8 batches stay random."
+                ),
+            )
             parser.add_argument('--batch-alternation', action='store_true', 
                                 help='Enable batch-level alternation mode')
             parser.add_argument('--math-batches-per-cycle', type=int, default=1,
                                 help='Number of math batches per cycle in alternation mode')
             parser.add_argument('--qa-batches-per-cycle', type=int, default=1,
                                 help='Number of QA batches per cycle in alternation mode')
+            parser.add_argument('--terminal-batches-per-cycle', type=int, default=0,
+                                help='Number of Terminal-Bench batches per cycle in alternation mode')
+            parser.add_argument(
+                '--batch-alternation-order',
+                type=int,
+                default=None,
+                choices=range(1, 7),
+                help=(
+                    'Three-domain dispatch order: '
+                    '1=math,qa,terminal; 2=math,terminal,qa; '
+                    '3=qa,math,terminal; 4=qa,terminal,math; '
+                    '5=terminal,math,qa; 6=terminal,qa,math.'
+                ),
+            )
             parser.add_argument(
                 '--batch-alternation-start-task',
                 type=str,
-                default='math',
-                choices=['math', 'qa'],
-                help='Task dispatched first in each fixed batch-alternation cycle.',
+                default=None,
+                choices=['math', 'qa', 'terminal'],
+                help=(
+                    'Deprecated compatibility option for two-domain-style rotation. '
+                    'Use --batch-alternation-order for an explicit three-domain order.'
+                ),
             )
             parser.add_argument('--phase-aware-alternation', action='store_true',
                                 help='Enable phase-aware alternation: prefer QA during training and math after policy update.')
@@ -2007,11 +2251,113 @@ def slime_validate_args(args):
 
     if args.over_sampling_batch_size is None:
         args.over_sampling_batch_size = args.rollout_batch_size
+    if args.adaptive_group_oversampling_min_groups is None:
+        args.adaptive_group_oversampling_min_groups = args.rollout_batch_size
 
     assert args.over_sampling_batch_size >= args.rollout_batch_size, (
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+    if args.adaptive_group_oversampling:
+        if args.over_sampling_batch_size <= args.rollout_batch_size:
+            raise ValueError(
+                "--adaptive-group-oversampling requires --over-sampling-batch-size "
+                "to be greater than --rollout-batch-size"
+            )
+        if not args.use_slime_dashboard:
+            raise ValueError("--adaptive-group-oversampling requires --use-slime-dashboard")
+        if not (
+            0
+            < args.adaptive_group_oversampling_min_groups
+            <= args.rollout_batch_size
+            <= args.over_sampling_batch_size
+        ):
+            raise ValueError(
+                "elastic group window requires 0 < min-groups <= rollout-batch-size "
+                "<= over-sampling-batch-size"
+            )
+        if args.adaptive_group_oversampling_running_threshold <= 0:
+            raise ValueError("--adaptive-group-oversampling-running-threshold must be positive")
+        if args.adaptive_group_oversampling_queue_threshold < 0:
+            raise ValueError("--adaptive-group-oversampling-queue-threshold must be non-negative")
+        if not 0 <= args.adaptive_group_oversampling_expansion_kv_threshold <= 1:
+            raise ValueError(
+                "--adaptive-group-oversampling-expansion-kv-threshold must be in [0, 1]"
+            )
+        if args.adaptive_group_oversampling_window_seconds <= 0:
+            raise ValueError("--adaptive-group-oversampling-window-seconds must be positive")
+        if args.adaptive_group_oversampling_cooldown_seconds <= 0:
+            raise ValueError("--adaptive-group-oversampling-cooldown-seconds must be positive")
+        if args.adaptive_group_oversampling_post_resume_expansion_grace_seconds < 0:
+            raise ValueError(
+                "--adaptive-group-oversampling-post-resume-expansion-grace-seconds "
+                "must be non-negative"
+            )
+        if args.adaptive_group_oversampling_recovery_seconds <= 0:
+            raise ValueError("--adaptive-group-oversampling-recovery-seconds must be positive")
+        if args.adaptive_group_oversampling_step_groups <= 0:
+            raise ValueError("--adaptive-group-oversampling-step-groups must be positive")
+        if args.adaptive_group_oversampling_pressure_queue_threshold < 0:
+            raise ValueError(
+                "--adaptive-group-oversampling-pressure-queue-threshold must be non-negative"
+            )
+        if not 0 <= args.adaptive_group_oversampling_pressure_kv_threshold <= 1:
+            raise ValueError("--adaptive-group-oversampling-pressure-kv-threshold must be in [0, 1]")
+        if not 0 <= args.adaptive_group_oversampling_hard_max_engine_kv_threshold <= 1:
+            raise ValueError(
+                "--adaptive-group-oversampling-hard-max-engine-kv-threshold must be in [0, 1]"
+            )
+        if args.adaptive_group_oversampling_hard_engine_queue_threshold < 0:
+            raise ValueError(
+                "--adaptive-group-oversampling-hard-engine-queue-threshold must be non-negative"
+            )
+        if not 0 <= args.adaptive_group_oversampling_hard_pressure_kv_threshold <= 1:
+            raise ValueError(
+                "--adaptive-group-oversampling-hard-pressure-kv-threshold must be in [0, 1]"
+            )
+        if args.adaptive_group_oversampling_hard_pressure_seconds <= 0:
+            raise ValueError("--adaptive-group-oversampling-hard-pressure-seconds must be positive")
+        if args.adaptive_group_oversampling_hard_step_groups <= 0:
+            raise ValueError("--adaptive-group-oversampling-hard-step-groups must be positive")
+    if args.gpu_generation_slots is not None and args.gpu_generation_slots <= 0:
+        raise ValueError("--gpu-generation-slots must be positive")
+    if args.terminal_live_session_limit is not None and args.terminal_live_session_limit <= 0:
+        raise ValueError("--terminal-live-session-limit must be positive")
+    if args.terminal_concurrent_resets is not None and args.terminal_concurrent_resets <= 0:
+        raise ValueError("--terminal-concurrent-resets must be positive")
+    if (
+        args.terminal_live_session_limit is not None
+        and args.terminal_concurrent_resets is not None
+        and args.terminal_concurrent_resets > args.terminal_live_session_limit
+    ):
+        raise ValueError("--terminal-concurrent-resets cannot exceed --terminal-live-session-limit")
+    if args.max_inflight_groups is not None and args.max_inflight_groups <= 0:
+        raise ValueError("--max-inflight-groups must be positive")
+    if args.inflight_group_soft_limit is not None:
+        if args.inflight_group_soft_limit <= 0:
+            raise ValueError("--inflight-group-soft-limit must be positive")
+        if args.max_inflight_groups is None:
+            raise ValueError("--inflight-group-soft-limit requires --max-inflight-groups")
+        if args.inflight_group_soft_limit > args.max_inflight_groups:
+            raise ValueError("--inflight-group-soft-limit cannot exceed --max-inflight-groups")
+    if args.math_ratio < 0 or args.terminal_ratio < 0 or args.math_ratio + args.terminal_ratio > 1:
+        raise ValueError(
+            "--math-ratio and --terminal-ratio must be non-negative and sum to at most 1 "
+            f"(got {args.math_ratio} + {args.terminal_ratio})"
+        )
+    alternation_quotas = (
+        args.math_batches_per_cycle,
+        args.qa_batches_per_cycle,
+        args.terminal_batches_per_cycle,
+    )
+    if any(quota < 0 for quota in alternation_quotas):
+        raise ValueError("batch-alternation task batch counts must be non-negative")
+    if args.batch_alternation and sum(alternation_quotas) == 0:
+        raise ValueError("--batch-alternation requires at least one positive task batch count")
+    if args.batch_alternation_order is not None and args.batch_alternation_start_task is not None:
+        raise ValueError(
+            "--batch-alternation-order and --batch-alternation-start-task cannot be set together"
+        )
     train_batch_quotas = (args.train_batch_math_groups, args.train_batch_qa_groups)
     if any(quota is not None for quota in train_batch_quotas):
         if any(quota is None for quota in train_batch_quotas):
