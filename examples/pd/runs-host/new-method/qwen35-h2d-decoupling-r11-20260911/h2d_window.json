@@ -1,0 +1,97 @@
+[
+  {
+    "run": "/tmp/pd-persist/fused-qwen35-9b-tp1-swe500-2p6d-c500-h2d4-decoupled-q32-32-20260911-r11",
+    "window": [
+      1789161143.9214127,
+      1789162343.9214127
+    ],
+    "h2d_completions": 12351,
+    "direct_completions": 2564,
+    "fast_arrival_seen": 3002,
+    "whole_run_command_seconds": {
+      "count": 21365,
+      "minimum": 0.328439902048558,
+      "mean": 1.286585938606325,
+      "p50": 0.8530651819892228,
+      "p90": 1.9286145305261024,
+      "maximum": 604.3885446409695
+    },
+    "whole_run_command_under_1s_fraction": 0.5966768078633279,
+    "window_arrival_command_seconds": {
+      "count": 11843,
+      "minimum": 0.4787038736976683,
+      "mean": 1.5210258611580143,
+      "p50": 1.1734162857756019,
+      "p90": 2.1705088449642065,
+      "maximum": 238.67181284027174
+    },
+    "window_arrival_command_under_1s_fraction": 0.35886177488811954,
+    "eligible_to_first_h2d_log_seconds": {
+      "count": 11942,
+      "minimum": -0.9359414577484131,
+      "mean": 5.484664210760499,
+      "p50": 3.7095746994018555,
+      "p90": 14.490044689178466,
+      "maximum": 30.291165590286255
+    },
+    "unmatched_wait_count": 409,
+    "negative_quantized_wait_count": 2086,
+    "wait_less_than_minus_one_second": 0,
+    "gpu_event_ms": {
+      "count": 12351,
+      "minimum": 3.026,
+      "mean": 51.044305076512025,
+      "p50": 44.853,
+      "p90": 86.673,
+      "maximum": 3143.025
+    },
+    "io_wall_ms": {
+      "count": 12351,
+      "minimum": 13.35,
+      "mean": 157.86752376325805,
+      "p50": 125.524,
+      "p90": 239.808,
+      "maximum": 4325.65
+    },
+    "host_copy_ms": {
+      "count": 12351,
+      "minimum": 0.076,
+      "mean": 5.12351963403773,
+      "p50": 0.345,
+      "p90": 0.796,
+      "maximum": 4172.025
+    },
+    "snapshot_gib": {
+      "count": 12351,
+      "minimum": 0.0616455078125,
+      "mean": 0.4675118723781222,
+      "p50": 0.4366455078125,
+      "p90": 0.7510986328125,
+      "maximum": 1.6280517578125
+    },
+    "completed_bytes_per_window_gib_s": 4.811865946451823,
+    "gpu_event_gib_s": {
+      "count": 12351,
+      "minimum": 0.229,
+      "mean": 9.983160310906,
+      "p50": 9.946,
+      "p90": 13.293,
+      "maximum": 21.014
+    },
+    "controls": {
+      "prefill-0.log": {
+        "samples": 40,
+        "reserved_lanes_sample_mean": 1.075,
+        "lane_full_sample_fraction": 0.2,
+        "host_ready_sample_mean": 68.575
+      },
+      "prefill-1.log": {
+        "samples": 40,
+        "reserved_lanes_sample_mean": 1.075,
+        "lane_full_sample_fraction": 0.175,
+        "host_ready_sample_mean": 64.85
+      }
+    },
+    "note": "TP=1 only. Wait has <1s downward timestamp quantization; control stats are ~30s snapshots, not continuous DMA occupancy. Throughput counts whole snapshots finishing in the window. window_arrival_command statistics cover retained arrival markers only, not all window tools; whole_run_command covers all recorded shell calls."
+  }
+]
