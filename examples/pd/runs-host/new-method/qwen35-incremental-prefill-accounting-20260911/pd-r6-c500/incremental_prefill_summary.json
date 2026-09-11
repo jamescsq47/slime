@@ -1,0 +1,25 @@
+{
+  "run": "/tmp/pd-persist/fused-qwen35-9b-tp1-swe500-2p6d-c500-no-policy-recompute-q32-32-20260911-r6",
+  "requests": 500,
+  "totals": {
+    "turns": 21998,
+    "actual_prefill_tokens": 10525615,
+    "ideal_incremental_tokens": 9849276,
+    "ideal_page64_prefill_tokens": 10525615,
+    "page64_boundary_recompute_tokens": 676339,
+    "excess_over_ideal_page64_tokens": 0,
+    "decode_tokens": 6865869,
+    "cumulative_full_prompt_tokens": 272305711
+  },
+  "per_agent_mean": {
+    "turns": 43.996,
+    "actual_prefill_tokens": 21051.23,
+    "ideal_incremental_tokens": 19698.552,
+    "ideal_page64_prefill_tokens": 21051.23,
+    "page64_boundary_recompute_tokens": 1352.678,
+    "excess_over_ideal_page64_tokens": 0.0,
+    "decode_tokens": 13731.738,
+    "cumulative_full_prompt_tokens": 544611.422
+  },
+  "definition": "Fully retained stable prompt prefix; prior reasoning removed; common page64 counterfactual. Includes visible reply/tool/template suffix; not initial prompt+raw tool text only."
+}

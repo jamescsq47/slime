@@ -1,0 +1,546 @@
+[
+  {
+    "run": "/tmp/pd-persist/fused-qwen35-9b-tp1-swe500-2p6d-c500-no-policy-recompute-q32-32-20260911-r6",
+    "window": [
+      1789140959.5128794,
+      1789142159.5128794
+    ],
+    "metadata_tombstones": 89,
+    "arrivals_from_retained_markers": 11030,
+    "arrivals_from_router_log": 21498,
+    "arrivals_reconstructed_fast": 0,
+    "slow_matched": 11686,
+    "slow_unmatched": 89,
+    "stage_occupancy_two_p_total": {
+      "host_eligible_not_yet_hbm_ready": {
+        "mean": 126.70538370072842,
+        "request_seconds": 152046.4604408741,
+        "nonempty_time_fraction": 0.9905341388781865,
+        "p50": 133,
+        "p90": 218,
+        "maximum": 300,
+        "intersecting_snapshots": 9689
+      },
+      "io_wall_equivalent": {
+        "mean": 0.8963678187131882,
+        "request_seconds": 1075.6413824558258,
+        "intersecting_snapshots": 9722,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "host_wait_next_arrival": {
+        "mean": 18.847586422959964,
+        "request_seconds": 22617.103707551956,
+        "nonempty_time_fraction": 0.9803661014636358,
+        "p50": 6,
+        "p90": 55,
+        "maximum": 279,
+        "intersecting_snapshots": 7795
+      },
+      "arrived_wait_host_durable": {
+        "mean": 0.5155719105402629,
+        "request_seconds": 618.6862926483154,
+        "nonempty_time_fraction": 0.16650206486384073,
+        "p50": 0,
+        "p90": 1,
+        "maximum": 46,
+        "intersecting_snapshots": 1722
+      },
+      "host_eligible_wait_io": {
+        "mean": 125.81230010569095,
+        "request_seconds": 150974.76012682915,
+        "nonempty_time_fraction": 0.9882078069448471,
+        "p50": 132,
+        "p90": 217,
+        "maximum": 300,
+        "intersecting_snapshots": 9663
+      },
+      "eligible_before_materialize": {
+        "mean": 123.64698392232259,
+        "request_seconds": 148376.3807067871,
+        "nonempty_time_fraction": 0.9824089751640955,
+        "p50": 130,
+        "p90": 216,
+        "maximum": 299,
+        "intersecting_snapshots": 9620
+      },
+      "materialized_before_io": {
+        "mean": 2.165316183368365,
+        "request_seconds": 2598.379420042038,
+        "intersecting_snapshots": 2902,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "host_io": {
+        "mean": 0.8930835950374604,
+        "request_seconds": 1071.7003140449524,
+        "intersecting_snapshots": 9689,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "hbm_ready_before_radix_release": {
+        "mean": 0.7659790341059367,
+        "request_seconds": 919.174840927124,
+        "intersecting_snapshots": 912,
+        "subsecond_absolute_timing_not_measured": true
+      }
+    },
+    "eligible_wait_io_mean_timestamp_bounds": [
+      121.81895216325918,
+      129.85673885305724
+    ],
+    "p_metrics": {
+      "http://127.0.0.1:23700": {
+        "forward_fraction": 0.7367075206321467,
+        "sglang_num_queue_reqs": 0.03982359270254771,
+        "sglang_num_prefill_prealloc_queue_reqs": 0,
+        "sglang_num_prefill_inflight_queue_reqs": 4.60811987620283,
+        "sglang_full_token_usage": 0.1276523027257071,
+        "sglang_mamba_usage": 0.11801779514794407
+      },
+      "http://127.0.0.1:23720": {
+        "forward_fraction": 0.7337734630379832,
+        "sglang_num_queue_reqs": 0,
+        "sglang_num_prefill_prealloc_queue_reqs": 0,
+        "sglang_num_prefill_inflight_queue_reqs": 4.213060334835995,
+        "sglang_full_token_usage": 0.12267336046046774,
+        "sglang_mamba_usage": 0.10897788062305745
+      }
+    },
+    "coarse_endpoint_time_backlog_ge1_and_forward_lt95": 0.880626158217589,
+    "active_agents": {
+      "mean": 370.2259110412995,
+      "request_seconds": 444271.0932495594,
+      "nonempty_time_fraction": 1,
+      "p50": 374,
+      "p90": 476,
+      "maximum": 491,
+      "intersecting_snapshots": 491
+    },
+    "tool_full": {
+      "count": 21778,
+      "minimum": 0.2948955628089607,
+      "mean": 1.1497816116068318,
+      "p50": 0.6820238903164864,
+      "p90": 1.412362351361662,
+      "maximum": 600.3854764588177,
+      "p95": 1.8925640942528839,
+      "p99": 4.416472909115242,
+      "bins": [
+        {
+          "lower": 0,
+          "upper": 0.5,
+          "count": 1052,
+          "fraction": 0.048305629534392505
+        },
+        {
+          "lower": 0.5,
+          "upper": 1,
+          "count": 15377,
+          "fraction": 0.7060795298007163
+        },
+        {
+          "lower": 1,
+          "upper": 2,
+          "count": 4412,
+          "fraction": 0.20258976949214805
+        },
+        {
+          "lower": 2,
+          "upper": 5,
+          "count": 762,
+          "fraction": 0.0349894388832767
+        },
+        {
+          "lower": 5,
+          "upper": 10,
+          "count": 111,
+          "fraction": 0.005096886766461567
+        },
+        {
+          "lower": 10,
+          "upper": 60,
+          "count": 45,
+          "fraction": 0.0020663054458627973
+        },
+        {
+          "lower": 60,
+          "upper": 300,
+          "count": 12,
+          "fraction": 0.0005510147855634127
+        },
+        {
+          "lower": 300,
+          "upper": null,
+          "count": 7,
+          "fraction": 0.00032142529157865734
+        }
+      ],
+      "sum_seconds": 25039.943937573582
+    },
+    "tool_d_completion_window_cohort": {
+      "count": 15174,
+      "minimum": 0.3138156058266759,
+      "mean": 1.182883643728173,
+      "p50": 0.7637708433903754,
+      "p90": 1.4320822175126524,
+      "maximum": 600.3854764588177,
+      "p95": 1.8409414506750168,
+      "p99": 4.131750722397138,
+      "bins": [
+        {
+          "lower": 0,
+          "upper": 0.5,
+          "count": 353,
+          "fraction": 0.023263477000131805
+        },
+        {
+          "lower": 0.5,
+          "upper": 1,
+          "count": 10460,
+          "fraction": 0.6893370238565968
+        },
+        {
+          "lower": 1,
+          "upper": 2,
+          "count": 3742,
+          "fraction": 0.24660603664162384
+        },
+        {
+          "lower": 2,
+          "upper": 5,
+          "count": 501,
+          "fraction": 0.03301700276789245
+        },
+        {
+          "lower": 5,
+          "upper": 10,
+          "count": 71,
+          "fraction": 0.004679056280479768
+        },
+        {
+          "lower": 10,
+          "upper": 60,
+          "count": 34,
+          "fraction": 0.0022406748385396073
+        },
+        {
+          "lower": 60,
+          "upper": 300,
+          "count": 8,
+          "fraction": 0.0005272176090681429
+        },
+        {
+          "lower": 300,
+          "upper": null,
+          "count": 5,
+          "fraction": 0.0003295110056675893
+        }
+      ],
+      "sum_seconds": 17949.076409931295
+    },
+    "tool_bracketed_count": 21583,
+    "tool_unbracketed_count": 195,
+    "tool_duration_bracket_violations": [],
+    "tool_concurrency_bracketed_lower": 14.397210499971019,
+    "tool_concurrency_bracketed_upper": 14.405784822954642,
+    "tool_concurrency_all_conservative_upper": 14.512010214433928,
+    "model_end_to_next_arrival_or_final": {
+      "mean": 32.19681694110235,
+      "request_seconds": 38636.180329322815,
+      "nonempty_time_fraction": 1,
+      "p50": 19,
+      "p90": 71,
+      "maximum": 291,
+      "intersecting_snapshots": 15092
+    },
+    "notes": [
+      "All occupancy counts are system totals, not per-P averages.",
+      "Host wait-next-arrival includes tool and application/HTTP gap, not exact tool execution.",
+      "Host and load timestamp buckets have 1s precision; I/O duration uses wall_ms.",
+      "Short sub-second stage counts are coarse estimates; their instantaneous maxima can be artifacts of rounded log times.",
+      "Only complete matched lifetimes enter stage occupancy; unmatched are excluded.",
+      "Tool window cohort uses preceding D manifest creation, not exact shell start.",
+      "Tool concurrency bounds cover matched brackets only, and require duration<=bracket.",
+      "Coarse backlog/Forward coexistence is not causal idle-time attribution."
+    ]
+  },
+  {
+    "run": "/tmp/pd-persist/fused-qwen35-9b-tp1-swe500-2p6d-c500-h2d4-q32-32-20260911-r9",
+    "window": [
+      1789150333.905525,
+      1789151533.905525
+    ],
+    "metadata_tombstones": 110,
+    "arrivals_from_retained_markers": 13841,
+    "arrivals_from_router_log": 21671,
+    "arrivals_reconstructed_fast": 0,
+    "slow_matched": 14428,
+    "slow_unmatched": 0,
+    "stage_occupancy_two_p_total": {
+      "host_eligible_not_yet_hbm_ready": {
+        "mean": 92.74775305012862,
+        "request_seconds": 111297.30366015434,
+        "nonempty_time_fraction": 0.9506956644852956,
+        "p50": 81,
+        "p90": 206,
+        "maximum": 298,
+        "intersecting_snapshots": 11684
+      },
+      "io_wall_equivalent": {
+        "mean": 1.527214356660843,
+        "request_seconds": 1832.6572279930115,
+        "intersecting_snapshots": 11917,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "host_wait_next_arrival": {
+        "mean": 53.109080957770345,
+        "request_seconds": 63730.89714932442,
+        "nonempty_time_fraction": 0.9861770341793696,
+        "p50": 21,
+        "p90": 165,
+        "maximum": 289,
+        "intersecting_snapshots": 10542
+      },
+      "arrived_wait_host_durable": {
+        "mean": 0.5776724561055502,
+        "request_seconds": 693.2069473266602,
+        "nonempty_time_fraction": 0.16000736713409425,
+        "p50": 0,
+        "p90": 1,
+        "maximum": 34,
+        "intersecting_snapshots": 1159
+      },
+      "host_eligible_wait_io": {
+        "mean": 91.24041304687658,
+        "request_seconds": 109488.49565625191,
+        "nonempty_time_fraction": 0.9410577082633972,
+        "p50": 79,
+        "p90": 205,
+        "maximum": 296,
+        "intersecting_snapshots": 11555
+      },
+      "eligible_before_materialize": {
+        "mean": 87.39253767629465,
+        "request_seconds": 104871.04521155357,
+        "nonempty_time_fraction": 0.9118966372807821,
+        "p50": 74,
+        "p90": 200,
+        "maximum": 292,
+        "intersecting_snapshots": 11329
+      },
+      "materialized_before_io": {
+        "mean": 3.847875370581945,
+        "request_seconds": 4617.450444698334,
+        "intersecting_snapshots": 5289,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "host_io": {
+        "mean": 1.5073400032520294,
+        "request_seconds": 1808.8080039024353,
+        "intersecting_snapshots": 11683,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "hbm_ready_before_radix_release": {
+        "mean": 1.5285194740692774,
+        "request_seconds": 1834.223368883133,
+        "intersecting_snapshots": 1775,
+        "subsecond_absolute_timing_not_measured": true
+      },
+      "host_wait_final_marker": {
+        "mean": 0.202210307319959,
+        "request_seconds": 242.6523687839508,
+        "nonempty_time_fraction": 0.17441051065921784,
+        "p50": 0,
+        "p90": 1,
+        "maximum": 3,
+        "intersecting_snapshots": 65
+      },
+      "final_marker_before_host_release": {
+        "mean": 0.17897271037101745,
+        "request_seconds": 214.76725244522095,
+        "nonempty_time_fraction": 0.1581635562578837,
+        "p50": 0,
+        "p90": 1,
+        "maximum": 2,
+        "intersecting_snapshots": 80
+      }
+    },
+    "eligible_wait_io_mean_timestamp_bounds": [
+      86.57660510142644,
+      96.15767846385639
+    ],
+    "p_metrics": {
+      "http://127.0.0.1:23700": {
+        "forward_fraction": 0.7230344298570162,
+        "sglang_num_queue_reqs": 0.05032955339422619,
+        "sglang_num_prefill_prealloc_queue_reqs": 0,
+        "sglang_num_prefill_inflight_queue_reqs": 5.832106901612461,
+        "sglang_full_token_usage": 0.1822793848726106,
+        "sglang_mamba_usage": 0.18931322216557828
+      },
+      "http://127.0.0.1:23720": {
+        "forward_fraction": 0.7152940288396817,
+        "sglang_num_queue_reqs": 0.08317211965827992,
+        "sglang_num_prefill_prealloc_queue_reqs": 0,
+        "sglang_num_prefill_inflight_queue_reqs": 5.930029387369981,
+        "sglang_full_token_usage": 0.19126003611037254,
+        "sglang_mamba_usage": 0.19237417727212597
+      }
+    },
+    "coarse_endpoint_time_backlog_ge1_and_forward_lt95": 0.835735747118791,
+    "active_agents": {
+      "mean": 371.69071202953654,
+      "request_seconds": 446028.8544354439,
+      "nonempty_time_fraction": 1,
+      "p50": 378,
+      "p90": 481,
+      "maximum": 491,
+      "intersecting_snapshots": 491
+    },
+    "tool_full": {
+      "count": 21934,
+      "minimum": 0.2722034710459411,
+      "mean": 1.32827915661769,
+      "p50": 0.8181584489066154,
+      "p90": 1.808764501148835,
+      "maximum": 600.2900242977776,
+      "p95": 2.3095649085473267,
+      "p99": 5.1718084469484,
+      "bins": [
+        {
+          "lower": 0,
+          "upper": 0.5,
+          "count": 975,
+          "fraction": 0.04445153642746421
+        },
+        {
+          "lower": 0.5,
+          "upper": 1,
+          "count": 12715,
+          "fraction": 0.579693626333546
+        },
+        {
+          "lower": 1,
+          "upper": 2,
+          "count": 6574,
+          "fraction": 0.2997173338196407
+        },
+        {
+          "lower": 2,
+          "upper": 5,
+          "count": 1437,
+          "fraction": 0.06551472599617032
+        },
+        {
+          "lower": 5,
+          "upper": 10,
+          "count": 162,
+          "fraction": 0.007385793744870976
+        },
+        {
+          "lower": 10,
+          "upper": 60,
+          "count": 44,
+          "fraction": 0.0020060180541624875
+        },
+        {
+          "lower": 60,
+          "upper": 300,
+          "count": 21,
+          "fraction": 0.00095741770766846
+        },
+        {
+          "lower": 300,
+          "upper": null,
+          "count": 6,
+          "fraction": 0.0002735479164767028
+        }
+      ],
+      "sum_seconds": 29134.47502125241
+    },
+    "tool_d_completion_window_cohort": {
+      "count": 15275,
+      "minimum": 0.2948415279388428,
+      "mean": 1.3180450756186939,
+      "p50": 0.9432366415858269,
+      "p90": 1.8434306686744095,
+      "maximum": 600.2688742056489,
+      "p95": 2.2777002749033266,
+      "p99": 5.023504265518859,
+      "bins": [
+        {
+          "lower": 0,
+          "upper": 0.5,
+          "count": 307,
+          "fraction": 0.02009819967266776
+        },
+        {
+          "lower": 0.5,
+          "upper": 1,
+          "count": 8009,
+          "fraction": 0.5243207855973814
+        },
+        {
+          "lower": 1,
+          "upper": 2,
+          "count": 5789,
+          "fraction": 0.3789852700490998
+        },
+        {
+          "lower": 2,
+          "upper": 5,
+          "count": 1014,
+          "fraction": 0.06638297872340425
+        },
+        {
+          "lower": 5,
+          "upper": 10,
+          "count": 102,
+          "fraction": 0.006677577741407529
+        },
+        {
+          "lower": 10,
+          "upper": 60,
+          "count": 39,
+          "fraction": 0.002553191489361702
+        },
+        {
+          "lower": 60,
+          "upper": 300,
+          "count": 14,
+          "fraction": 0.0009165302782324059
+        },
+        {
+          "lower": 300,
+          "upper": null,
+          "count": 1,
+          "fraction": 0.00006546644844517185
+        }
+      ],
+      "sum_seconds": 20133.13853007555
+    },
+    "tool_bracketed_count": 21774,
+    "tool_unbracketed_count": 160,
+    "tool_duration_bracket_violations": [],
+    "tool_concurrency_bracketed_lower": 16.27995707250045,
+    "tool_concurrency_bracketed_upper": 16.28886998795167,
+    "tool_concurrency_all_conservative_upper": 16.375719075996894,
+    "model_end_to_next_arrival_or_final": {
+      "mean": 67.13953574577967,
+      "request_seconds": 80567.44289493561,
+      "nonempty_time_fraction": 1,
+      "p50": 34,
+      "p90": 183,
+      "maximum": 317,
+      "intersecting_snapshots": 15227
+    },
+    "notes": [
+      "All occupancy counts are system totals, not per-P averages.",
+      "Host wait-next-arrival includes tool and application/HTTP gap, not exact tool execution.",
+      "Host and load timestamp buckets have 1s precision; I/O duration uses wall_ms.",
+      "Short sub-second stage counts are coarse estimates; their instantaneous maxima can be artifacts of rounded log times.",
+      "Only complete matched lifetimes enter stage occupancy; unmatched are excluded.",
+      "Tool window cohort uses preceding D manifest creation, not exact shell start.",
+      "Tool concurrency bounds cover matched brackets only, and require duration<=bracket.",
+      "Coarse backlog/Forward coexistence is not causal idle-time attribution."
+    ]
+  }
+]
