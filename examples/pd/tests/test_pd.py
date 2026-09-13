@@ -132,6 +132,30 @@ def test_dynamic_scheduler_cold_start_is_deterministically_balanced():
     assert "mmmm" not in "".join("m" if choice == "math" else "q" for choice in choices)
 
 
+def test_parse_engine_metrics_keeps_native_forward_timers_and_hybrid_pools():
+    text = '''
+# TYPE sglang:forward_execution_seconds_total counter
+sglang:forward_execution_seconds_total{category="extend",tp_rank="0"} 1.25
+sglang:forward_execution_seconds_total{category="decode",tp_rank="0"} 3.5
+# TYPE sglang:gpu_execution_seconds_total counter
+sglang:gpu_execution_seconds_total{category="forward_decode"} 2.0
+# TYPE sglang:full_token_usage gauge
+sglang:full_token_usage 0.2
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 0.4
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 10
+'''
+    assert _parse_engine_metrics(text) == {
+        "sglang_forward_execution_seconds_total|category=extend": 1.25,
+        "sglang_forward_execution_seconds_total|category=decode": 3.5,
+        "sglang_gpu_execution_seconds_total|category=forward_decode": 2.0,
+        "sglang_full_token_usage": 0.2,
+        "sglang_mamba_usage": 0.4,
+        "sglang_mamba_used_tokens": 10.0,
+    }
+
+
 def test_parse_engine_metrics_and_summary_throughput():
     text = """
 # TYPE sglang:prompt_tokens_total counter

@@ -37,8 +37,10 @@ environment:
 
   # Agentic KV data-plane settings under test.
   D_TARGET_KV_FRACTION: 1.0
-  FAST_TOOL_THRESHOLD_SECONDS: 2
-  DIRECT_WAIT_SECONDS: 2
+  # Trial on restored 4888 baseline: claimed fast Direct failures also recompute.
+  FAST_TOOL_THRESHOLD_SECONDS: 1
+  DIRECT_WAIT_SECONDS: 1
+  SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE: true
   D2P_HOST_ARENA_GIB_PER_P: 128
   P2D_HOST_ARENA_GIB_PER_P: 32
   P2D_HOST_STAGING: true

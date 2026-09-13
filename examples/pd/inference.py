@@ -37,6 +37,16 @@ GAUGES = {
     "sglang_num_queue_reqs",
     "sglang_num_used_tokens",
     "sglang_token_usage",
+    # Hybrid models expose attention KV and Mamba state as distinct pools.
+    "sglang_full_token_usage",
+    "sglang_mamba_usage",
+    "sglang_mamba_used_tokens",
+    "sglang_mamba_available_tokens",
+    "sglang_mamba_evictable_tokens",
+    "sglang_kv_used_tokens",
+    "sglang_kv_available_tokens",
+    "sglang_kv_evictable_tokens",
+    "sglang_fwd_occupancy",
     "sglang_max_total_num_tokens",
     "sglang_cache_hit_rate",
     "sglang_gen_throughput",
@@ -286,7 +296,13 @@ def _parse_engine_metrics(text: str) -> dict[str, float]:
                 if mode:
                     key = f"{name}|mode={mode}"
                     values[key] = values.get(key, 0.0) + float(sample.value)
-            if name == "sglang_gpu_execution_seconds_total":
+            if name in {
+                "sglang_gpu_execution_seconds_total",
+                "sglang_forward_execution_seconds_total",
+            }:
+                # Keep native names/categories: newer SGLang reports
+                # extend/decode rather than forward_extend/forward_decode.
+                # Do not alias and accidentally count both exports twice.
                 category = sample.labels.get("category")
                 if category:
                     key = f"{name}|category={category}"

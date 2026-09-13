@@ -1,208 +1,148 @@
 # BrowseComp + Qwen3-8B
 
+固定 source-order n680 循环，temperature=0，8卡、TP=1，300秒业务预热 + 1200秒正式测量。
+显存按物理GPU对齐：普通卡0.80，GPU7（搜索服务）0.60；PD为4P:4D，P=0/2/4/6，D=1/3/5/7。
+
+
+## 当前完整新方案
+
+2026-09-09起采用 **快慢路径＋全局Slow恢复拥堵反馈重算**，对应c512实测 **5,148.4 token/s**。
+c384/c576均已用当前完整方法重新完成。
+
+- 工具超过1秒未返回：Slow；工具1秒内返回：尝试Direct，建链deadline为1秒。
+- 快工具Direct失败：恢复队列不拥堵时转Slow；拥堵时显式完整重算。
+- 全局Q只计工具已返回、Host durable、尚未被H2D worker接手的唯一parent generation；跨P不重复，等待工具不计入。
+- 每秒采样，连续两次Q≥32进入拥堵，Q≤8退出；信号超过3秒陈旧或无效时保守Slow。
+- 只决定新发生的Direct失败出口，不取消已在Host中的请求，不抢占在途KV；DMA fence、workset和TP规则不变。
+- Q是等待worker接手的代理指标，不是实际DMA等待队列；32/8是已测参数，不宣称最优。
+
+新方案复现须设置 `SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE=true`、`SLOW_CONGESTION_HIGH=32`、
+`SLOW_CONGESTION_LOW=8`（后两项完整前缀同为`SGLANG_AGENTIC_KV_`）。
+原生HiCache/Mooncake关闭；D→P Host=128 GiB/P、P→D Host=32 GiB/P、H2D=2 lanes/P，
+D接收目标1.0，P→D grace=0.5秒；全部Host预注册完成后才开始业务预热。
+No-reverse、Colocated及原生Mooncake基线保留已经完成的配置对齐结果。
+
 ## 实验矩阵
 
-除非单独说明，正式结果要求使用固定 source-order BrowseComp workload、
-temperature 0、8 张 GPU、300 秒预热和 1,200 秒测量。Decode 为所有 Decode
-计算资源的墙钟总吞吐。
-
-> **显存比例校正（2026-09-07）：** colocated 使用普通 GPU `0.80`、承载搜索
-> 服务的 GPU 7 使用 `0.60`；下列既有 PD 运行虽然 D 已使用
-> `0.80/0.80/0.80/0.60`，但 P 使用了 `0.85`。这些 PD 数字仅保留为历史诊断值，
-> 均需以 P `0.80` 重跑后才能用于最终横向比较。Colocated 结果不受影响。
-
-> **新方法语义校正（2026-09-08）：** “当前新方法”现在专指“工具超过1秒走
-> Slow；工具1秒内返回则尝试Direct；Direct在1秒内未建立时完整重算”。此前
-> “Direct失败→Slow”的快慢路径结果均为旧方案，除下面新增的c512对齐结果外，
-> 均需按新语义重跑。
+2026-09-10额外c576消融：已回退统一NUMA池到SGLang `921fbd46ab6d`，
+只关闭P→D Host、保留late binding和D→P全部路径，正式300+1200秒为
+**4965.7 token/s**，较旧独立Host完整方法4822.5提高2.97%。本轮2874 Agent完成、0失败，
+D Forward 99.43%、P Forward 93.87%、D running/卡47.54、D KV/卡69.0%。
+不据此替换完整方案默认设置；单轮差异及3个预算终止Host副本残留见
+[本轮完整报告](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/current-method-p2d-direct-only-20260910-r1/RESULTS.md)。
 
 | 方法 | 配置 | 状态 | Decode |
 |---|---|---|---:|
 | Colocated baseline | 8卡，c384 | 完成 | 4,834 token/s |
 | Colocated baseline | 8卡，c512 | 完成 | 4,434 token/s |
 | Colocated baseline | 8卡，c576 | 完成 | 4,349 token/s |
-| 旧版快慢路径 | 4P:4D，c384 | 需重跑（历史 P=0.85，且不是当前新方法） | 4,700 token/s |
-| 旧版快慢路径 | 4P:4D，c512 | 需重跑（历史 P=0.85，且不是当前新方法） | 4,638 token/s |
-| 旧版快慢路径 | 4P:4D，c576，Host短snapshot优先驱逐 | 需重跑（历史 P=0.85，且不是当前新方法） | 4,017 token/s |
-| **当前新方法（快慢路径+重算）** | **4P:4D，c512** | **完成（对齐显存）** | **4,888 token/s** |
-| No-reverse PD | 4P:4D，c384 | 需重跑（历史 P=0.85） | 2,013 token/s |
-| No-reverse PD | 4P:4D，c512 | 需重跑（历史 P=0.85） | 2,071 token/s |
-| No-reverse PD | 4P:4D，c576 | 需重跑（历史 P=0.85） | 2,179 token/s |
-| 原生 Mooncake | 4P:4D，c384 | 需重跑（历史 P=0.85） | 1,076 token/s |
-| 原生 Mooncake | 4P:4D，c512 | 需重跑（历史 P=0.85） | 1,352 token/s |
-| 原生 Mooncake | 4P:4D，c576 | 需重跑（历史 P=0.85） | 1,460 token/s |
+| 当前新方法（Slow拥堵反馈重算） | 4P:4D，c384 | 完成 | 4,737.0 token/s |
+| 当前新方法（Slow拥堵反馈重算） | 4P:4D，c512 | 完成 | 5,148.4 token/s |
+| 当前新方法（Slow拥堵反馈重算） | 4P:4D，c576 | 完成 | 4,822.5 token/s |
+| No-reverse PD | 4P:4D，c384 | 完成 | 1,982 token/s |
+| No-reverse PD | 4P:4D，c512 | 完成 | 1,984 token/s |
+| No-reverse PD | 4P:4D，c576 | 完成 | 2,153 token/s |
+| 原生 Mooncake | 4P:4D，c384 | 完成 | 1,193 token/s |
+| 原生 Mooncake | 4P:4D，c512 | 完成 | 1,320 token/s |
+| 原生 Mooncake | 4P:4D，c576 | 完成（显式本地NUMA，见下） | 2,041 token/s |
 
-## 已完成结果明细
+2026-09-10补齐原生Mooncake c576：使用未修改的`pd_baseline`引擎，300.54秒业务预热＋1200.00秒正式测量。
+本轮在独立启动脚本中显式按物理GPU绑定本地NUMA，并把scheduler watchdog从300秒延长到1200秒；
+旧c384/c512启动日志为全部TP1 worker自动绑定NUMA0。因此缓存容量、模型和数据参数对齐，
+但CPU/NUMA放置并不完全一致，不能把c576相对旧行的吞吐差异仅归因为并发变化。
+未修改共享启动脚本、harness、`pd_baseline`源码或另一个agent的自定义引擎。
 
-除加粗的当前新方法 c512 外，以下 PD 明细均是 P `0.85` 的历史测量，待以
-P `0.80` 和当前“快慢路径+重算”语义重跑后替换；不要用旧行与 colocated
-计算最终收益。
+## 正式窗口吞吐与数据特性
 
-| 方法 | 并发 | Agent/s | Prefill compute | Decode/Agent | 实际 Prefill/Agent | Parent KV复用 |
+| 方法 | 并发 | Agent/s | Prefill token/s | Decode/Agent tokens | 实际Prefill/Agent tokens | Parent KV复用 |
 |---|---:|---:|---:|---:|---:|---:|
-| Colocated baseline | 384 | 2.392 | 38,149 token/s | 2,014 tokens | 15,893 tokens | 91.74% |
-| Colocated baseline | 512 | 2.181 | 46,523 token/s | 2,031 tokens | 21,308 tokens | 74.11% |
-| Colocated baseline | 576 | 2.160 | 47,552 token/s | 2,008 tokens | 21,957 tokens | 74.31% |
-| 旧版快慢路径 4P:4D | 384 | 2.352 | 32,669 token/s | 1,993 tokens | 13,856 tokens | 99.98% |
-| 旧版快慢路径 4P:4D | 512 | 2.320 | 32,889 token/s | 1,996 tokens | 14,154 tokens | 99.26% |
-| 旧版快慢路径 4P:4D + Host驱逐 | 576 | 2.062 | 32,315 token/s | 1,943 tokens | 15,631 tokens | 96.32% |
-| **当前新方法（快慢路径+重算）4P:4D** | **512** | **2.275** | **38,232 token/s** | **2,147 tokens** | **16,790 tokens** | **93.44%** |
-| No-reverse PD 4P:4D | 384 | 0.989 | 42,857 token/s | 2,030 tokens | 43,224 tokens | 0.00% |
-| No-reverse PD 4P:4D | 512 | 1.014 | 42,801 token/s | 2,039 tokens | 42,138 tokens | 0.00% |
-| No-reverse PD 4P:4D | 576 | 1.049 | 43,228 token/s | 2,070 tokens | 41,066 tokens | 0.00% |
-| 原生 Mooncake 4P:4D | 384 | 0.525 | 21,567 token/s | 2,048 tokens | 41,049 tokens | 21.39% |
-| 原生 Mooncake 4P:4D | 512 | 0.627 | 21,849 token/s | 2,152 tokens | 34,784 tokens | 21.02% |
-| 原生 Mooncake 4P:4D | 576 | 0.693 | 22,226 token/s | 2,104 tokens | 32,039 tokens | 19.49% |
+| Colocated baseline | 384 | 2.392 | 38,149 | 2,014 | 15,893 | 91.74% |
+| Colocated baseline | 512 | 2.181 | 46,523 | 2,031 | 21,308 | 74.11% |
+| Colocated baseline | 576 | 2.160 | 47,552 | 2,008 | 21,957 | 74.31% |
+| 当前新方法（Slow拥堵反馈重算） | 384 | 2.333 | 34,486 | 2,029 | 14,769 | 97.48% |
+| 当前新方法（Slow拥堵反馈重算） | 512 | 2.387 | 35,195 | 2,153 | 14,719 | 96.30% |
+| 当前新方法（Slow拥堵反馈重算） | 576 | 2.334 | 35,472 | 2,062 | 15,165 | 95.86% |
+| No-reverse PD | 384 | 0.978 | 42,976 | 2,022 | 43,846 | 0.00% |
+| No-reverse PD | 512 | 0.966 | 42,803 | 2,051 | 44,251 | 0.00% |
+| No-reverse PD | 576 | 1.019 | 42,680 | 2,106 | 41,753 | 0.00% |
+| 原生 Mooncake | 384 | 0.582 | 21,509 | 2,043 | 36,823 | 23.26% |
+| 原生 Mooncake | 512 | 0.619 | 21,409 | 2,130 | 34,550 | 19.54% |
+| 原生 Mooncake（本地NUMA） | 576 | 0.993 | 37,850 | 2,052 | 38,054 | 15.13% |
 
-## D→P 快慢路径比例
+Parent复用按完成轨迹的完整page-aligned父前缀统计；新方法显式重算会降低该比例。Prefill/Agent与Decode/Agent为窗口总计算量除以完成Agent数。
 
-旧版三行按正式 1,200 秒窗口内完成路径的唯一 request-generation snapshot
-统计；当前新方法 c512 的新分析器计数覆盖预热和正式窗口整轮，绝对次数不能与
-旧行直接相比，路径比例仅使用已得到明确结果的 snapshot。TP rank 不重复计数。
-其他方法不使用当前新方法的自定义 D→P Direct/Shared-Arena 状态机，因此不适用。
+## 稳态资源
 
-| 方法 | 配置 | Direct | Slow | 重算 | 路径比例 |
-|---|---|---:|---:|---:|---|
-| 旧版快慢路径 | 4P:4D，c384 | 4,781 | 2,458 | 0 | 66.05% / 33.95% / 0% |
-| 旧版快慢路径 | 4P:4D，c512 | 4,753 | 2,340 | 0 | 67.01% / 32.99% / 0% |
-| 旧版快慢路径 + Host驱逐 | 4P:4D，c576 | 4,986 | 1,345 | 0 | 78.76% / 21.24% / 0% |
-| **当前新方法（快慢路径+重算）** | **4P:4D，c512** | **8,207** | **427** | **637** | **88.5% / 4.6% / 6.9%** |
-| Colocated / No-reverse / 原生 Mooncake | — | — | — | — | 不适用 |
+资源为正式窗口各引擎采样均值；Forward为每物理卡平均。Colocated的KV池由P/D共享。
 
-## 稳态资源明细
+| 方法 | P Forward/卡 | P KV/引擎 | P queue | P inflight | D Forward/卡 | D KV/引擎 | D running | D queue | D prealloc | D transfer |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Colocated c384 | 51.1% | — | — | — | 48.8% | 67.6% | 46.3 | 0.8 | — | — |
+| Colocated c512 | 60.4% | — | — | — | 39.6% | 84.1% | 59.9 | 3.1 | — | — |
+| Colocated c576 | 62.0% | — | — | — | 37.9% | 84.6% | 66.1 | 4.8 | — | — |
+| 新方法 c384 | 90.04% | 67.08% | 25.56 | 8.70 | 98.46% | 79.32% | 50.33 | 0.00 | 1.43 | 0.24 |
+| 新方法 c512 | 88.99% | 55.01% | 55.76 | 9.37 | 99.07% | 74.91% | 52.48 | 0.00 | 1.65 | 0.20 |
+| 新方法 c576 | 90.57% | 57.27% | 75.10 | 8.41 | 99.11% | 76.87% | 49.67 | 0.00 | 1.57 | 0.21 |
+| No-reverse PD c384 | 99.41% | 7.96% | 17.62 | 0.72 | 98.28% | 92.27% | 7.61 | 0.00 | 68.27 | 20.02 |
+| No-reverse PD c512 | 99.20% | 7.92% | 16.84 | 0.72 | 98.59% | 92.01% | 8.63 | 0.00 | 100.05 | 19.25 |
+| No-reverse PD c576 | 98.42% | 7.84% | 17.37 | 0.74 | 99.15% | 91.99% | 8.72 | 0.00 | 115.40 | 19.80 |
+| 原生 Mooncake c384 | 84.22% | 8.78% | 18.37 | 1.16 | 92.23% | 92.31% | 5.16 | 0.00 | 69.86 | 20.93 |
+| 原生 Mooncake c512 | 82.85% | 8.33% | 19.75 | 1.12 | 92.67% | 92.18% | 5.83 | 0.00 | 100.08 | 22.31 |
+| 原生 Mooncake c576（本地NUMA） | 97.26% | 9.15% | 17.52 | 1.02 | 99.03% | 91.94% | 8.21 | 0.00 | 115.33 | 20.33 |
 
-下表均为 1,200 秒正式测量窗口平均值。Forward 按物理 GPU 统计；KV、running、
-queue 和 inflight/transfer 按 SGLang 逻辑引擎统计。Colocated 的 P/D 共享同一
-KV pool，因此只在 D KV/running/queue 栏记录整体引擎状态。
+原生Mooncake c576正式窗口结束1192个Agent：486正常完成、706按原配置截断（422单轮长度、284预算），
+无`aborted`、无记录的请求/搜索后端错误；共3834次模型调用，平均3.216轮。
+396条一轮轨迹中381条为单轮长度终止、15条正常结束，不是此前搜索失败导致的全部一轮退出。
+Agent/s沿用本表“无请求错误的结束Agent（含截断）/正式时间”口径，不等于正确率或完整解题率。
+Mooncake正式窗口平均占用80.38%、峰值84.90%；全程累计成功驱逐46次、分配失败0。
 
-| 方法 | P Forward/卡 | P KV/引擎 | P queue/引擎 | P inflight/引擎 | D Forward/卡 | D KV/引擎 | D running/引擎 | D queue/引擎 | D transfer/引擎 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Colocated c384 | 51.1% | — | — | — | 48.8% | 67.6% | 46.3 | 0.8 | — |
-| Colocated c512 | 60.4% | — | — | — | 39.6% | 84.1% | 59.9 | 3.1 | — |
-| Colocated c576 | 62.0% | — | — | — | 37.9% | 84.6% | 66.1 | 4.8 | — |
-| 旧版快慢路径 4P:4D c384 | 87.0% | 90.6% | 8.7 | 12.4 | 97.6% | 86.4% | 52.8 | 0.0 | 0.3 |
-| 旧版快慢路径 4P:4D c512 | 86.8% | 85.1% | 25.8 | 12.5 | 97.9% | 85.0% | 50.6 | 0.0 | 0.3 |
-| 旧版快慢路径 + Host驱逐 c576 | 84.6% | 70.1% | 61.7 | 12.8 | 97.4% | 71.1% | 36.6 | 0.0 | 0.4 |
-| **当前新方法（快慢路径+重算）c512** | **97.04%** | **50.60%** | **65.37** | **6.38** | **99.62%** | **70.49%** | **48.44** | **0.0** | **0.20** |
-| No-reverse 4P:4D c384 | 99.7% | 7.5% | 18.9 | 0.7 | 99.1% | 92.2% | 7.7 | 0.0 | 21.3 |
-| No-reverse 4P:4D c512 | 99.0% | 7.4% | 19.2 | 0.8 | 98.7% | 92.3% | 8.2 | 0.0 | 21.6 |
-| No-reverse 4P:4D c576 | 99.4% | 7.3% | 19.1 | 0.7 | 99.1% | 92.2% | 9.0 | 0.0 | 21.6 |
-| 原生 Mooncake 4P:4D c384 | 84.7% | 8.0% | 20.1 | 1.1 | 89.1% | 92.6% | 4.7 | 0.0 | 22.5 |
-| 原生 Mooncake 4P:4D c512 | 83.8% | 7.7% | 21.3 | 1.1 | 92.2% | 92.4% | 6.4 | 0.0 | 23.9 |
-| 原生 Mooncake 4P:4D c576 | 83.4% | 7.5% | 21.0 | 1.1 | 93.3% | 92.2% | 7.1 | 0.0 | 23.6 |
+## 新方法路径计数
 
-## Slow 路径在 D HBM 中的额外驻留
+统一为正式1200秒，按唯一snapshot去重；不是含预热的整轮计数，也不是Agent比例。
 
-这里仅统计最终转入 D→P Slow 的 snapshot。从 Decode 结束发布 Direct offer
-开始，到该 snapshot 完成 D2H、D 释放父 KV 为止，对 page-aligned token 数做
-时间积分。平均占用包括 Direct/工具阈值等待和完整 D2H wall time；不包含最终走
-Direct 的 snapshot。Qwen3-8B TP=1 的 KV 为 144 KiB/token。
+| 并发 | Direct完成 | Slow | 显式重算 | Direct / Slow / 重算 | D→P Host写入 / 恢复 | P→D Host写入 / 恢复 |
+|---|---:|---:|---:|---|---|---|
+| c384 | 5,582 | 1,503 | 136 | 77.30% / 20.81% / 1.88% | 1,503 / 1,500 | 4,349 / 4,364 |
+| c512 | 5,785 | 1,126 | 244 | 80.85% / 15.74% / 3.41% | 1,126 / 1,095 | 3,090 / 3,013 |
+| c576 | 5,639 | 1,070 | 306 | 80.39% / 15.25% / 4.36% | 1,070 / 1,064 | 3,845 / 3,808 |
 
-| 配置 | Slow完成数 | 平均转Slow等待 | 平均D2H wall | Slow额外占用（4D合计） | 平均每D | 峰值（4D合计） | 占D KV池 | 占实际D KV使用 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 旧版快慢路径 c384 | 2,458 | 2.244 s | 0.418 s | 13.39 GiB | 3.35 GiB | 48.23 GiB | 7.66% | 8.85% |
-| 旧版快慢路径 c512 | 2,340 | 2.293 s | 0.383 s | 11.93 GiB | 2.98 GiB | 42.42 GiB | 6.82% | 8.01% |
+正式窗口写入的1126个D→P snapshot中，1095个窗口内恢复、29个窗口后恢复，2个Agent因budget结束无需下一轮。
+1126个均有D HBM释放记录。1次D→P Host释放、4次P→D源P释放跨窗口边界，已核对到释放。
+预算结束后的Host清理及时性仍需核对，不宣称所有生命周期边界已经验收完毕。
+本轮CPU回归446项通过、独立审核GO、正式请求失败0；仅一次正式结果，不代表多seed统计结论。
 
-c384 的平均 13.39 GiB 可进一步拆成：Direct/工具阈值等待 10.83 GiB，D2H
-wall 阶段 2.56 GiB；c512 分别为 9.77 GiB 和 2.16 GiB。因此这两轮的 Slow
-驻留成本约 81% 来自转 Slow 前的等待窗口，而不是 Host DMA 带宽不足。以上均为
-旧版快慢路径数据，需按当前“快慢路径+重算”语义重跑后再用于设计结论。
+## 统一NUMA Host池试验（不替换当前完整方法）
+
+2026-09-10：c576，其他计算/阈值配置不变，Host改为每NUMA288 GiB，两方向各96 GiB
+保底并共享96 GiB。完成300+1200秒；存在1次终止/续轮不一致的Router超时，以下仅为诊断结果。
+
+| 指标 | 原独立Arena c576 | 统一NUMA池 c576 |
+|---|---:|---:|
+| Decode token/s | 4822.5 | 4656.9 |
+| P Forward/卡 | 90.57% | 91.22% |
+| D Forward/卡 | 99.11% | 99.45% |
+| P KV/卡 | 57.27% | 64.34% |
+| D KV/卡 | 76.87% | 82.52% |
+| D running/卡 | 49.67 | 51.19 |
+
+物理池能够填充和排空，P→D确实使用了弹性容量；但吞吐下降3.44%，暂不作为性能升级。
+详见[配置、Host占用、路径计数及异常记录](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/current-method-numa-pool-288g-r1/RESULTS.md)。
+本轮实验服务均已停止。
 
 ## 原始结果
 
+- 新方法 c512：[summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-slow-congestion-1s-20260909-r1/offload_analysis_summary.json)、[原始实验报告](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-slow-congestion-1s-20260909-r1/RESULT.md)。
+- 新方法 c384：[summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/current-method-slow-congestion-1s-20260909-r1/offload_analysis_summary.json)。正式窗口完成2800个Agent、请求失败0；D→P和P→D写入/恢复计数受窗口边界影响，不能直接把差额解释为丢失。
+- 新方法 c576：[summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/current-method-slow-congestion-1s-20260909-r1/offload_analysis_summary.json)。正式窗口完成2801个Agent、请求失败0；同样按窗口内事件独立计数，边界差额不是KV丢失量。
 - Colocated c384: [summary](archive/baseline/formal-browsecomp-source-order-colocated-8gpu-c384-w300-m1200-20260816-r1/offload_analysis_summary.json)
 - Colocated c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/baseline-colocated/offload_analysis_summary.json)
 - Colocated c576: [summary](archive/baseline/formal-browsecomp-source-order-colocated-8gpu-c576-w300-m1200-20260817-r1/offload_analysis_summary.json)
-- 旧版快慢路径 c384: [report](current/h100-a100-integration/browsecomp-qwen3-8b-tp1-4p4d-c384-prewarm-barrier-w300-m1200-r2/RESULTS.md)
-- 旧版快慢路径 c512: [report](current/h100-a100-integration/browsecomp-qwen3-8b-tp1-4p4d-c512-prewarm-barrier-w300-m1200-r2/RESULTS.md)
-- 旧版快慢路径 c576（Host驱逐策略）: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/new-method-agentic-pd-host-evict-shortest-low75-r1/offload_analysis_summary.json)
-- 旧版快慢路径 c576（驱逐前失败现场）: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
-- 当前新方法 c512: [summary](current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260908-r4/fast-direct-fail-recompute-1s/offload_analysis_summary.json)
-- No-reverse c384: [summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/no-reverse-pd-4p4d/offload_analysis_summary.json)
-- No-reverse c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/no-reverse-pd-4p4d/offload_analysis_summary.json)
-- No-reverse c576: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/no-reverse-pd-4p4d/offload_analysis_summary.json)
-- 原生 Mooncake c384（首次预热失败现场）: [run](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/native-mooncake-pd-4p4d-failed-storage-r1/)
-- 原生 Mooncake c384（正式重跑）: [summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/native-mooncake-pd-4p4d/offload_analysis_summary.json)
-- 原生 Mooncake c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/native-mooncake-pd-4p4d/offload_analysis_summary.json)
-- 原生 Mooncake c576: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native-mooncake-pd-4p4d/offload_analysis_summary.json)
+- No-reverse PD c384: [summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/no_reverse-aligned-20260908-r1/offload_analysis_summary.json)
+- No-reverse PD c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/no_reverse-aligned-20260908-r1/offload_analysis_summary.json)
+- No-reverse PD c576: [summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/no_reverse-aligned-20260908-r1/offload_analysis_summary.json)
+- 原生 Mooncake c384: [summary](current/qwen3-8b-tp1-browsecomp-c384-w300-m1200/native_mooncake-aligned-20260908-r1/offload_analysis_summary.json)
+- 原生 Mooncake c512: [summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/native_mooncake-aligned-20260908-r1/offload_analysis_summary.json)
+- 原生 Mooncake c576（2026-09-10有效重试）：[summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native_mooncake-aligned-20260910-r5/offload_analysis_summary.json)、[数据有效性及资源](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native_mooncake-aligned-20260910-r5/data_validity_and_resources.json)、[实验报告及复现配置](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native_mooncake-aligned-20260910-r5/RESULTS.md)。
+- 原生 Mooncake c576历史失败记录保留：第一次业务预热约124秒NIXL断连，见[故障报告](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native_mooncake-aligned-20260909-r1/FAILURE.md)；第二次完整运行但7038条轨迹搜索失败，见[数据正确性报告](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native_mooncake-aligned-20260909-r3/FAILURE.md)；本次r4在业务前因NIXL初始化超过300秒watchdog退出，见[启动故障报告](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/native_mooncake-aligned-20260910-r4/FAILURE.md)。均不纳入正式吞吐。
 
-## 原生 Mooncake c384 预热失败
-
-- source-order n680、temperature 0、4P:4D、c384，与同组正式实验保持一致。
-- 预热约 185 秒时停止；在进入 1,200 秒测量窗口前已经产生 308 个 Decode HTTP 500。
-- 首个故障信号来自 P 侧原生 Mooncake：`BatchGet LEASE_EXPIRED`、
-  `Batch finalization RPC_TIMEOUT`，随后 P0 超过 20 秒无法推进 detokenizer heartbeat 并退出。
-- P 退出使 NIXL 连接断开，四个 D 随后分别记录 182、111、178、55 次
-  `Decode transfer failed`；Router 最终报告所有 Decode circuit unavailable。
-- 故障发生时 Mooncake store 约 153/256 GiB（59.8%），且未触发驱逐，因此不是
-  共享存储容量耗尽，而是原生恢复/存储控制路径阻塞 P 后引发的级联失败。
-- 本轮不产生可比较吞吐结果。
-
-## 原生 Mooncake c512 正式结果补充
-
-- 完整通过 300 秒预热和 1,200 秒测量，测量窗口内 P storage error、D transfer
-  error 和 HTTP 500 均为 0。
-- Mooncake 平均/峰值使用率为 81.29%/85.00%；测量窗口内成功驱逐 46 次、
-  约 1,005.35 GB。
-- D 平均每引擎还有 97.54 个 prealloc 请求、23.93 个 transfer 请求，但只有
-  6.41 个 running 请求；因此 92.39% 的 D KV 占用没有转化成高 Decode 并行度。
-
-## 原生 Mooncake c384 正式重跑
-
-- 重跑完整通过 301 秒预热和 1,200 秒测量，完成 630 个 Agent；全窗口
-  HTTP 500、Mooncake RPC timeout 和 transfer failure 均为 0。首次预热失败
-  因而不是 c384 必现故障。
-- Mooncake 平均/峰值使用率为 80.08%/85.00%，成功驱逐 46 次、约
-  1,005.38 GB，无 allocation failure。
-- D 平均每引擎有 68.93 个 prealloc、22.46 个 transfer，但只有 4.68 个
-  running；92.64% 的 KV 使用率没有形成有效 Decode batch。
-- Parent KV 复用率 21.39%，父 KV 丢失导致额外 Prefill 20,503 tokens/Agent。
-
-## 原生 Mooncake c576 正式结果补充
-
-- 完整通过 301 秒预热和 1,200 秒测量，测量窗口完成 832 个 Agent；P/D 日志中
-  HTTP 500、Mooncake RPC timeout 和 transfer failure 均为 0。
-- Mooncake 平均/峰值使用率为 80.40%/84.90%；成功驱逐 46 次、约
-  1,009.47 GB，无 allocation failure。
-- D 平均每引擎有 113.32 个 prealloc、23.57 个 transfer，但只有 7.07 个
-  running；92.22% 的 D KV 主要被等待状态占据。并发从 512 增至 576 后，
-  Decode 仅从 1,352 增至 1,460 token/s，仍远低于 No-reverse 和当前新方法。
-- 完成集合的 page-aligned Parent KV 复用率仅 19.49%，由父 KV 丢失明确造成的
-  额外 Prefill 为 13,954 tokens/Agent。
-
-## c576 Shared Arena 驱逐结果
-
-- 90% 水位触发，按 snapshot token 数从短到长驱逐；长度相同时优先等待更久者，目标回落至 75%。
-- 共驱逐 355 个 request-generation snapshot、3,473,856 tokens（约 477.1 GiB）。
-- 驱逐 snapshot 长度：中位数 9,856 tokens，P90 16,640 tokens，范围 960–20,544 tokens。
-- Router 500、异步控制错误和 P-ready 600 秒超时均为 0；旧 c576 的容量闭环未复现。
-- 驱逐后完成集合的父 KV page-aligned 复用率为 96.32%，额外重复 Prefill 为 1,356 tokens/Agent。
-- 相比驱逐前失败现场，Decode 从 907 提升到 4,017 token/s；它比旧版快慢路径
-  c512 低 9.45%，比当前“快慢路径+重算”c512 低约 17.82%。该结果说明主动驱逐
-  解决了当时的活性问题，但仍属于需要重跑的旧方案。
-
-## 完成集合数据特性
-
-`实际 Prefill/Agent` 是 GPU 真正执行的 Prefill tokens；`Parent KV 未复用率`
-等于 `1 - Parent KV 复用率`，表示上一轮父 KV 中需要重复计算的 token 比例，
-不能直接解释为实际 Prefill 的同等比例。只有分析器明确记录绝对重算量时，才填入
-`明确额外 Prefill/Agent`，避免用不同完成集合进行不可靠的相减。
-
-| 方法 | 并发 | Decode/Agent | 实际 Prefill/Agent | Parent KV 未复用率 | 明确额外 Prefill/Agent |
-|---|---:|---:|---:|---:|---:|
-| Colocated baseline | 384 | 2,014 tokens | 15,893 tokens | 8.26% | 未单独记录 |
-| Colocated baseline | 512 | 2,031 tokens | 21,308 tokens | 25.89% | 未单独记录 |
-| Colocated baseline | 576 | 2,008 tokens | 21,957 tokens | 25.69% | 未单独记录 |
-| 旧版快慢路径 4P:4D | 384 | 1,993 tokens | 13,856 tokens | 0.02% | 7.3 tokens |
-| 旧版快慢路径 4P:4D | 512 | 1,996 tokens | 14,154 tokens | 0.74% | 未单独记录 |
-| 旧版快慢路径 4P:4D + Host驱逐 | 576 | 1,943 tokens | 15,631 tokens | 3.68% | 1,356 tokens |
-| **当前新方法（快慢路径+重算）4P:4D** | **512** | **2,147 tokens** | **16,790 tokens** | **6.56%** | **2,146 tokens（整轮637次显式Direct失败重算）** |
-| No-reverse PD 4P:4D | 384 | 2,030 tokens | 43,224 tokens | 100.00% | 未单独记录 |
-| No-reverse PD 4P:4D | 512 | 2,039 tokens | 42,138 tokens | 100.00% | 未单独记录 |
-| No-reverse PD 4P:4D | 576 | 2,070 tokens | 41,066 tokens | 100.00% | 未单独记录 |
-| 原生 Mooncake 4P:4D | 384 | 2,048 tokens | 41,049 tokens | 78.61% | 20,503 tokens |
-| 原生 Mooncake 4P:4D | 512 | 2,152 tokens | 34,784 tokens | 78.98% | 15,647 tokens |
-| 原生 Mooncake 4P:4D | 576 | 2,104 tokens | 32,039 tokens | 80.51% | 13,954 tokens |
-
-重构前的 4,660 token/s 和 4,847 token/s 新方法结果只保留在 archive 中用于历史
-回归，不填入当前实验矩阵。
+消融见 [BrowseComp Qwen3-8B消融表](BROWSECOMP_QWEN3_8B_ABLATIONS.md)。

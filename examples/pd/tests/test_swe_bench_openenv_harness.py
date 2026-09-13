@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from data.swe_bench.verifier import RepositoryBaseline, VerifierResult
 from data.swe_bench_openenv.harness import (
     _model_turn,
@@ -76,7 +78,7 @@ def test_openenv_structured_terminal_semantics():
     assert structured_terminal_reason("The requested fix is complete.", []) == "final_answer"
     assert (
         structured_terminal_reason("", [], "Tests pass.\nTASK_COMPLETE<|im_end|>")
-        == "task_complete"
+        == "no_command"
     )
     assert structured_terminal_reason("  <|im_end|>  ", []) == "no_command"
 
@@ -97,7 +99,8 @@ def test_openenv_observation_and_history_are_bounded():
     assert "compacted" in compacted[2]["content"]
 
 
-def test_openenv_chat_completions_uses_official_reasoning_split(monkeypatch):
+@pytest.mark.parametrize("command_contract", ["local_strict", "miles_pr51"])
+def test_openenv_chat_completions_uses_official_reasoning_split(monkeypatch, command_contract):
     captured = {}
 
     class Tokenizer:
@@ -159,9 +162,11 @@ def test_openenv_chat_completions_uses_official_reasoning_split(monkeypatch):
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "task"},
             ],
-            sampling_params={"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+            sampling_params={"temperature": 0.6, "top_p": 0.95, "top_k": 20,
+                             "skip_special_tokens": False, "no_stop_trim": True},
             options={
                 "model_api": "chat_completions",
+                "command_contract": command_contract,
                 "enable_thinking": True,
                 "max_tokens_per_turn": 8192,
             },
@@ -172,6 +177,8 @@ def test_openenv_chat_completions_uses_official_reasoning_split(monkeypatch):
     assert captured["url"].endswith("/v1/chat/completions")
     assert captured["payload"]["input_ids"] == [0, 1]
     assert captured["payload"]["separate_reasoning"] is True
+    assert captured["payload"]["skip_special_tokens"] is (command_contract == "miles_pr51")
+    assert captured["payload"]["no_stop_trim"] is (command_contract != "miles_pr51")
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
     assert reply == "```bash\npwd\n```"
     assert len(output_ids) == 3

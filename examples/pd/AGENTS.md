@@ -1,5 +1,12 @@
 # Agentic PD modification gate
 
+## Canonical working directory
+
+All development, experiment launches and result-document updates on this node
+must use `/homes/siqic/slime`. The former `slime-h100-integration` worktree was
+consolidated into this directory on 2026-09-07 and retired; do not resume work
+in that checkout or recreate a second active integration directory.
+
 Before modifying any file under this directory, read
 `docs/AGENTIC_PD_DESIGN_INVARIANTS.md` completely.
 

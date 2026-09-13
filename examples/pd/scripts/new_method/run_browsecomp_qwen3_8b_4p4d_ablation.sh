@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PD_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-ABLATION="${1:?usage: $0 full-1s|d2p-slow-only-1s|fast-direct-fail-recompute-1s|direct-only-recompute-1s|d2p-direct-only|d2p-slow-only|random-routing|p2d-direct-only}"
+ABLATION="${1:?usage: $0 full-1s|pure-recompute|d2p-slow-only-1s|fast-direct-fail-recompute-1s|direct-only-recompute-1s|d2p-direct-only|d2p-slow-only|random-routing|p2d-direct-only|p2d-prebind-direct-only}"
 BASE_RUN_DIR="${PD_DIR}/runs-host/current/ablations/browsecomp-qwen3-8b-4p4d-c512"
 export PD_ENV_BIN="${PD_ENV_BIN:-/homes/siqic/anaconda3/envs/pd/bin}"
 export SGLANG_OVERLAY_ROOT="${SGLANG_OVERLAY_ROOT:-/homes/siqic/sglang-h100-integration/python}"
@@ -30,11 +30,27 @@ export P2D_HOST_ARENA_GIB_PER_P=32
 export SGLANG_AGENTIC_KV_HOST_STAGING=true
 export SGLANG_AGENTIC_KV_FORCE_SLOW_PATH=false
 export SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE=false
+export SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE=false
 export SGLANG_PD_ABLATION_RANDOM_ROUTING=false
 export SGLANG_PD_ABLATION_RANDOM_SEED=2026
+export SGLANG_PD_ABLATION_P2D_PREBIND=false
 export P2D_HOST_STAGING=true
 
 case "${ABLATION}" in
+  pure-recompute)
+    # Preserve the custom P->D late-binding and Host staging pipeline.  Only
+    # D->P parent reuse is disabled; every later agent turn fully Prefills.
+    export FAST_TOOL_THRESHOLD_SECONDS=1
+    export DIRECT_WAIT_SECONDS=1
+    export SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE=true
+    # Match the adopted full-method c512 environment exactly. These D->P
+    # failure policies are unreachable while reverse reuse is disabled, but
+    # pinning them prevents an accidental multi-variable comparison.
+    export SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE=true
+    export SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE=true
+    export SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH=32
+    export SGLANG_AGENTIC_KV_SLOW_CONGESTION_LOW=8
+    ;;
   full-1s)
     export FAST_TOOL_THRESHOLD_SECONDS=1
     export DIRECT_WAIT_SECONDS=1
@@ -69,6 +85,19 @@ case "${ABLATION}" in
     export SGLANG_PD_ABLATION_RANDOM_SEED=2026
     ;;
   p2d-direct-only)
+    export P2D_HOST_STAGING=false
+    ;;
+  p2d-prebind-direct-only)
+    # Isolate the two P->D features: reserve/fix D before Prefill and do not
+    # stage a completed Prefill snapshot in Host memory.  D->P remains the
+    # current full method because the custom Router and lifecycle stay active.
+    export FAST_TOOL_THRESHOLD_SECONDS=1
+    export DIRECT_WAIT_SECONDS=1
+    export SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE=true
+    export SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE=true
+    export SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH=32
+    export SGLANG_AGENTIC_KV_SLOW_CONGESTION_LOW=8
+    export SGLANG_PD_ABLATION_P2D_PREBIND=true
     export P2D_HOST_STAGING=false
     ;;
   *)

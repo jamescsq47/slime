@@ -6,29 +6,35 @@
 TP=2、300 秒预热和 1,200 秒测量。`2P:6D` 表示一个 TP=2 Prefill 组和三个
 TP=2 Decode 组；`4P:4D` 表示两个 TP=2 Prefill 组和两个 TP=2 Decode 组。
 
-> **新方法语义校正（2026-09-08）：** 当前新方法已改为“工具超过1秒走Slow；
-> 工具1秒内返回时尝试Direct；Direct在1秒内未建立则完整重算”。下列原
-> `1,447 token/s` 结果使用旧“Direct失败→Slow”语义，仅保留作历史诊断，必须
-> 用新方法重跑；其他 colocated、No-reverse 和原生 Mooncake baseline 不受影响。
+> **新方法语义校正（2026-09-10）：** 当前新方法为“工具超过1秒走Slow；
+> 工具1秒内返回时尝试Direct；Direct失败时，恢复队列拥堵则显式重算，否则走Slow”。
+> 当前采用r6正式结果：Decode **1,405.70 token/s**，**Q high=32、low=8**。
+> 每秒采样，连续两次Q≥32进入拥堵，Q≤8退出；Q按逻辑snapshot计数，不按TP shard重复计数。
+> 工具与Direct建链阈值均1秒；原生HiCache/Mooncake关闭。其他baseline结果保留。
 
 | 方法 | 配置 | 状态 | Decode |
 |---|---|---|---:|
 | Colocated baseline | c256 | 完成 | 1,366 token/s |
 | Colocated baseline | c320 | 完成 | 1,456 token/s |
 | 原生 Mooncake | 2P:6D，c256 | 完成 | 862 token/s |
-| 旧版快慢路径 | 2P:6D，c256 | 需按当前新方法重跑 | 1,447 token/s（历史） |
+| 当前新方法 | 2P:6D，c256，Q=32/8 | 完成，671条Agent、0失败 | 1,406 token/s |
 | No-reverse PD | 2P:6D，c256 | 完成 | 816 token/s |
 | No-reverse PD | 4P:4D，c256 | 完成 | 1,020 token/s |
 | 原生 Mooncake | 4P:4D，c256 | 完成 | 1,023 token/s |
 
 ## 已完成结果明细
 
+2026-09-10正式记录见 [Q32/8新方法结果](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/current-method-q32-low8-r6/EXPERIMENT.md)。
+300.996秒业务预热+1200.001秒测量，完成671条Agent，零失败；TP回滚异常未复现。
+P=[0,4]、D=[1,5]/[2,6]/[3,7]；mem_fraction_static分别为P=.80、D=.80/.80/.60，搜索GPU7。
+下表Decode/Agent与实际Prefill/Agent使用窗口counter增量除以完成Agent数；末尾另列完成轨迹口径，二者不可混用。
+
 | 方法 | 并发 | Agent/s | Prefill compute | Decode/Agent | 实际 Prefill/Agent | Parent KV复用 |
 |---|---:|---:|---:|---:|---:|---:|
 | Colocated baseline | 256 | 0.518 | 9,607 token/s | 2,626 tokens | 18,472 tokens | 9.39% |
 | Colocated baseline | 320 | 0.542 | 9,580 token/s | 2,675 tokens | 17,606 tokens | 10.39% |
 | 原生 Mooncake 2P:6D | 256 | 0.330 | 4,805 token/s | 2,610 tokens | 14,555 tokens | 19.65% |
-| 旧版快慢路径 2P:6D（需重跑） | 256 | 0.557 | 5,135 token/s | 2,591 tokens | 9,196 tokens | 100.00% |
+| 当前新方法 2P:6D，Q=32/8 | 256 | 0.559 | 5,208 token/s | 2,508 tokens | 9,292 tokens | 96.94% |
 | No-reverse PD 2P:6D | 256 | 0.319 | 5,551 token/s | 2,553 tokens | 17,362 tokens | 0.00% |
 | No-reverse PD 4P:4D | 256 | 0.408 | 6,798 token/s | 2,490 tokens | 16,595 tokens | 0.00% |
 | 原生 Mooncake 4P:4D | 256 | 0.401 | 5,420 token/s | 2,544 tokens | 13,480 tokens | 27.66% |
@@ -38,10 +44,13 @@ TP=2 Decode 组；`4P:4D` 表示两个 TP=2 Prefill 组和两个 TP=2 Decode 组
 按正式 1,200 秒窗口内完成路径的唯一 request-generation snapshot 统计，两个
 TP rank 合并为一个逻辑 snapshot。
 
-| 方法 | 配置 | Direct | Slow | Direct/Slow 比例 |
-|---|---|---:|---:|---:|
-| 旧版快慢路径（需重跑） | 2P:6D，c256 | 631 | 308 | 67.20% / 32.80% |
-| Colocated / No-reverse / 原生 Mooncake | — | — | — | 不适用 |
+| 方法 | 配置 | Direct | Slow | 重算 | Direct/Slow/重算比例 |
+|---|---|---:|---:|---:|---:|
+| 当前新方法 | 2P:6D，c256，Q=32/8 | 552 | 323 | 11 | 62.30% / 36.46% / 1.24% |
+| Colocated / No-reverse / 原生 Mooncake | — | — | — | — | 不适用 |
+
+Slow写入与D源KV释放均323次，Host→P恢复331次（包含窗口前写入）。
+完成轨迹未复用父KV共189,376 tokens，全部对应明确重算，无未归因父KV缺失。
 
 ## 稳态资源明细
 
@@ -55,7 +64,7 @@ Colocated 的 P/D 共享同一 KV pool，只在 D KV/running/queue 栏记录整�
 | Colocated c256 | 45.7% | — | — | — | 54.3% | 92.9% | 28.0 | 35.4 | — |
 | Colocated c320 | 45.3% | — | — | — | 54.6% | 93.1% | 29.7 | 49.8 | — |
 | 原生 Mooncake 2P:6D c256 | 99.9% | 10.5% | 50.1 | 1.6 | 99.8% | 90.8% | 9.0 | 0.0 | 18.2 |
-| 旧版快慢路径 2P:6D c256（需重跑） | 97.7% | 66.7% | 5.6 | 6.6 | 99.8% | 77.9% | 19.3 | 0.0 | 0.1 |
+| 当前新方法 2P:6D c256，Q=32/8 | 98.3% | 39.3% | 4.5 | 4.6 | 99.9% | 60.3% | 16.5 | 0.0 | 0.056 |
 | No-reverse 2P:6D c256 | 100.1% | 10.0% | 50.8 | 1.4 | 97.8% | 90.8% | 8.2 | 0.0 | 18.1 |
 | No-reverse 4P:4D c256 | 60.9% | 6.7% | 2.1 | 1.4 | 99.9% | 90.1% | 19.7 | 0.0 | 4.0 |
 | 原生 Mooncake 4P:4D c256 | 54.6% | 6.4% | 2.1 | 1.4 | 99.2% | 90.2% | 20.2 | 0.0 | 4.2 |
@@ -65,7 +74,7 @@ Colocated 的 P/D 共享同一 KV pool，只在 D KV/running/queue 栏记录整�
 - Colocated c256: [summary](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/baseline-colocated/offload_analysis_summary.json)
 - Colocated c320: [summary](archive/baseline/formal-qwen3-32b-tp2-browsecomp-colocated-c320-w300-m1200-20260824-r1/offload_analysis_summary.json)
 - 原生 Mooncake 2P:6D c256: [summary](archive/baseline/formal-qwen3-32b-tp2-browsecomp-native-mooncake-2p6d-c256-w300-m1200-20260824-r1/offload_analysis_summary.json)
-- 旧版快慢路径 2P:6D c256（需重跑）: [summary](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/new-method-agentic-pd/offload_analysis_summary.json)
+- 当前新方法 2P:6D c256，Q=32/8: [结果及配置](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/current-method-q32-low8-r6/EXPERIMENT.md)
 - No-reverse 2P:6D c256: [summary](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/no-reverse-pd-2p6d/offload_analysis_summary.json)
 - No-reverse 4P:4D c256: [summary](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/no-reverse-pd-4p4d/offload_analysis_summary.json)
 - 原生 Mooncake 4P:4D c256: [summary](current/qwen3-32b-tp2-browsecomp-c256-w300-m1200/native-mooncake-pd-4p4d/offload_analysis_summary.json)
@@ -83,7 +92,7 @@ token 比例；它不是实际 Prefill tokens 的简单百分比。绝对重复 
 | Colocated baseline | c256 | 2,626 tokens | 18,472 tokens | 90.61% | 未单独记录 |
 | Colocated baseline | c320 | 2,675 tokens | 17,606 tokens | 89.61% | 未单独记录 |
 | 原生 Mooncake | 2P:6D，c256 | 2,610 tokens | 14,555 tokens | 80.35% | 未单独记录 |
-| 旧版快慢路径（需重跑） | 2P:6D，c256 | 2,591 tokens | 9,196 tokens | 0.00% | 约 0 tokens |
+| 当前新方法（完成轨迹口径） | 2P:6D，c256，Q=32/8 | 2,589 tokens | 7,956 tokens | 3.06% | 282 tokens，明确重算 |
 | No-reverse PD | 2P:6D，c256 | 2,553 tokens | 17,362 tokens | 100.00% | 6,796 tokens |
 | No-reverse PD | 4P:4D，c256 | 2,490 tokens | 16,595 tokens | 100.00% | 6,627 tokens |
 | 原生 Mooncake | 4P:4D，c256 | 2,544 tokens | 13,480 tokens | 72.34% | 4,658 tokens |

@@ -40,6 +40,60 @@ _BASH_BLOCK = re.compile(r"```(?:bash|sh)?\s*\n(.*?)\n```", re.DOTALL | re.IGNOR
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 _DONE_MARKER = "SWE_TASK_COMPLETE"
 
+# Run inside the task container. Unlike `timeout --signal=KILL`, the supervisor
+# survives killing the command group and returns the conventional timeout124.
+# A command killed independently still returns137, not a false timeout.
+_DOCKER_TIMEOUT_RUNNER = """
+import os, signal, subprocess, sys, tempfile
+# Descendants must not inherit the docker exec attachment pipe. A background
+# process may outlive its shell, but cannot delay the result by holding EOF open.
+with tempfile.TemporaryFile() as output:
+    p = subprocess.Popen(sys.argv[2:], start_new_session=True,
+                         stdout=output, stderr=subprocess.STDOUT)
+    try:
+        code = p.wait(timeout=float(sys.argv[1]))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+        code = 124
+    size = os.fstat(output.fileno()).st_size
+    for offset in range(0, size, 1024 * 1024):
+        sys.stdout.buffer.write(os.pread(output.fileno(), min(size - offset, 1024 * 1024), offset))
+sys.exit(code if code >= 0 else 128 - code)
+"""
+
+# Only for this adapter's single-task Docker PID namespace, never the host.
+# Quiescence, not merely signal delivery, is required before patch capture.
+_DOCKER_TIMEOUT_QUIESCE = """
+import os, signal, sys, time
+deadline = time.monotonic() + 5
+while True:
+    active = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit() or int(name) in (1, os.getpid()):
+            continue
+        try:
+            with open('/proc/' + name + '/stat') as f:
+                state = f.read().rsplit(')', 1)[1].split()[0]
+            if state not in ('Z', 'X'):
+                active.append(int(name))
+        except FileNotFoundError:
+            pass
+    if not active:
+        sys.exit(0)
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    for pid in active:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    time.sleep(.02)
+"""
+
 
 def command_from_reply(reply: str) -> str | None:
     """Extract exactly one fenced shell action; never execute free-form prose."""
@@ -87,6 +141,12 @@ class DockerTask:
             "uploads": [],
         }
     )
+    # Opt-in transport parity with Daytona. Preserve legacy image defaults
+    # for other datasets/launchers that share this Docker adapter.
+    user: str | None = None
+    cpu: int | None = None
+    memory_gb: int | None = None
+    normalize_tool_timeout: bool = False
 
     async def _run_host(self, *args: str, timeout: float) -> tuple[int, str]:
         process = await asyncio.create_subprocess_exec(
@@ -116,6 +176,22 @@ class DockerTask:
         run_id = os.environ.get("PD_SWE_RUN_ID", "").strip()
         if run_id:
             command.extend(["--label", f"pd.swe.run_id={run_id}"])
+        if self.user is not None:
+            command.extend(["--user", self.user])
+        if self.cpu is not None:
+            if self.cpu <= 0:
+                raise ValueError("docker_cpu must be positive")
+            command.extend(["--cpus", str(self.cpu)])
+            for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                        "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                command.extend(["-e", f"{key}={self.cpu}"])
+            command.extend(["-e", "PYTHONUNBUFFERED=1"])
+        if self.memory_gb is not None:
+            if self.memory_gb <= 0:
+                raise ValueError("docker_memory_gb must be positive")
+            command.extend(["--memory", f"{self.memory_gb}g"])
+        self.metrics.update(container_user=self.user, cpu_quota=self.cpu,
+                            memory_limit_gb=self.memory_gb)
         command.extend([
             "--entrypoint", "sleep", "--network", self.network,
             "-w", "/testbed", self.image, "86400",
@@ -152,6 +228,10 @@ class DockerTask:
         docker_environment: list[str] = []
         for key, value in (environment or {}).items():
             docker_environment.extend(("-e", f"{key}={value}"))
+        if self.normalize_tool_timeout and phase == "agent_tool":
+            runner = ["python3", "-c", _DOCKER_TIMEOUT_RUNNER, str(seconds)]
+        else:
+            runner = ["timeout", "--signal=KILL", f"{seconds}s"]
         returncode, output = await self._run_host(
             "docker",
             "exec",
@@ -159,13 +239,21 @@ class DockerTask:
             "/testbed",
             *docker_environment,
             self.container_id,
-            "timeout",
-            "--signal=KILL",
-            f"{seconds}s",
+            *runner,
             *interpreter,
             command,
             timeout=seconds + 10,
         )
+        timeout_cleanup_seconds = None
+        if self.normalize_tool_timeout and phase == "agent_tool" and returncode == 124:
+            cleanup_started = time.monotonic()
+            cleanup_code, cleanup_output = await self._run_host(
+                "docker", "exec", "--user", "root", self.container_id,
+                "python3", "-c", _DOCKER_TIMEOUT_QUIESCE, timeout=10,
+            )
+            if cleanup_code:
+                raise RuntimeError(f"tool timeout cleanup did not quiesce: {cleanup_output}")
+            timeout_cleanup_seconds = time.monotonic() - cleanup_started
         self.metrics["exec_calls"].append(
             {
                 "phase": phase,
@@ -174,6 +262,8 @@ class DockerTask:
                 "exit_code": returncode,
                 "command_chars": len(command),
                 "output_chars": len(output),
+                **({"timeout_cleanup_seconds": timeout_cleanup_seconds}
+                   if timeout_cleanup_seconds is not None else {}),
             }
         )
         return returncode, output
@@ -186,6 +276,12 @@ class DockerTask:
             with tempfile.NamedTemporaryFile(prefix="pd-swe-upload-", delete=False) as handle:
                 handle.write(contents)
                 temporary_path = handle.name
+            # ``docker cp`` preserves the source mode while creating the file
+            # as root inside the container.  Current OpenHands source-minimal
+            # images run as the unprivileged ``openhands`` user, so the
+            # NamedTemporaryFile default (0600) would make verifier scripts and
+            # patches unreadable after the copy.
+            os.chmod(temporary_path, 0o644)
             started = time.monotonic()
             returncode, output = await self._run_host(
                 "docker",
@@ -379,6 +475,10 @@ def _create_task(
         return DockerTask(
             **common,
             network=str(options.get("container_network", "none")),
+            user=str(options["docker_user"]) if options.get("docker_user") is not None else None,
+            cpu=int(options["docker_cpu"]) if options.get("docker_cpu") is not None else None,
+            memory_gb=int(options["docker_memory_gb"]) if options.get("docker_memory_gb") is not None else None,
+            normalize_tool_timeout=bool(options.get("docker_normalize_tool_timeout", False)),
         )
     if backend == "daytona":
         return DaytonaTask(

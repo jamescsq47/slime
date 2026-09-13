@@ -1,0 +1,4186 @@
+{
+  "run": "/tmp/pd-persist/fused-qwen35-27b-tp2-swe500-4p4d-c128-20260913-r6-gdn-contiguous",
+  "tp": 2,
+  "begin": 1789263597.0149548,
+  "end": 1789270025.223437,
+  "seconds": 6428.208482265472,
+  "completed": 500,
+  "resolved": 297,
+  "milestones": {
+    "10": 365.0073437690735,
+    "20": 521.2137081623077,
+    "50": 851.9341905117035,
+    "90": 1048.4462630748749,
+    "100": 1099.4944400787354,
+    "250": 2143.402475118637,
+    "450": 3747.7593874931335,
+    "490": 4017.738641023636,
+    "500": 6428.208482265472
+  },
+  "latency": {
+    "count": 500,
+    "mean": 944.2558158192635,
+    "p50": 948.9939728975296,
+    "p90": 1368.3755474805832,
+    "p99": 1874.1431844353676,
+    "total": 472127.90790963173
+  },
+  "prompt": {
+    "count": 25262,
+    "mean": 17636.237827567096,
+    "p50": 16468.5,
+    "p90": 32207.0,
+    "p99": 46391.08999999998,
+    "total": 445526640
+  },
+  "decode": {
+    "count": 25262,
+    "mean": 195.82665663842926,
+    "p50": 87.0,
+    "p90": 473.0,
+    "p99": 1165.7799999999988,
+    "total": 4946973
+  },
+  "initial": {
+    "count": 500,
+    "mean": 914.968,
+    "p50": 749.0,
+    "p90": 1407.1000000000004,
+    "p99": 3254.8099999999995,
+    "total": 457484
+  },
+  "tools": {
+    "count": 24993,
+    "mean": 1.0444996334771932,
+    "p50": 0.536222618073225,
+    "p90": 1.370543506927788,
+    "p99": 7.566265163384371,
+    "total": 26105.179339495488
+  },
+  "tool_bins": [
+    20719,
+    2818,
+    1305,
+    151
+  ],
+  "compacted_events": 0,
+  "structured_action_errors": 22,
+  "stop_counts": {
+    "task_complete": 234,
+    "max_turns": 227,
+    "max_tokens_per_turn": 13,
+    "no_command": 22,
+    "repeated_command_outcome": 3,
+    "command_timeout": 1
+  },
+  "stop_resolved": {
+    "task_complete": 185,
+    "max_turns": 106,
+    "max_tokens_per_turn": 2,
+    "no_command": 4
+  },
+  "profile": {
+    "overview": {
+      "requests": 500,
+      "completed": 500,
+      "failed": 0,
+      "raw_failed": 0,
+      "truncated": 0,
+      "resolved": 297,
+      "unresolved": 203,
+      "verifier_infrastructure_errors": 0,
+      "warm_image_requests": 500,
+      "mini_swe_trajectories": 0,
+      "openenv_trajectories": 500,
+      "run_wall_seconds": 6428.208482265472,
+      "request_per_second": 0.07778216922793187,
+      "agent_per_second": 0.07778216922793187
+    },
+    "status_counts": {
+      "completed": 500
+    },
+    "raw_status_counts": {
+      "completed": 500
+    },
+    "stop_reason_counts": {
+      "task_complete": 234,
+      "max_turns": 227,
+      "max_tokens_per_turn": 13,
+      "no_command": 22,
+      "repeated_command_outcome": 3,
+      "command_timeout": 1
+    },
+    "verifier_status_counts": {
+      "completed": 499,
+      "timeout": 1
+    },
+    "mini_swe_agent_version_counts": {
+      "None": 500
+    },
+    "distributions": {
+      "agent_latency_seconds": {
+        "count": 500,
+        "sum": 472127.90790963173,
+        "mean": 944.2558158192635,
+        "p50": 948.9939728975296,
+        "p90": 1368.3755474805832,
+        "p95": 1525.4761207103727,
+        "p99": 1874.1431844353676,
+        "max": 4332.036762237549
+      },
+      "sample_time_seconds": {
+        "count": 500,
+        "sum": 472127.7648814898,
+        "mean": 944.2555297629796,
+        "p50": 948.9937310677487,
+        "p90": 1368.3752546493897,
+        "p95": 1525.4757687166332,
+        "p99": 1874.142696652934,
+        "max": 4332.035914819222
+      },
+      "model_seconds": {
+        "count": 500,
+        "sum": 432877.3258034722,
+        "mean": 865.7546516069444,
+        "p50": 879.2375843999907,
+        "p90": 1274.3904462858102,
+        "p95": 1412.6702398883874,
+        "p99": 1683.8443580008156,
+        "max": 1968.5708308089525
+      },
+      "tool_seconds": {
+        "count": 500,
+        "sum": 26105.179339495488,
+        "mean": 52.21035867899098,
+        "p50": 40.14802353223786,
+        "p90": 80.04941203380005,
+        "p95": 112.68780707062683,
+        "p99": 221.90247903025687,
+        "max": 1527.6659427792765
+      },
+      "verifier_queue_seconds": {
+        "count": 500,
+        "sum": 0.013313273899257183,
+        "mean": 2.6626547798514367e-05,
+        "p50": 2.3395055904984474e-05,
+        "p90": 4.6538049355149275e-05,
+        "p95": 5.7442719116806985e-05,
+        "p99": 9.287636727094647e-05,
+        "max": 0.00018181093037128448
+      },
+      "verifier_seconds": {
+        "count": 500,
+        "sum": 9308.884818574414,
+        "mean": 18.61776963714883,
+        "p50": 9.55883801029995,
+        "p90": 20.36415494610556,
+        "p95": 55.95113003763816,
+        "p99": 94.08245085048465,
+        "max": 2400.203065769747
+      },
+      "docker_image_inspect_seconds": {
+        "count": 500,
+        "sum": 59.43978865304962,
+        "mean": 0.11887957730609923,
+        "p50": 0.0812471411190927,
+        "p90": 0.26244165515527135,
+        "p95": 0.30270032740663727,
+        "p99": 0.37669513387139886,
+        "max": 0.5048966803587973
+      },
+      "docker_container_start_seconds": {
+        "count": 500,
+        "sum": 359.22300908947363,
+        "mean": 0.7184460181789473,
+        "p50": 0.26779473130591214,
+        "p90": 2.1829756850376727,
+        "p95": 3.223936339537613,
+        "p99": 3.4719849813356998,
+        "max": 3.5225570518523455
+      },
+      "docker_container_close_seconds": {
+        "count": 500,
+        "sum": 180.637623117771,
+        "mean": 0.361275246235542,
+        "p50": 0.33214612980373204,
+        "p90": 0.49241762626916175,
+        "p95": 0.5738847586791963,
+        "p99": 0.6463350174250081,
+        "max": 1.0326500232331455
+      },
+      "docker_exec_seconds": {
+        "count": 500,
+        "sum": 37426.40636240924,
+        "mean": 74.85281272481848,
+        "p50": 54.496224963571876,
+        "p90": 118.1674330978189,
+        "p95": 159.5565865730866,
+        "p99": 341.76212056298743,
+        "max": 3929.929348330945
+      },
+      "docker_upload_seconds": {
+        "count": 500,
+        "sum": 58.309308390598744,
+        "mean": 0.11661861678119749,
+        "p50": 0.10530963400378823,
+        "p90": 0.16505004605278376,
+        "p95": 0.19795433960389336,
+        "p99": 0.26672094422858184,
+        "max": 0.8342065960168839
+      },
+      "docker_accounted_seconds": {
+        "count": 500,
+        "sum": 38084.01609166013,
+        "mean": 76.16803218332026,
+        "p50": 56.44250096427277,
+        "p90": 118.97736191032459,
+        "p95": 160.5518009578343,
+        "p99": 342.88530118787656,
+        "max": 3930.4794555404224
+      },
+      "docker_agent_tool_seconds": {
+        "count": 500,
+        "sum": 26104.78746263031,
+        "mean": 52.20957492526062,
+        "p50": 40.14690172742121,
+        "p90": 80.04855266385712,
+        "p95": 112.68712560336566,
+        "p99": 221.90123690308516,
+        "max": 1527.6655398881994
+      },
+      "docker_baseline_seconds": {
+        "count": 500,
+        "sum": 1243.2720804866403,
+        "mean": 2.486544160973281,
+        "p50": 1.6868939474225044,
+        "p90": 5.753158880118281,
+        "p95": 6.437513115443289,
+        "p99": 7.182401891322807,
+        "max": 7.467662777751684
+      },
+      "docker_patch_capture_seconds": {
+        "count": 500,
+        "sum": 610.0951127996668,
+        "mean": 1.2201902255993335,
+        "p50": 1.3703750725835562,
+        "p90": 1.566853562416509,
+        "p95": 1.6939188952557735,
+        "p99": 2.0107306848186997,
+        "max": 2.1137212831526995
+      },
+      "docker_verifier_exec_seconds": {
+        "count": 500,
+        "sum": 9244.976896059234,
+        "mean": 18.489953792118467,
+        "p50": 9.459597585489973,
+        "p90": 20.244970585359265,
+        "p95": 55.85601274394411,
+        "p99": 93.95823769743065,
+        "max": 2400.128096956294
+      },
+      "docker_setup_seconds": {
+        "count": 500,
+        "sum": 223.27481043338776,
+        "mean": 0.4465496208667755,
+        "p50": 0.2659269708674401,
+        "p90": 1.2769300266634698,
+        "p95": 1.499608573666774,
+        "p99": 1.608665793230757,
+        "max": 1.6831499678082764
+      },
+      "docker_exec_calls": {
+        "count": 500,
+        "sum": 29568.0,
+        "mean": 59.136,
+        "p50": 68.5,
+        "p90": 73.0,
+        "p95": 74.0,
+        "p99": 74.0,
+        "max": 74.0
+      },
+      "docker_upload_calls": {
+        "count": 500,
+        "sum": 500.0,
+        "mean": 1.0,
+        "p50": 1.0,
+        "p90": 1.0,
+        "p95": 1.0,
+        "p99": 1.0,
+        "max": 1.0
+      },
+      "turns": {
+        "count": 500,
+        "sum": 25262.0,
+        "mean": 50.524,
+        "p50": 60.0,
+        "p90": 64.0,
+        "p95": 64.0,
+        "p99": 64.0,
+        "max": 64.0
+      },
+      "shell_calls": {
+        "count": 500,
+        "sum": 24993.0,
+        "mean": 49.986,
+        "p50": 59.0,
+        "p90": 64.0,
+        "p95": 64.0,
+        "p99": 64.0,
+        "max": 64.0
+      },
+      "cumulative_model_input_tokens": {
+        "count": 500,
+        "sum": 445526640.0,
+        "mean": 891053.28,
+        "p50": 959959.0,
+        "p90": 1509349.3,
+        "p95": 1649022.8499999996,
+        "p99": 1981984.9199999997,
+        "max": 2512038.0
+      },
+      "model_output_tokens": {
+        "count": 500,
+        "sum": 4946973.0,
+        "mean": 9893.946,
+        "p50": 8872.5,
+        "p90": 16767.900000000005,
+        "p95": 19884.449999999993,
+        "p99": 28947.539999999986,
+        "max": 44894.0
+      },
+      "tool_observation_tokens": {
+        "count": 500,
+        "sum": 9188126.0,
+        "mean": 18376.252,
+        "p50": 18299.5,
+        "p90": 27977.9,
+        "p95": 30869.25,
+        "p99": 37091.75999999995,
+        "max": 66628.0
+      },
+      "cached_input_tokens": {
+        "count": 500,
+        "sum": 0.0,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "trajectory_tokens": {
+        "count": 500,
+        "sum": 4946973.0,
+        "mean": 9893.946,
+        "p50": 8872.5,
+        "p90": 16767.900000000005,
+        "p95": 19884.449999999993,
+        "p99": 28947.539999999986,
+        "max": 44894.0
+      },
+      "patch_chars": {
+        "count": 500,
+        "sum": 4766756.0,
+        "mean": 9533.512,
+        "p50": 1431.0,
+        "p90": 6488.4000000000015,
+        "p95": 17690.849999999984,
+        "p99": 201221.43999999997,
+        "max": 592725.0
+      },
+      "patch_bytes": {
+        "count": 500,
+        "sum": 4767346.0,
+        "mean": 9534.692,
+        "p50": 1431.0,
+        "p90": 6488.4000000000015,
+        "p95": 17690.849999999984,
+        "p99": 201225.39999999997,
+        "max": 592885.0
+      }
+    }
+  },
+  "windows": {
+    "full": {
+      "seconds": 6428.208482265472,
+      "completed": 500,
+      "roles": {
+        "prefill": {
+          "groups": 2,
+          "metrics": {
+            "sglang_full_token_usage": 0.2038666730798705,
+            "sglang_mamba_usage": 0.21614609399973153,
+            "sglang_num_running_reqs": 0.0,
+            "sglang_num_queue_reqs": 0.015551281576893995,
+            "sglang_num_decode_prealloc_queue_reqs": 0.0,
+            "sglang_num_decode_transfer_queue_reqs": 0.0,
+            "sglang_num_prefill_inflight_queue_reqs": 3.944712269012904,
+            "sglang_realtime_tokens_total|mode=prefill_compute": 2537.605313362694,
+            "sglang_realtime_tokens_total|mode=prefill_cache": 66893.61136719922,
+            "sglang_realtime_tokens_total|mode=decode": null,
+            "sglang_gpu_execution_seconds_total|category=forward_extend": 0.5098419945016733,
+            "sglang_gpu_execution_seconds_total|category=forward_decode": null
+          },
+          "peaks": {
+            "sglang_full_token_usage": 0.7404725912960458,
+            "sglang_mamba_usage": 0.9941520467836257,
+            "sglang_num_running_reqs": 0.0,
+            "sglang_num_queue_reqs": 5.0,
+            "sglang_num_decode_prealloc_queue_reqs": 0.0,
+            "sglang_num_decode_transfer_queue_reqs": 0.0,
+            "sglang_num_prefill_inflight_queue_reqs": 25.0
+          },
+          "capacity": {
+            "http://127.0.0.1:23700": 804416.0,
+            "http://127.0.0.1:23720": 804416.0
+          },
+          "max_scrape_gap_s": 3.5909955501556396
+        },
+        "decode": {
+          "groups": 2,
+          "metrics": {
+            "sglang_full_token_usage": 0.4437799399837915,
+            "sglang_mamba_usage": 0.3106121687678469,
+            "sglang_num_running_reqs": 14.020277773551129,
+            "sglang_num_queue_reqs": 0.0,
+            "sglang_num_decode_prealloc_queue_reqs": 0.11352173658690629,
+            "sglang_num_decode_transfer_queue_reqs": 0.18366156819248144,
+            "sglang_num_prefill_inflight_queue_reqs": 0.0,
+            "sglang_realtime_tokens_total|mode=prefill_compute": null,
+            "sglang_realtime_tokens_total|mode=prefill_cache": null,
+            "sglang_realtime_tokens_total|mode=decode": 769.5725821040196,
+            "sglang_gpu_execution_seconds_total|category=forward_extend": null,
+            "sglang_gpu_execution_seconds_total|category=forward_decode": 0.7068626879133589
+          },
+          "peaks": {
+            "sglang_full_token_usage": 0.9297427652733119,
+            "sglang_mamba_usage": 1.0,
+            "sglang_num_running_reqs": 42.0,
+            "sglang_num_queue_reqs": 0.0,
+            "sglang_num_decode_prealloc_queue_reqs": 4.0,
+            "sglang_num_decode_transfer_queue_reqs": 8.0,
+            "sglang_num_prefill_inflight_queue_reqs": 0.0
+          },
+          "capacity": {
+            "http://127.0.0.1:23701": 804416.0,
+            "http://127.0.0.1:23721": 796160.0
+          },
+          "max_scrape_gap_s": 3.5909955501556396
+        }
+      }
+    },
+    "middle": {
+      "seconds": 1200.0,
+      "completed": 147,
+      "roles": {
+        "prefill": {
+          "groups": 2,
+          "metrics": {
+            "sglang_full_token_usage": 0.3680048582178752,
+            "sglang_mamba_usage": 0.4058500500415517,
+            "sglang_num_running_reqs": 0.0,
+            "sglang_num_queue_reqs": 0.04185237770279249,
+            "sglang_num_decode_prealloc_queue_reqs": 0.0,
+            "sglang_num_decode_transfer_queue_reqs": 0.0,
+            "sglang_num_prefill_inflight_queue_reqs": 7.42750700594325,
+            "sglang_realtime_tokens_total|mode=prefill_compute": 4412.171500117482,
+            "sglang_realtime_tokens_total|mode=prefill_cache": 120842.44125704956,
+            "sglang_realtime_tokens_total|mode=decode": null,
+            "sglang_gpu_execution_seconds_total|category=forward_extend": 0.8829932265044813,
+            "sglang_gpu_execution_seconds_total|category=forward_decode": null
+          },
+          "peaks": {
+            "sglang_full_token_usage": 0.7404725912960458,
+            "sglang_mamba_usage": 0.8304093567251462,
+            "sglang_num_running_reqs": 0.0,
+            "sglang_num_queue_reqs": 5.0,
+            "sglang_num_decode_prealloc_queue_reqs": 0.0,
+            "sglang_num_decode_transfer_queue_reqs": 0.0,
+            "sglang_num_prefill_inflight_queue_reqs": 17.0
+          },
+          "capacity": {
+            "http://127.0.0.1:23700": 804416.0,
+            "http://127.0.0.1:23720": 804416.0
+          },
+          "max_scrape_gap_s": 3.5566372871398926
+        },
+        "decode": {
+          "groups": 2,
+          "metrics": {
+            "sglang_full_token_usage": 0.8014784861376116,
+            "sglang_mamba_usage": 0.5453983039581818,
+            "sglang_num_running_reqs": 24.91117870010101,
+            "sglang_num_queue_reqs": 0.0,
+            "sglang_num_decode_prealloc_queue_reqs": 0.20909986535708108,
+            "sglang_num_decode_transfer_queue_reqs": 0.36352480766234274,
+            "sglang_num_prefill_inflight_queue_reqs": 0.0,
+            "sglang_realtime_tokens_total|mode=prefill_compute": null,
+            "sglang_realtime_tokens_total|mode=prefill_cache": null,
+            "sglang_realtime_tokens_total|mode=decode": 1294.3918942621472,
+            "sglang_gpu_execution_seconds_total|category=forward_extend": null,
+            "sglang_gpu_execution_seconds_total|category=forward_decode": 0.9954094430938603
+          },
+          "peaks": {
+            "sglang_full_token_usage": 0.9297427652733119,
+            "sglang_mamba_usage": 0.7857142857142857,
+            "sglang_num_running_reqs": 40.0,
+            "sglang_num_queue_reqs": 0.0,
+            "sglang_num_decode_prealloc_queue_reqs": 4.0,
+            "sglang_num_decode_transfer_queue_reqs": 8.0,
+            "sglang_num_prefill_inflight_queue_reqs": 0.0
+          },
+          "capacity": {
+            "http://127.0.0.1:23701": 804416.0,
+            "http://127.0.0.1:23721": 796160.0
+          },
+          "max_scrape_gap_s": 3.5566372871398926
+        }
+      }
+    }
+  },
+  "raw_prefill": {
+    "totals": {
+      "calls": 25262,
+      "prompt": 445526640,
+      "cached": 430006080,
+      "uncached": 15520560,
+      "retractions": 0
+    },
+    "mismatches": [],
+    "per_task": {
+      "sympy__sympy-18211": {
+        "calls": 64,
+        "prompt": 903491,
+        "cached": 873728,
+        "retractions": 0,
+        "uncached": 29763
+      },
+      "sympy__sympy-17318": {
+        "calls": 46,
+        "prompt": 568874,
+        "cached": 544128,
+        "retractions": 0,
+        "uncached": 24746
+      },
+      "sympy__sympy-18698": {
+        "calls": 64,
+        "prompt": 1672443,
+        "cached": 1624320,
+        "retractions": 0,
+        "uncached": 48123
+      },
+      "sphinx-doc__sphinx-8459": {
+        "calls": 64,
+        "prompt": 1341406,
+        "cached": 1299136,
+        "retractions": 0,
+        "uncached": 42270
+      },
+      "sympy__sympy-16597": {
+        "calls": 64,
+        "prompt": 1283502,
+        "cached": 1249664,
+        "retractions": 0,
+        "uncached": 33838
+      },
+      "pytest-dev__pytest-7324": {
+        "calls": 64,
+        "prompt": 1457463,
+        "cached": 1412736,
+        "retractions": 0,
+        "uncached": 44727
+      },
+      "pydata__xarray-4687": {
+        "calls": 64,
+        "prompt": 879378,
+        "cached": 849536,
+        "retractions": 0,
+        "uncached": 29842
+      },
+      "pylint-dev__pylint-7080": {
+        "calls": 64,
+        "prompt": 1507360,
+        "cached": 1471424,
+        "retractions": 0,
+        "uncached": 35936
+      },
+      "sympy__sympy-13852": {
+        "calls": 39,
+        "prompt": 797005,
+        "cached": 763520,
+        "retractions": 0,
+        "uncached": 33485
+      },
+      "pydata__xarray-4094": {
+        "calls": 55,
+        "prompt": 766813,
+        "cached": 736256,
+        "retractions": 0,
+        "uncached": 30557
+      },
+      "pytest-dev__pytest-5840": {
+        "calls": 64,
+        "prompt": 984196,
+        "cached": 955648,
+        "retractions": 0,
+        "uncached": 28548
+      },
+      "scikit-learn__scikit-learn-13328": {
+        "calls": 48,
+        "prompt": 731449,
+        "cached": 696064,
+        "retractions": 0,
+        "uncached": 35385
+      },
+      "pydata__xarray-2905": {
+        "calls": 64,
+        "prompt": 1280923,
+        "cached": 1239808,
+        "retractions": 0,
+        "uncached": 41115
+      },
+      "sympy__sympy-16792": {
+        "calls": 64,
+        "prompt": 1467586,
+        "cached": 1426496,
+        "retractions": 0,
+        "uncached": 41090
+      },
+      "sympy__sympy-13551": {
+        "calls": 64,
+        "prompt": 1216059,
+        "cached": 1178880,
+        "retractions": 0,
+        "uncached": 37179
+      },
+      "sphinx-doc__sphinx-7889": {
+        "calls": 49,
+        "prompt": 537266,
+        "cached": 512768,
+        "retractions": 0,
+        "uncached": 24498
+      },
+      "scikit-learn__scikit-learn-14629": {
+        "calls": 64,
+        "prompt": 960280,
+        "cached": 929152,
+        "retractions": 0,
+        "uncached": 31128
+      },
+      "sphinx-doc__sphinx-8593": {
+        "calls": 64,
+        "prompt": 1004286,
+        "cached": 970624,
+        "retractions": 0,
+        "uncached": 33662
+      },
+      "pytest-dev__pytest-6197": {
+        "calls": 64,
+        "prompt": 1527839,
+        "cached": 1479552,
+        "retractions": 0,
+        "uncached": 48287
+      },
+      "sympy__sympy-15017": {
+        "calls": 64,
+        "prompt": 1130995,
+        "cached": 1097152,
+        "retractions": 0,
+        "uncached": 33843
+      },
+      "sympy__sympy-19346": {
+        "calls": 48,
+        "prompt": 543482,
+        "cached": 520832,
+        "retractions": 0,
+        "uncached": 22650
+      },
+      "sympy__sympy-12481": {
+        "calls": 59,
+        "prompt": 1058463,
+        "cached": 1024704,
+        "retractions": 0,
+        "uncached": 33759
+      },
+      "sphinx-doc__sphinx-8721": {
+        "calls": 60,
+        "prompt": 1550281,
+        "cached": 1491264,
+        "retractions": 0,
+        "uncached": 59017
+      },
+      "sphinx-doc__sphinx-7590": {
+        "calls": 64,
+        "prompt": 1161337,
+        "cached": 1124288,
+        "retractions": 0,
+        "uncached": 37049
+      },
+      "sympy__sympy-17139": {
+        "calls": 35,
+        "prompt": 252654,
+        "cached": 238464,
+        "retractions": 0,
+        "uncached": 14190
+      },
+      "scikit-learn__scikit-learn-13496": {
+        "calls": 53,
+        "prompt": 1085971,
+        "cached": 1049152,
+        "retractions": 0,
+        "uncached": 36819
+      },
+      "pylint-dev__pylint-6386": {
+        "calls": 64,
+        "prompt": 1699621,
+        "cached": 1653376,
+        "retractions": 0,
+        "uncached": 46245
+      },
+      "sphinx-doc__sphinx-11510": {
+        "calls": 64,
+        "prompt": 1894665,
+        "cached": 1838080,
+        "retractions": 0,
+        "uncached": 56585
+      },
+      "sphinx-doc__sphinx-9281": {
+        "calls": 64,
+        "prompt": 1349482,
+        "cached": 1305600,
+        "retractions": 0,
+        "uncached": 43882
+      },
+      "pydata__xarray-6938": {
+        "calls": 64,
+        "prompt": 1230731,
+        "cached": 1194112,
+        "retractions": 0,
+        "uncached": 36619
+      },
+      "sphinx-doc__sphinx-7440": {
+        "calls": 64,
+        "prompt": 1513429,
+        "cached": 1464064,
+        "retractions": 0,
+        "uncached": 49365
+      },
+      "sphinx-doc__sphinx-9602": {
+        "calls": 64,
+        "prompt": 1238719,
+        "cached": 1203392,
+        "retractions": 0,
+        "uncached": 35327
+      },
+      "sympy__sympy-15875": {
+        "calls": 64,
+        "prompt": 1230471,
+        "cached": 1193920,
+        "retractions": 0,
+        "uncached": 36551
+      },
+      "sphinx-doc__sphinx-9320": {
+        "calls": 30,
+        "prompt": 386662,
+        "cached": 361600,
+        "retractions": 0,
+        "uncached": 25062
+      },
+      "sphinx-doc__sphinx-9711": {
+        "calls": 52,
+        "prompt": 768206,
+        "cached": 736704,
+        "retractions": 0,
+        "uncached": 31502
+      },
+      "sympy__sympy-16766": {
+        "calls": 31,
+        "prompt": 270388,
+        "cached": 256128,
+        "retractions": 0,
+        "uncached": 14260
+      },
+      "sphinx-doc__sphinx-9658": {
+        "calls": 43,
+        "prompt": 738800,
+        "cached": 707904,
+        "retractions": 0,
+        "uncached": 30896
+      },
+      "pytest-dev__pytest-7571": {
+        "calls": 60,
+        "prompt": 1101909,
+        "cached": 1066304,
+        "retractions": 0,
+        "uncached": 35605
+      },
+      "sphinx-doc__sphinx-8475": {
+        "calls": 44,
+        "prompt": 647362,
+        "cached": 619264,
+        "retractions": 0,
+        "uncached": 28098
+      },
+      "scikit-learn__scikit-learn-14087": {
+        "calls": 50,
+        "prompt": 844766,
+        "cached": 811456,
+        "retractions": 0,
+        "uncached": 33310
+      },
+      "sphinx-doc__sphinx-8551": {
+        "calls": 64,
+        "prompt": 1524750,
+        "cached": 1477312,
+        "retractions": 0,
+        "uncached": 47438
+      },
+      "sphinx-doc__sphinx-9698": {
+        "calls": 31,
+        "prompt": 314081,
+        "cached": 294464,
+        "retractions": 0,
+        "uncached": 19617
+      },
+      "sympy__sympy-19637": {
+        "calls": 15,
+        "prompt": 102109,
+        "cached": 90944,
+        "retractions": 0,
+        "uncached": 11165
+      },
+      "sympy__sympy-15345": {
+        "calls": 44,
+        "prompt": 398534,
+        "cached": 378432,
+        "retractions": 0,
+        "uncached": 20102
+      },
+      "sympy__sympy-13615": {
+        "calls": 52,
+        "prompt": 744922,
+        "cached": 713088,
+        "retractions": 0,
+        "uncached": 31834
+      },
+      "sphinx-doc__sphinx-11445": {
+        "calls": 64,
+        "prompt": 959638,
+        "cached": 927872,
+        "retractions": 0,
+        "uncached": 31766
+      },
+      "sphinx-doc__sphinx-9229": {
+        "calls": 64,
+        "prompt": 1229373,
+        "cached": 1191680,
+        "retractions": 0,
+        "uncached": 37693
+      },
+      "sphinx-doc__sphinx-8638": {
+        "calls": 64,
+        "prompt": 2029398,
+        "cached": 1967616,
+        "retractions": 0,
+        "uncached": 61782
+      },
+      "sphinx-doc__sphinx-7454": {
+        "calls": 64,
+        "prompt": 1286344,
+        "cached": 1247168,
+        "retractions": 0,
+        "uncached": 39176
+      },
+      "sphinx-doc__sphinx-10466": {
+        "calls": 60,
+        "prompt": 1489090,
+        "cached": 1445312,
+        "retractions": 0,
+        "uncached": 43778
+      },
+      "sphinx-doc__sphinx-9591": {
+        "calls": 64,
+        "prompt": 1272424,
+        "cached": 1237696,
+        "retractions": 0,
+        "uncached": 34728
+      },
+      "sphinx-doc__sphinx-10673": {
+        "calls": 64,
+        "prompt": 1481204,
+        "cached": 1441216,
+        "retractions": 0,
+        "uncached": 39988
+      },
+      "pydata__xarray-6721": {
+        "calls": 64,
+        "prompt": 1192560,
+        "cached": 1155584,
+        "retractions": 0,
+        "uncached": 36976
+      },
+      "sphinx-doc__sphinx-9258": {
+        "calls": 64,
+        "prompt": 1224875,
+        "cached": 1186560,
+        "retractions": 0,
+        "uncached": 38315
+      },
+      "pydata__xarray-6744": {
+        "calls": 41,
+        "prompt": 739607,
+        "cached": 705408,
+        "retractions": 0,
+        "uncached": 34199
+      },
+      "scikit-learn__scikit-learn-26194": {
+        "calls": 64,
+        "prompt": 1548689,
+        "cached": 1502080,
+        "retractions": 0,
+        "uncached": 46609
+      },
+      "pytest-dev__pytest-7236": {
+        "calls": 64,
+        "prompt": 1550473,
+        "cached": 1500032,
+        "retractions": 0,
+        "uncached": 50441
+      },
+      "sphinx-doc__sphinx-8056": {
+        "calls": 64,
+        "prompt": 1344947,
+        "cached": 1304896,
+        "retractions": 0,
+        "uncached": 40051
+      },
+      "sympy__sympy-14248": {
+        "calls": 64,
+        "prompt": 1161635,
+        "cached": 1124096,
+        "retractions": 0,
+        "uncached": 37539
+      },
+      "sympy__sympy-15599": {
+        "calls": 64,
+        "prompt": 1095010,
+        "cached": 1059584,
+        "retractions": 0,
+        "uncached": 35426
+      },
+      "pylint-dev__pylint-4604": {
+        "calls": 64,
+        "prompt": 1087544,
+        "cached": 1055360,
+        "retractions": 0,
+        "uncached": 32184
+      },
+      "sympy__sympy-11618": {
+        "calls": 54,
+        "prompt": 715857,
+        "cached": 688896,
+        "retractions": 0,
+        "uncached": 26961
+      },
+      "sympy__sympy-13372": {
+        "calls": 22,
+        "prompt": 125242,
+        "cached": 114176,
+        "retractions": 0,
+        "uncached": 11066
+      },
+      "sympy__sympy-14976": {
+        "calls": 64,
+        "prompt": 933244,
+        "cached": 905408,
+        "retractions": 0,
+        "uncached": 27836
+      },
+      "sympy__sympy-13878": {
+        "calls": 64,
+        "prompt": 1019093,
+        "cached": 991168,
+        "retractions": 0,
+        "uncached": 27925
+      },
+      "pydata__xarray-6992": {
+        "calls": 64,
+        "prompt": 1050202,
+        "cached": 1016064,
+        "retractions": 0,
+        "uncached": 34138
+      },
+      "sympy__sympy-12419": {
+        "calls": 64,
+        "prompt": 979333,
+        "cached": 945408,
+        "retractions": 0,
+        "uncached": 33925
+      },
+      "sphinx-doc__sphinx-9461": {
+        "calls": 64,
+        "prompt": 1246776,
+        "cached": 1207232,
+        "retractions": 0,
+        "uncached": 39544
+      },
+      "sympy__sympy-13647": {
+        "calls": 54,
+        "prompt": 761909,
+        "cached": 733376,
+        "retractions": 0,
+        "uncached": 28533
+      },
+      "pydata__xarray-4966": {
+        "calls": 64,
+        "prompt": 1848278,
+        "cached": 1792896,
+        "retractions": 0,
+        "uncached": 55382
+      },
+      "sympy__sympy-13091": {
+        "calls": 64,
+        "prompt": 1310652,
+        "cached": 1276224,
+        "retractions": 0,
+        "uncached": 34428
+      },
+      "sympy__sympy-14711": {
+        "calls": 64,
+        "prompt": 950943,
+        "cached": 922752,
+        "retractions": 0,
+        "uncached": 28191
+      },
+      "pylint-dev__pylint-4551": {
+        "calls": 64,
+        "prompt": 1732735,
+        "cached": 1685248,
+        "retractions": 0,
+        "uncached": 47487
+      },
+      "sphinx-doc__sphinx-8265": {
+        "calls": 64,
+        "prompt": 1469545,
+        "cached": 1421824,
+        "retractions": 0,
+        "uncached": 47721
+      },
+      "sympy__sympy-17630": {
+        "calls": 64,
+        "prompt": 1216581,
+        "cached": 1179456,
+        "retractions": 0,
+        "uncached": 37125
+      },
+      "sympy__sympy-12489": {
+        "calls": 64,
+        "prompt": 1118242,
+        "cached": 1090176,
+        "retractions": 0,
+        "uncached": 28066
+      },
+      "pydata__xarray-7229": {
+        "calls": 64,
+        "prompt": 1367705,
+        "cached": 1327360,
+        "retractions": 0,
+        "uncached": 40345
+      },
+      "sphinx-doc__sphinx-7985": {
+        "calls": 64,
+        "prompt": 1133849,
+        "cached": 1095040,
+        "retractions": 0,
+        "uncached": 38809
+      },
+      "scikit-learn__scikit-learn-10297": {
+        "calls": 64,
+        "prompt": 1018689,
+        "cached": 987904,
+        "retractions": 0,
+        "uncached": 30785
+      },
+      "sympy__sympy-19495": {
+        "calls": 61,
+        "prompt": 1111126,
+        "cached": 1075776,
+        "retractions": 0,
+        "uncached": 35350
+      },
+      "sympy__sympy-12096": {
+        "calls": 61,
+        "prompt": 916107,
+        "cached": 883968,
+        "retractions": 0,
+        "uncached": 32139
+      },
+      "sympy__sympy-18763": {
+        "calls": 64,
+        "prompt": 718939,
+        "cached": 696000,
+        "retractions": 0,
+        "uncached": 22939
+      },
+      "sympy__sympy-14531": {
+        "calls": 64,
+        "prompt": 1180354,
+        "cached": 1149952,
+        "retractions": 0,
+        "uncached": 30402
+      },
+      "sphinx-doc__sphinx-10614": {
+        "calls": 64,
+        "prompt": 1488068,
+        "cached": 1448192,
+        "retractions": 0,
+        "uncached": 39876
+      },
+      "pydata__xarray-3095": {
+        "calls": 62,
+        "prompt": 1045429,
+        "cached": 1011456,
+        "retractions": 0,
+        "uncached": 33973
+      },
+      "scikit-learn__scikit-learn-26323": {
+        "calls": 45,
+        "prompt": 687011,
+        "cached": 653760,
+        "retractions": 0,
+        "uncached": 33251
+      },
+      "sympy__sympy-13877": {
+        "calls": 64,
+        "prompt": 1592981,
+        "cached": 1548352,
+        "retractions": 0,
+        "uncached": 44629
+      },
+      "scikit-learn__scikit-learn-11310": {
+        "calls": 64,
+        "prompt": 1115573,
+        "cached": 1081280,
+        "retractions": 0,
+        "uncached": 34293
+      },
+      "sympy__sympy-18189": {
+        "calls": 18,
+        "prompt": 119014,
+        "cached": 107008,
+        "retractions": 0,
+        "uncached": 12006
+      },
+      "sympy__sympy-13757": {
+        "calls": 64,
+        "prompt": 980387,
+        "cached": 949312,
+        "retractions": 0,
+        "uncached": 31075
+      },
+      "pytest-dev__pytest-7490": {
+        "calls": 59,
+        "prompt": 1269701,
+        "cached": 1234816,
+        "retractions": 0,
+        "uncached": 34885
+      },
+      "sphinx-doc__sphinx-10323": {
+        "calls": 64,
+        "prompt": 1347229,
+        "cached": 1305984,
+        "retractions": 0,
+        "uncached": 41245
+      },
+      "sympy__sympy-15349": {
+        "calls": 32,
+        "prompt": 347822,
+        "cached": 328832,
+        "retractions": 0,
+        "uncached": 18990
+      },
+      "sympy__sympy-19954": {
+        "calls": 22,
+        "prompt": 111788,
+        "cached": 100800,
+        "retractions": 0,
+        "uncached": 10988
+      },
+      "sympy__sympy-20154": {
+        "calls": 48,
+        "prompt": 575157,
+        "cached": 549952,
+        "retractions": 0,
+        "uncached": 25205
+      },
+      "sympy__sympy-20428": {
+        "calls": 64,
+        "prompt": 957786,
+        "cached": 926912,
+        "retractions": 0,
+        "uncached": 30874
+      },
+      "sympy__sympy-18199": {
+        "calls": 40,
+        "prompt": 530085,
+        "cached": 506496,
+        "retractions": 0,
+        "uncached": 23589
+      },
+      "pytest-dev__pytest-5787": {
+        "calls": 64,
+        "prompt": 1756471,
+        "cached": 1708288,
+        "retractions": 0,
+        "uncached": 48183
+      },
+      "sympy__sympy-15809": {
+        "calls": 44,
+        "prompt": 491305,
+        "cached": 471424,
+        "retractions": 0,
+        "uncached": 19881
+      },
+      "scikit-learn__scikit-learn-25232": {
+        "calls": 48,
+        "prompt": 828002,
+        "cached": 793216,
+        "retractions": 0,
+        "uncached": 34786
+      },
+      "scikit-learn__scikit-learn-25747": {
+        "calls": 38,
+        "prompt": 759181,
+        "cached": 722752,
+        "retractions": 0,
+        "uncached": 36429
+      },
+      "pydata__xarray-6461": {
+        "calls": 64,
+        "prompt": 866980,
+        "cached": 836672,
+        "retractions": 0,
+        "uncached": 30308
+      },
+      "sympy__sympy-17655": {
+        "calls": 54,
+        "prompt": 762545,
+        "cached": 735936,
+        "retractions": 0,
+        "uncached": 26609
+      },
+      "scikit-learn__scikit-learn-13124": {
+        "calls": 50,
+        "prompt": 1068638,
+        "cached": 1031232,
+        "retractions": 0,
+        "uncached": 37406
+      },
+      "sphinx-doc__sphinx-8035": {
+        "calls": 64,
+        "prompt": 1036322,
+        "cached": 1002816,
+        "retractions": 0,
+        "uncached": 33506
+      },
+      "matplotlib__matplotlib-25332": {
+        "calls": 64,
+        "prompt": 1208820,
+        "cached": 1170816,
+        "retractions": 0,
+        "uncached": 38004
+      },
+      "sympy__sympy-19040": {
+        "calls": 64,
+        "prompt": 1239070,
+        "cached": 1199872,
+        "retractions": 0,
+        "uncached": 39198
+      },
+      "sphinx-doc__sphinx-10435": {
+        "calls": 64,
+        "prompt": 1177402,
+        "cached": 1139392,
+        "retractions": 0,
+        "uncached": 38010
+      },
+      "pylint-dev__pylint-4970": {
+        "calls": 64,
+        "prompt": 1104908,
+        "cached": 1066304,
+        "retractions": 0,
+        "uncached": 38604
+      },
+      "sympy__sympy-16450": {
+        "calls": 64,
+        "prompt": 777325,
+        "cached": 752128,
+        "retractions": 0,
+        "uncached": 25197
+      },
+      "mwaskom__seaborn-3187": {
+        "calls": 64,
+        "prompt": 1301680,
+        "cached": 1258432,
+        "retractions": 0,
+        "uncached": 43248
+      },
+      "sphinx-doc__sphinx-7757": {
+        "calls": 64,
+        "prompt": 1358138,
+        "cached": 1314432,
+        "retractions": 0,
+        "uncached": 43706
+      },
+      "sphinx-doc__sphinx-10449": {
+        "calls": 64,
+        "prompt": 1648671,
+        "cached": 1601408,
+        "retractions": 0,
+        "uncached": 47263
+      },
+      "sphinx-doc__sphinx-7748": {
+        "calls": 64,
+        "prompt": 1128559,
+        "cached": 1089856,
+        "retractions": 0,
+        "uncached": 38703
+      },
+      "sympy__sympy-16886": {
+        "calls": 14,
+        "prompt": 71058,
+        "cached": 63232,
+        "retractions": 0,
+        "uncached": 7826
+      },
+      "sphinx-doc__sphinx-8595": {
+        "calls": 64,
+        "prompt": 865915,
+        "cached": 837184,
+        "retractions": 0,
+        "uncached": 28731
+      },
+      "scikit-learn__scikit-learn-9288": {
+        "calls": 37,
+        "prompt": 625166,
+        "cached": 594112,
+        "retractions": 0,
+        "uncached": 31054
+      },
+      "sympy__sympy-13974": {
+        "calls": 64,
+        "prompt": 1554672,
+        "cached": 1510208,
+        "retractions": 0,
+        "uncached": 44464
+      },
+      "sphinx-doc__sphinx-7910": {
+        "calls": 48,
+        "prompt": 793408,
+        "cached": 762752,
+        "retractions": 0,
+        "uncached": 30656
+      },
+      "sympy__sympy-20438": {
+        "calls": 64,
+        "prompt": 1022538,
+        "cached": 992640,
+        "retractions": 0,
+        "uncached": 29898
+      },
+      "sympy__sympy-20590": {
+        "calls": 52,
+        "prompt": 501390,
+        "cached": 480320,
+        "retractions": 0,
+        "uncached": 21070
+      },
+      "sympy__sympy-20801": {
+        "calls": 64,
+        "prompt": 798999,
+        "cached": 771840,
+        "retractions": 0,
+        "uncached": 27159
+      },
+      "sympy__sympy-20916": {
+        "calls": 64,
+        "prompt": 1102761,
+        "cached": 1066560,
+        "retractions": 0,
+        "uncached": 36201
+      },
+      "sphinx-doc__sphinx-9673": {
+        "calls": 64,
+        "prompt": 1732435,
+        "cached": 1683136,
+        "retractions": 0,
+        "uncached": 49299
+      },
+      "sympy__sympy-13798": {
+        "calls": 38,
+        "prompt": 360839,
+        "cached": 339840,
+        "retractions": 0,
+        "uncached": 20999
+      },
+      "pydata__xarray-6599": {
+        "calls": 64,
+        "prompt": 1981506,
+        "cached": 1916160,
+        "retractions": 0,
+        "uncached": 65346
+      },
+      "sympy__sympy-22080": {
+        "calls": 64,
+        "prompt": 977048,
+        "cached": 948480,
+        "retractions": 0,
+        "uncached": 28568
+      },
+      "sympy__sympy-22456": {
+        "calls": 64,
+        "prompt": 1291887,
+        "cached": 1234432,
+        "retractions": 0,
+        "uncached": 57455
+      },
+      "sympy__sympy-19783": {
+        "calls": 64,
+        "prompt": 985049,
+        "cached": 953920,
+        "retractions": 0,
+        "uncached": 31129
+      },
+      "sympy__sympy-21930": {
+        "calls": 64,
+        "prompt": 909500,
+        "cached": 881728,
+        "retractions": 0,
+        "uncached": 27772
+      },
+      "sympy__sympy-21612": {
+        "calls": 64,
+        "prompt": 1174768,
+        "cached": 1132736,
+        "retractions": 0,
+        "uncached": 42032
+      },
+      "sympy__sympy-13031": {
+        "calls": 59,
+        "prompt": 711055,
+        "cached": 681792,
+        "retractions": 0,
+        "uncached": 29263
+      },
+      "sympy__sympy-22714": {
+        "calls": 30,
+        "prompt": 239792,
+        "cached": 218368,
+        "retractions": 0,
+        "uncached": 21424
+      },
+      "sympy__sympy-22914": {
+        "calls": 62,
+        "prompt": 1377018,
+        "cached": 1341120,
+        "retractions": 0,
+        "uncached": 35898
+      },
+      "sympy__sympy-23262": {
+        "calls": 63,
+        "prompt": 1213729,
+        "cached": 1174784,
+        "retractions": 0,
+        "uncached": 38945
+      },
+      "sympy__sympy-23413": {
+        "calls": 64,
+        "prompt": 2353969,
+        "cached": 2289984,
+        "retractions": 0,
+        "uncached": 63985
+      },
+      "sympy__sympy-23534": {
+        "calls": 34,
+        "prompt": 312270,
+        "cached": 295104,
+        "retractions": 0,
+        "uncached": 17166
+      },
+      "sympy__sympy-21847": {
+        "calls": 19,
+        "prompt": 118438,
+        "cached": 107904,
+        "retractions": 0,
+        "uncached": 10534
+      },
+      "scikit-learn__scikit-learn-25102": {
+        "calls": 33,
+        "prompt": 554071,
+        "cached": 522304,
+        "retractions": 0,
+        "uncached": 31767
+      },
+      "sympy__sympy-15976": {
+        "calls": 58,
+        "prompt": 1165406,
+        "cached": 1124736,
+        "retractions": 0,
+        "uncached": 40670
+      },
+      "sympy__sympy-21379": {
+        "calls": 46,
+        "prompt": 612859,
+        "cached": 587776,
+        "retractions": 0,
+        "uncached": 25083
+      },
+      "sympy__sympy-23950": {
+        "calls": 60,
+        "prompt": 736224,
+        "cached": 710912,
+        "retractions": 0,
+        "uncached": 25312
+      },
+      "sympy__sympy-24066": {
+        "calls": 64,
+        "prompt": 1011655,
+        "cached": 982720,
+        "retractions": 0,
+        "uncached": 28935
+      },
+      "sympy__sympy-24213": {
+        "calls": 37,
+        "prompt": 406628,
+        "cached": 387840,
+        "retractions": 0,
+        "uncached": 18788
+      },
+      "sympy__sympy-24443": {
+        "calls": 43,
+        "prompt": 611881,
+        "cached": 586624,
+        "retractions": 0,
+        "uncached": 25257
+      },
+      "sympy__sympy-23824": {
+        "calls": 20,
+        "prompt": 175631,
+        "cached": 161344,
+        "retractions": 0,
+        "uncached": 14287
+      },
+      "sympy__sympy-24539": {
+        "calls": 17,
+        "prompt": 60968,
+        "cached": 53760,
+        "retractions": 0,
+        "uncached": 7208
+      },
+      "sympy__sympy-21596": {
+        "calls": 64,
+        "prompt": 1373552,
+        "cached": 1334784,
+        "retractions": 0,
+        "uncached": 38768
+      },
+      "sympy__sympy-24562": {
+        "calls": 25,
+        "prompt": 151475,
+        "cached": 140224,
+        "retractions": 0,
+        "uncached": 11251
+      },
+      "sympy__sympy-24661": {
+        "calls": 49,
+        "prompt": 727616,
+        "cached": 700032,
+        "retractions": 0,
+        "uncached": 27584
+      },
+      "sphinx-doc__sphinx-8269": {
+        "calls": 41,
+        "prompt": 751801,
+        "cached": 717824,
+        "retractions": 0,
+        "uncached": 33977
+      },
+      "scikit-learn__scikit-learn-14710": {
+        "calls": 30,
+        "prompt": 421442,
+        "cached": 397248,
+        "retractions": 0,
+        "uncached": 24194
+      },
+      "astropy__astropy-12907": {
+        "calls": 22,
+        "prompt": 170622,
+        "cached": 156544,
+        "retractions": 0,
+        "uncached": 14078
+      },
+      "astropy__astropy-13236": {
+        "calls": 64,
+        "prompt": 1080116,
+        "cached": 1048320,
+        "retractions": 0,
+        "uncached": 31796
+      },
+      "astropy__astropy-14309": {
+        "calls": 38,
+        "prompt": 605786,
+        "cached": 574592,
+        "retractions": 0,
+        "uncached": 31194
+      },
+      "astropy__astropy-7671": {
+        "calls": 64,
+        "prompt": 988863,
+        "cached": 959360,
+        "retractions": 0,
+        "uncached": 29503
+      },
+      "django__django-10554": {
+        "calls": 64,
+        "prompt": 1189811,
+        "cached": 1152128,
+        "retractions": 0,
+        "uncached": 37683
+      },
+      "astropy__astropy-13579": {
+        "calls": 38,
+        "prompt": 815067,
+        "cached": 772608,
+        "retractions": 0,
+        "uncached": 42459
+      },
+      "astropy__astropy-7166": {
+        "calls": 35,
+        "prompt": 367833,
+        "cached": 348416,
+        "retractions": 0,
+        "uncached": 19417
+      },
+      "astropy__astropy-14598": {
+        "calls": 64,
+        "prompt": 1844415,
+        "cached": 1789184,
+        "retractions": 0,
+        "uncached": 55231
+      },
+      "astropy__astropy-14995": {
+        "calls": 23,
+        "prompt": 370304,
+        "cached": 331392,
+        "retractions": 0,
+        "uncached": 38912
+      },
+      "astropy__astropy-14365": {
+        "calls": 18,
+        "prompt": 188273,
+        "cached": 165120,
+        "retractions": 0,
+        "uncached": 23153
+      },
+      "astropy__astropy-13977": {
+        "calls": 64,
+        "prompt": 1406173,
+        "cached": 1365760,
+        "retractions": 0,
+        "uncached": 40413
+      },
+      "astropy__astropy-8872": {
+        "calls": 56,
+        "prompt": 968145,
+        "cached": 933056,
+        "retractions": 0,
+        "uncached": 35089
+      },
+      "django__django-11163": {
+        "calls": 29,
+        "prompt": 211245,
+        "cached": 197248,
+        "retractions": 0,
+        "uncached": 13997
+      },
+      "django__django-12741": {
+        "calls": 54,
+        "prompt": 700957,
+        "cached": 676352,
+        "retractions": 0,
+        "uncached": 24605
+      },
+      "django__django-11119": {
+        "calls": 62,
+        "prompt": 1097735,
+        "cached": 1063808,
+        "retractions": 0,
+        "uncached": 33927
+      },
+      "django__django-11433": {
+        "calls": 23,
+        "prompt": 173017,
+        "cached": 159744,
+        "retractions": 0,
+        "uncached": 13273
+      },
+      "django__django-11532": {
+        "calls": 44,
+        "prompt": 688947,
+        "cached": 659200,
+        "retractions": 0,
+        "uncached": 29747
+      },
+      "django__django-11477": {
+        "calls": 64,
+        "prompt": 1235827,
+        "cached": 1198592,
+        "retractions": 0,
+        "uncached": 37235
+      },
+      "django__django-11848": {
+        "calls": 38,
+        "prompt": 584801,
+        "cached": 560256,
+        "retractions": 0,
+        "uncached": 24545
+      },
+      "django__django-11239": {
+        "calls": 37,
+        "prompt": 400703,
+        "cached": 376832,
+        "retractions": 0,
+        "uncached": 23871
+      },
+      "django__django-11400": {
+        "calls": 64,
+        "prompt": 1264990,
+        "cached": 1221824,
+        "retractions": 0,
+        "uncached": 43166
+      },
+      "django__django-11551": {
+        "calls": 56,
+        "prompt": 1076884,
+        "cached": 1041344,
+        "retractions": 0,
+        "uncached": 35540
+      },
+      "django__django-12304": {
+        "calls": 44,
+        "prompt": 649954,
+        "cached": 620800,
+        "retractions": 0,
+        "uncached": 29154
+      },
+      "django__django-11555": {
+        "calls": 61,
+        "prompt": 773046,
+        "cached": 742144,
+        "retractions": 0,
+        "uncached": 30902
+      },
+      "django__django-11179": {
+        "calls": 48,
+        "prompt": 708535,
+        "cached": 681856,
+        "retractions": 0,
+        "uncached": 26679
+      },
+      "django__django-12050": {
+        "calls": 37,
+        "prompt": 440173,
+        "cached": 412352,
+        "retractions": 0,
+        "uncached": 27821
+      },
+      "django__django-12209": {
+        "calls": 25,
+        "prompt": 185208,
+        "cached": 171712,
+        "retractions": 0,
+        "uncached": 13496
+      },
+      "django__django-12039": {
+        "calls": 62,
+        "prompt": 1296224,
+        "cached": 1258560,
+        "retractions": 0,
+        "uncached": 37664
+      },
+      "django__django-10880": {
+        "calls": 64,
+        "prompt": 1129533,
+        "cached": 1093376,
+        "retractions": 0,
+        "uncached": 36157
+      },
+      "django__django-11603": {
+        "calls": 56,
+        "prompt": 625632,
+        "cached": 601152,
+        "retractions": 0,
+        "uncached": 24480
+      },
+      "django__django-11099": {
+        "calls": 20,
+        "prompt": 76427,
+        "cached": 66048,
+        "retractions": 0,
+        "uncached": 10379
+      },
+      "django__django-12308": {
+        "calls": 64,
+        "prompt": 1177701,
+        "cached": 1142592,
+        "retractions": 0,
+        "uncached": 35109
+      },
+      "django__django-11066": {
+        "calls": 52,
+        "prompt": 1000719,
+        "cached": 961088,
+        "retractions": 0,
+        "uncached": 39631
+      },
+      "django__django-11265": {
+        "calls": 64,
+        "prompt": 1350026,
+        "cached": 1313088,
+        "retractions": 0,
+        "uncached": 36938
+      },
+      "django__django-11790": {
+        "calls": 45,
+        "prompt": 560786,
+        "cached": 537600,
+        "retractions": 0,
+        "uncached": 23186
+      },
+      "django__django-12713": {
+        "calls": 46,
+        "prompt": 558598,
+        "cached": 530048,
+        "retractions": 0,
+        "uncached": 28550
+      },
+      "django__django-11206": {
+        "calls": 34,
+        "prompt": 580539,
+        "cached": 547072,
+        "retractions": 0,
+        "uncached": 33467
+      },
+      "django__django-10999": {
+        "calls": 16,
+        "prompt": 98104,
+        "cached": 87616,
+        "retractions": 0,
+        "uncached": 10488
+      },
+      "django__django-12262": {
+        "calls": 44,
+        "prompt": 752523,
+        "cached": 721728,
+        "retractions": 0,
+        "uncached": 30795
+      },
+      "django__django-10914": {
+        "calls": 64,
+        "prompt": 1014989,
+        "cached": 988480,
+        "retractions": 0,
+        "uncached": 26509
+      },
+      "django__django-11333": {
+        "calls": 54,
+        "prompt": 777585,
+        "cached": 750336,
+        "retractions": 0,
+        "uncached": 27249
+      },
+      "django__django-11740": {
+        "calls": 64,
+        "prompt": 1470999,
+        "cached": 1425856,
+        "retractions": 0,
+        "uncached": 45143
+      },
+      "django__django-12125": {
+        "calls": 64,
+        "prompt": 1794548,
+        "cached": 1744960,
+        "retractions": 0,
+        "uncached": 49588
+      },
+      "django__django-10973": {
+        "calls": 25,
+        "prompt": 163124,
+        "cached": 145856,
+        "retractions": 0,
+        "uncached": 17268
+      },
+      "django__django-13012": {
+        "calls": 64,
+        "prompt": 1052996,
+        "cached": 1020224,
+        "retractions": 0,
+        "uncached": 32772
+      },
+      "django__django-13344": {
+        "calls": 64,
+        "prompt": 1817618,
+        "cached": 1762304,
+        "retractions": 0,
+        "uncached": 55314
+      },
+      "django__django-13121": {
+        "calls": 64,
+        "prompt": 1269328,
+        "cached": 1230848,
+        "retractions": 0,
+        "uncached": 38480
+      },
+      "django__django-13346": {
+        "calls": 64,
+        "prompt": 1191444,
+        "cached": 1155584,
+        "retractions": 0,
+        "uncached": 35860
+      },
+      "django__django-13449": {
+        "calls": 64,
+        "prompt": 1508896,
+        "cached": 1462272,
+        "retractions": 0,
+        "uncached": 46624
+      },
+      "django__django-13315": {
+        "calls": 55,
+        "prompt": 774008,
+        "cached": 744640,
+        "retractions": 0,
+        "uncached": 29368
+      },
+      "django__django-13033": {
+        "calls": 64,
+        "prompt": 1716954,
+        "cached": 1667648,
+        "retractions": 0,
+        "uncached": 49306
+      },
+      "django__django-13516": {
+        "calls": 64,
+        "prompt": 1514369,
+        "cached": 1473728,
+        "retractions": 0,
+        "uncached": 40641
+      },
+      "django__django-12965": {
+        "calls": 64,
+        "prompt": 1370051,
+        "cached": 1328960,
+        "retractions": 0,
+        "uncached": 41091
+      },
+      "django__django-13158": {
+        "calls": 64,
+        "prompt": 1133052,
+        "cached": 1094272,
+        "retractions": 0,
+        "uncached": 38780
+      },
+      "django__django-13279": {
+        "calls": 64,
+        "prompt": 1784492,
+        "cached": 1735488,
+        "retractions": 0,
+        "uncached": 49004
+      },
+      "django__django-13590": {
+        "calls": 42,
+        "prompt": 546361,
+        "cached": 520704,
+        "retractions": 0,
+        "uncached": 25657
+      },
+      "django__django-13410": {
+        "calls": 12,
+        "prompt": 52905,
+        "cached": 45760,
+        "retractions": 0,
+        "uncached": 7145
+      },
+      "astropy__astropy-14539": {
+        "calls": 57,
+        "prompt": 874553,
+        "cached": 841792,
+        "retractions": 0,
+        "uncached": 32761
+      },
+      "django__django-11133": {
+        "calls": 29,
+        "prompt": 287141,
+        "cached": 267776,
+        "retractions": 0,
+        "uncached": 19365
+      },
+      "django__django-10097": {
+        "calls": 60,
+        "prompt": 1516568,
+        "cached": 1470336,
+        "retractions": 0,
+        "uncached": 46232
+      },
+      "astropy__astropy-14369": {
+        "calls": 20,
+        "prompt": 260611,
+        "cached": 235392,
+        "retractions": 0,
+        "uncached": 25219
+      },
+      "django__django-13195": {
+        "calls": 64,
+        "prompt": 1346118,
+        "cached": 1308160,
+        "retractions": 0,
+        "uncached": 37958
+      },
+      "django__django-13109": {
+        "calls": 55,
+        "prompt": 824581,
+        "cached": 796032,
+        "retractions": 0,
+        "uncached": 28549
+      },
+      "django__django-13513": {
+        "calls": 44,
+        "prompt": 491034,
+        "cached": 469312,
+        "retractions": 0,
+        "uncached": 21722
+      },
+      "django__django-13658": {
+        "calls": 32,
+        "prompt": 286782,
+        "cached": 269248,
+        "retractions": 0,
+        "uncached": 17534
+      },
+      "django__django-13028": {
+        "calls": 64,
+        "prompt": 1177189,
+        "cached": 1140096,
+        "retractions": 0,
+        "uncached": 37093
+      },
+      "django__django-13343": {
+        "calls": 64,
+        "prompt": 1114954,
+        "cached": 1080320,
+        "retractions": 0,
+        "uncached": 34634
+      },
+      "django__django-13568": {
+        "calls": 34,
+        "prompt": 386490,
+        "cached": 364416,
+        "retractions": 0,
+        "uncached": 22074
+      },
+      "astropy__astropy-7606": {
+        "calls": 28,
+        "prompt": 140484,
+        "cached": 129728,
+        "retractions": 0,
+        "uncached": 10756
+      },
+      "django__django-11276": {
+        "calls": 53,
+        "prompt": 1094570,
+        "cached": 1059840,
+        "retractions": 0,
+        "uncached": 34730
+      },
+      "django__django-11141": {
+        "calls": 64,
+        "prompt": 669539,
+        "cached": 647552,
+        "retractions": 0,
+        "uncached": 21987
+      },
+      "django__django-11728": {
+        "calls": 55,
+        "prompt": 1063697,
+        "cached": 1025408,
+        "retractions": 0,
+        "uncached": 38289
+      },
+      "django__django-12143": {
+        "calls": 29,
+        "prompt": 165692,
+        "cached": 153536,
+        "retractions": 0,
+        "uncached": 12156
+      },
+      "django__django-11292": {
+        "calls": 64,
+        "prompt": 1125158,
+        "cached": 1091328,
+        "retractions": 0,
+        "uncached": 33830
+      },
+      "astropy__astropy-14096": {
+        "calls": 13,
+        "prompt": 62505,
+        "cached": 53376,
+        "retractions": 0,
+        "uncached": 9129
+      },
+      "django__django-11734": {
+        "calls": 64,
+        "prompt": 1378453,
+        "cached": 1339136,
+        "retractions": 0,
+        "uncached": 39317
+      },
+      "django__django-12193": {
+        "calls": 64,
+        "prompt": 1589144,
+        "cached": 1545216,
+        "retractions": 0,
+        "uncached": 43928
+      },
+      "django__django-11885": {
+        "calls": 42,
+        "prompt": 890430,
+        "cached": 839232,
+        "retractions": 0,
+        "uncached": 51198
+      },
+      "django__django-13023": {
+        "calls": 64,
+        "prompt": 929041,
+        "cached": 899136,
+        "retractions": 0,
+        "uncached": 29905
+      },
+      "django__django-11149": {
+        "calls": 64,
+        "prompt": 1465305,
+        "cached": 1414784,
+        "retractions": 0,
+        "uncached": 50521
+      },
+      "django__django-11087": {
+        "calls": 61,
+        "prompt": 2512038,
+        "cached": 2418944,
+        "retractions": 0,
+        "uncached": 93094
+      },
+      "django__django-13551": {
+        "calls": 36,
+        "prompt": 607044,
+        "cached": 575232,
+        "retractions": 0,
+        "uncached": 31812
+      },
+      "astropy__astropy-13033": {
+        "calls": 41,
+        "prompt": 556694,
+        "cached": 530112,
+        "retractions": 0,
+        "uncached": 26582
+      },
+      "django__django-12663": {
+        "calls": 64,
+        "prompt": 1245175,
+        "cached": 1208576,
+        "retractions": 0,
+        "uncached": 36599
+      },
+      "django__django-11490": {
+        "calls": 55,
+        "prompt": 912480,
+        "cached": 874176,
+        "retractions": 0,
+        "uncached": 38304
+      },
+      "django__django-11964": {
+        "calls": 58,
+        "prompt": 844382,
+        "cached": 815680,
+        "retractions": 0,
+        "uncached": 28702
+      },
+      "django__django-12708": {
+        "calls": 64,
+        "prompt": 1499389,
+        "cached": 1456000,
+        "retractions": 0,
+        "uncached": 43389
+      },
+      "astropy__astropy-8707": {
+        "calls": 55,
+        "prompt": 917120,
+        "cached": 879232,
+        "retractions": 0,
+        "uncached": 37888
+      },
+      "django__django-12858": {
+        "calls": 64,
+        "prompt": 919366,
+        "cached": 892672,
+        "retractions": 0,
+        "uncached": 26694
+      },
+      "django__django-12406": {
+        "calls": 64,
+        "prompt": 1123846,
+        "cached": 1087296,
+        "retractions": 0,
+        "uncached": 36550
+      },
+      "astropy__astropy-14182": {
+        "calls": 29,
+        "prompt": 277464,
+        "cached": 256960,
+        "retractions": 0,
+        "uncached": 20504
+      },
+      "django__django-13297": {
+        "calls": 14,
+        "prompt": 138429,
+        "cached": 121216,
+        "retractions": 0,
+        "uncached": 17213
+      },
+      "django__django-13670": {
+        "calls": 31,
+        "prompt": 315293,
+        "cached": 297216,
+        "retractions": 0,
+        "uncached": 18077
+      },
+      "astropy__astropy-14508": {
+        "calls": 48,
+        "prompt": 821321,
+        "cached": 784256,
+        "retractions": 0,
+        "uncached": 37065
+      },
+      "django__django-13406": {
+        "calls": 64,
+        "prompt": 1046248,
+        "cached": 1012992,
+        "retractions": 0,
+        "uncached": 33256
+      },
+      "django__django-13212": {
+        "calls": 64,
+        "prompt": 1174828,
+        "cached": 1142080,
+        "retractions": 0,
+        "uncached": 32748
+      },
+      "django__django-13112": {
+        "calls": 64,
+        "prompt": 1434250,
+        "cached": 1392000,
+        "retractions": 0,
+        "uncached": 42250
+      },
+      "astropy__astropy-13453": {
+        "calls": 60,
+        "prompt": 1059082,
+        "cached": 1023296,
+        "retractions": 0,
+        "uncached": 35786
+      },
+      "django__django-11999": {
+        "calls": 64,
+        "prompt": 1346605,
+        "cached": 1310784,
+        "retractions": 0,
+        "uncached": 35821
+      },
+      "django__django-12325": {
+        "calls": 64,
+        "prompt": 1350916,
+        "cached": 1299648,
+        "retractions": 0,
+        "uncached": 51268
+      },
+      "django__django-13786": {
+        "calls": 64,
+        "prompt": 1442660,
+        "cached": 1403392,
+        "retractions": 0,
+        "uncached": 39268
+      },
+      "django__django-11749": {
+        "calls": 64,
+        "prompt": 1111488,
+        "cached": 1079040,
+        "retractions": 0,
+        "uncached": 32448
+      },
+      "django__django-11880": {
+        "calls": 59,
+        "prompt": 1095166,
+        "cached": 1064896,
+        "retractions": 0,
+        "uncached": 30270
+      },
+      "django__django-11951": {
+        "calls": 43,
+        "prompt": 332229,
+        "cached": 316160,
+        "retractions": 0,
+        "uncached": 16069
+      },
+      "django__django-12774": {
+        "calls": 64,
+        "prompt": 1192278,
+        "cached": 1158784,
+        "retractions": 0,
+        "uncached": 33494
+      },
+      "django__django-13741": {
+        "calls": 58,
+        "prompt": 770849,
+        "cached": 746816,
+        "retractions": 0,
+        "uncached": 24033
+      },
+      "django__django-12276": {
+        "calls": 53,
+        "prompt": 992544,
+        "cached": 959232,
+        "retractions": 0,
+        "uncached": 33312
+      },
+      "astropy__astropy-7336": {
+        "calls": 17,
+        "prompt": 104650,
+        "cached": 93632,
+        "retractions": 0,
+        "uncached": 11018
+      },
+      "django__django-11820": {
+        "calls": 41,
+        "prompt": 588356,
+        "cached": 562944,
+        "retractions": 0,
+        "uncached": 25412
+      },
+      "django__django-11299": {
+        "calls": 52,
+        "prompt": 967876,
+        "cached": 935296,
+        "retractions": 0,
+        "uncached": 32580
+      },
+      "django__django-13569": {
+        "calls": 64,
+        "prompt": 1606760,
+        "cached": 1565184,
+        "retractions": 0,
+        "uncached": 41576
+      },
+      "django__django-13794": {
+        "calls": 63,
+        "prompt": 1041120,
+        "cached": 1007168,
+        "retractions": 0,
+        "uncached": 33952
+      },
+      "django__django-13089": {
+        "calls": 64,
+        "prompt": 1047620,
+        "cached": 1011392,
+        "retractions": 0,
+        "uncached": 36228
+      },
+      "django__django-12155": {
+        "calls": 26,
+        "prompt": 284624,
+        "cached": 264320,
+        "retractions": 0,
+        "uncached": 20304
+      },
+      "django__django-12754": {
+        "calls": 64,
+        "prompt": 1147547,
+        "cached": 1111616,
+        "retractions": 0,
+        "uncached": 35931
+      },
+      "django__django-11211": {
+        "calls": 64,
+        "prompt": 1311092,
+        "cached": 1269568,
+        "retractions": 0,
+        "uncached": 41524
+      },
+      "django__django-13401": {
+        "calls": 64,
+        "prompt": 1155572,
+        "cached": 1120576,
+        "retractions": 0,
+        "uncached": 34996
+      },
+      "django__django-11138": {
+        "calls": 64,
+        "prompt": 2225845,
+        "cached": 2164672,
+        "retractions": 0,
+        "uncached": 61173
+      },
+      "django__django-11451": {
+        "calls": 18,
+        "prompt": 158723,
+        "cached": 142272,
+        "retractions": 0,
+        "uncached": 16451
+      },
+      "django__django-13417": {
+        "calls": 11,
+        "prompt": 34678,
+        "cached": 29568,
+        "retractions": 0,
+        "uncached": 5110
+      },
+      "django__django-13128": {
+        "calls": 64,
+        "prompt": 1136429,
+        "cached": 1101312,
+        "retractions": 0,
+        "uncached": 35117
+      },
+      "django__django-13512": {
+        "calls": 64,
+        "prompt": 803761,
+        "cached": 779136,
+        "retractions": 0,
+        "uncached": 24625
+      },
+      "django__django-11815": {
+        "calls": 64,
+        "prompt": 1003590,
+        "cached": 975168,
+        "retractions": 0,
+        "uncached": 28422
+      },
+      "astropy__astropy-13398": {
+        "calls": 64,
+        "prompt": 2152153,
+        "cached": 2094976,
+        "retractions": 0,
+        "uncached": 57177
+      },
+      "django__django-11095": {
+        "calls": 64,
+        "prompt": 724835,
+        "cached": 700032,
+        "retractions": 0,
+        "uncached": 24803
+      },
+      "django__django-12419": {
+        "calls": 64,
+        "prompt": 1036411,
+        "cached": 1008064,
+        "retractions": 0,
+        "uncached": 28347
+      },
+      "django__django-13363": {
+        "calls": 61,
+        "prompt": 1598017,
+        "cached": 1551104,
+        "retractions": 0,
+        "uncached": 46913
+      },
+      "django__django-12273": {
+        "calls": 64,
+        "prompt": 1416831,
+        "cached": 1378688,
+        "retractions": 0,
+        "uncached": 38143
+      },
+      "django__django-13807": {
+        "calls": 64,
+        "prompt": 712761,
+        "cached": 688128,
+        "retractions": 0,
+        "uncached": 24633
+      },
+      "django__django-13810": {
+        "calls": 25,
+        "prompt": 274234,
+        "cached": 254528,
+        "retractions": 0,
+        "uncached": 19706
+      },
+      "django__django-13820": {
+        "calls": 41,
+        "prompt": 521662,
+        "cached": 500544,
+        "retractions": 0,
+        "uncached": 21118
+      },
+      "django__django-13809": {
+        "calls": 64,
+        "prompt": 1495428,
+        "cached": 1452800,
+        "retractions": 0,
+        "uncached": 42628
+      },
+      "django__django-13821": {
+        "calls": 64,
+        "prompt": 1133143,
+        "cached": 1101440,
+        "retractions": 0,
+        "uncached": 31703
+      },
+      "django__django-13925": {
+        "calls": 64,
+        "prompt": 844123,
+        "cached": 816832,
+        "retractions": 0,
+        "uncached": 27291
+      },
+      "django__django-13837": {
+        "calls": 64,
+        "prompt": 1062855,
+        "cached": 1029824,
+        "retractions": 0,
+        "uncached": 33031
+      },
+      "django__django-13933": {
+        "calls": 64,
+        "prompt": 1065723,
+        "cached": 1034688,
+        "retractions": 0,
+        "uncached": 31035
+      },
+      "django__django-13964": {
+        "calls": 64,
+        "prompt": 1141906,
+        "cached": 1105344,
+        "retractions": 0,
+        "uncached": 36562
+      },
+      "django__django-14007": {
+        "calls": 64,
+        "prompt": 1068132,
+        "cached": 1032448,
+        "retractions": 0,
+        "uncached": 35684
+      },
+      "django__django-14011": {
+        "calls": 64,
+        "prompt": 1044279,
+        "cached": 1009216,
+        "retractions": 0,
+        "uncached": 35063
+      },
+      "django__django-14034": {
+        "calls": 64,
+        "prompt": 1447986,
+        "cached": 1403392,
+        "retractions": 0,
+        "uncached": 44594
+      },
+      "django__django-14017": {
+        "calls": 9,
+        "prompt": 29107,
+        "cached": 21696,
+        "retractions": 0,
+        "uncached": 7411
+      },
+      "django__django-14140": {
+        "calls": 46,
+        "prompt": 529360,
+        "cached": 508160,
+        "retractions": 0,
+        "uncached": 21200
+      },
+      "django__django-14122": {
+        "calls": 64,
+        "prompt": 1224375,
+        "cached": 1178752,
+        "retractions": 0,
+        "uncached": 45623
+      },
+      "django__django-14170": {
+        "calls": 64,
+        "prompt": 1451367,
+        "cached": 1405248,
+        "retractions": 0,
+        "uncached": 46119
+      },
+      "django__django-14089": {
+        "calls": 25,
+        "prompt": 215154,
+        "cached": 201536,
+        "retractions": 0,
+        "uncached": 13618
+      },
+      "django__django-14155": {
+        "calls": 52,
+        "prompt": 1052996,
+        "cached": 1018624,
+        "retractions": 0,
+        "uncached": 34372
+      },
+      "django__django-14053": {
+        "calls": 64,
+        "prompt": 1567742,
+        "cached": 1520384,
+        "retractions": 0,
+        "uncached": 47358
+      },
+      "django__django-14311": {
+        "calls": 62,
+        "prompt": 1131466,
+        "cached": 1093568,
+        "retractions": 0,
+        "uncached": 37898
+      },
+      "django__django-14238": {
+        "calls": 37,
+        "prompt": 421673,
+        "cached": 398720,
+        "retractions": 0,
+        "uncached": 22953
+      },
+      "django__django-14315": {
+        "calls": 35,
+        "prompt": 489891,
+        "cached": 462336,
+        "retractions": 0,
+        "uncached": 27555
+      },
+      "django__django-14349": {
+        "calls": 64,
+        "prompt": 1251875,
+        "cached": 1221504,
+        "retractions": 0,
+        "uncached": 30371
+      },
+      "django__django-14351": {
+        "calls": 64,
+        "prompt": 1546692,
+        "cached": 1497024,
+        "retractions": 0,
+        "uncached": 49668
+      },
+      "django__django-14376": {
+        "calls": 20,
+        "prompt": 134546,
+        "cached": 123136,
+        "retractions": 0,
+        "uncached": 11410
+      },
+      "django__django-14434": {
+        "calls": 56,
+        "prompt": 827641,
+        "cached": 797952,
+        "retractions": 0,
+        "uncached": 29689
+      },
+      "django__django-14493": {
+        "calls": 30,
+        "prompt": 248274,
+        "cached": 230912,
+        "retractions": 0,
+        "uncached": 17362
+      },
+      "django__django-14373": {
+        "calls": 20,
+        "prompt": 186968,
+        "cached": 169280,
+        "retractions": 0,
+        "uncached": 17688
+      },
+      "django__django-14534": {
+        "calls": 64,
+        "prompt": 1045847,
+        "cached": 1016832,
+        "retractions": 0,
+        "uncached": 29015
+      },
+      "django__django-14500": {
+        "calls": 64,
+        "prompt": 1337031,
+        "cached": 1300160,
+        "retractions": 0,
+        "uncached": 36871
+      },
+      "django__django-14539": {
+        "calls": 57,
+        "prompt": 1358739,
+        "cached": 1316928,
+        "retractions": 0,
+        "uncached": 41811
+      },
+      "django__django-14559": {
+        "calls": 53,
+        "prompt": 1024377,
+        "cached": 990976,
+        "retractions": 0,
+        "uncached": 33401
+      },
+      "django__django-14580": {
+        "calls": 57,
+        "prompt": 918858,
+        "cached": 892352,
+        "retractions": 0,
+        "uncached": 26506
+      },
+      "django__django-14725": {
+        "calls": 64,
+        "prompt": 1660826,
+        "cached": 1610240,
+        "retractions": 0,
+        "uncached": 50586
+      },
+      "django__django-14631": {
+        "calls": 64,
+        "prompt": 1067766,
+        "cached": 1038208,
+        "retractions": 0,
+        "uncached": 29558
+      },
+      "django__django-14672": {
+        "calls": 36,
+        "prompt": 358150,
+        "cached": 342464,
+        "retractions": 0,
+        "uncached": 15686
+      },
+      "django__django-14608": {
+        "calls": 64,
+        "prompt": 977407,
+        "cached": 948160,
+        "retractions": 0,
+        "uncached": 29247
+      },
+      "django__django-14404": {
+        "calls": 12,
+        "prompt": 57674,
+        "cached": 49536,
+        "retractions": 0,
+        "uncached": 8138
+      },
+      "django__django-14855": {
+        "calls": 64,
+        "prompt": 1071443,
+        "cached": 1037056,
+        "retractions": 0,
+        "uncached": 34387
+      },
+      "django__django-14752": {
+        "calls": 19,
+        "prompt": 210929,
+        "cached": 192896,
+        "retractions": 0,
+        "uncached": 18033
+      },
+      "django__django-14915": {
+        "calls": 59,
+        "prompt": 1149179,
+        "cached": 1111872,
+        "retractions": 0,
+        "uncached": 37307
+      },
+      "django__django-14765": {
+        "calls": 28,
+        "prompt": 212550,
+        "cached": 195072,
+        "retractions": 0,
+        "uncached": 17478
+      },
+      "django__django-14771": {
+        "calls": 64,
+        "prompt": 1309532,
+        "cached": 1269760,
+        "retractions": 0,
+        "uncached": 39772
+      },
+      "django__django-14787": {
+        "calls": 29,
+        "prompt": 272828,
+        "cached": 254848,
+        "retractions": 0,
+        "uncached": 17980
+      },
+      "django__django-14792": {
+        "calls": 64,
+        "prompt": 1608885,
+        "cached": 1561856,
+        "retractions": 0,
+        "uncached": 47029
+      },
+      "django__django-14999": {
+        "calls": 64,
+        "prompt": 1460315,
+        "cached": 1420608,
+        "retractions": 0,
+        "uncached": 39707
+      },
+      "django__django-15022": {
+        "calls": 63,
+        "prompt": 1665521,
+        "cached": 1612544,
+        "retractions": 0,
+        "uncached": 52977
+      },
+      "django__django-15037": {
+        "calls": 61,
+        "prompt": 1664318,
+        "cached": 1617728,
+        "retractions": 0,
+        "uncached": 46590
+      },
+      "django__django-15098": {
+        "calls": 64,
+        "prompt": 1103648,
+        "cached": 1070400,
+        "retractions": 0,
+        "uncached": 33248
+      },
+      "django__django-15277": {
+        "calls": 41,
+        "prompt": 266690,
+        "cached": 253504,
+        "retractions": 0,
+        "uncached": 13186
+      },
+      "django__django-15128": {
+        "calls": 46,
+        "prompt": 935401,
+        "cached": 899648,
+        "retractions": 0,
+        "uncached": 35753
+      },
+      "django__django-15278": {
+        "calls": 64,
+        "prompt": 1272677,
+        "cached": 1233216,
+        "retractions": 0,
+        "uncached": 39461
+      },
+      "django__django-15103": {
+        "calls": 40,
+        "prompt": 710816,
+        "cached": 681152,
+        "retractions": 0,
+        "uncached": 29664
+      },
+      "django__django-15104": {
+        "calls": 20,
+        "prompt": 177838,
+        "cached": 158016,
+        "retractions": 0,
+        "uncached": 19822
+      },
+      "django__django-15127": {
+        "calls": 43,
+        "prompt": 662687,
+        "cached": 633536,
+        "retractions": 0,
+        "uncached": 29151
+      },
+      "django__django-15161": {
+        "calls": 64,
+        "prompt": 992469,
+        "cached": 967296,
+        "retractions": 0,
+        "uncached": 25173
+      },
+      "django__django-15252": {
+        "calls": 64,
+        "prompt": 1445907,
+        "cached": 1394304,
+        "retractions": 0,
+        "uncached": 51603
+      },
+      "django__django-15315": {
+        "calls": 64,
+        "prompt": 1180983,
+        "cached": 1146752,
+        "retractions": 0,
+        "uncached": 34231
+      },
+      "django__django-15375": {
+        "calls": 64,
+        "prompt": 1015199,
+        "cached": 982016,
+        "retractions": 0,
+        "uncached": 33183
+      },
+      "django__django-15380": {
+        "calls": 64,
+        "prompt": 1602588,
+        "cached": 1556928,
+        "retractions": 0,
+        "uncached": 45660
+      },
+      "django__django-15554": {
+        "calls": 64,
+        "prompt": 1655708,
+        "cached": 1606976,
+        "retractions": 0,
+        "uncached": 48732
+      },
+      "django__django-15382": {
+        "calls": 64,
+        "prompt": 933546,
+        "cached": 902016,
+        "retractions": 0,
+        "uncached": 31530
+      },
+      "django__django-15467": {
+        "calls": 35,
+        "prompt": 299402,
+        "cached": 279360,
+        "retractions": 0,
+        "uncached": 20042
+      },
+      "django__django-15503": {
+        "calls": 64,
+        "prompt": 1735563,
+        "cached": 1685504,
+        "retractions": 0,
+        "uncached": 50059
+      },
+      "django__django-15525": {
+        "calls": 64,
+        "prompt": 1464425,
+        "cached": 1424320,
+        "retractions": 0,
+        "uncached": 40105
+      },
+      "django__django-15563": {
+        "calls": 64,
+        "prompt": 1578553,
+        "cached": 1524160,
+        "retractions": 0,
+        "uncached": 54393
+      },
+      "django__django-15569": {
+        "calls": 50,
+        "prompt": 599726,
+        "cached": 575872,
+        "retractions": 0,
+        "uncached": 23854
+      },
+      "django__django-15629": {
+        "calls": 46,
+        "prompt": 1164257,
+        "cached": 1103296,
+        "retractions": 0,
+        "uncached": 60961
+      },
+      "django__django-15280": {
+        "calls": 64,
+        "prompt": 1277704,
+        "cached": 1236224,
+        "retractions": 0,
+        "uncached": 41480
+      },
+      "django__django-15268": {
+        "calls": 64,
+        "prompt": 1513933,
+        "cached": 1468352,
+        "retractions": 0,
+        "uncached": 45581
+      },
+      "django__django-15368": {
+        "calls": 61,
+        "prompt": 1352315,
+        "cached": 1315136,
+        "retractions": 0,
+        "uncached": 37179
+      },
+      "django__django-15499": {
+        "calls": 64,
+        "prompt": 919088,
+        "cached": 889920,
+        "retractions": 0,
+        "uncached": 29168
+      },
+      "django__django-15732": {
+        "calls": 46,
+        "prompt": 788956,
+        "cached": 758848,
+        "retractions": 0,
+        "uncached": 30108
+      },
+      "django__django-15851": {
+        "calls": 33,
+        "prompt": 308143,
+        "cached": 284416,
+        "retractions": 0,
+        "uncached": 23727
+      },
+      "django__django-15916": {
+        "calls": 59,
+        "prompt": 1199214,
+        "cached": 1164608,
+        "retractions": 0,
+        "uncached": 34606
+      },
+      "django__django-15930": {
+        "calls": 64,
+        "prompt": 976497,
+        "cached": 945856,
+        "retractions": 0,
+        "uncached": 30641
+      },
+      "django__django-15957": {
+        "calls": 64,
+        "prompt": 1280328,
+        "cached": 1230848,
+        "retractions": 0,
+        "uncached": 49480
+      },
+      "django__django-15731": {
+        "calls": 19,
+        "prompt": 105546,
+        "cached": 94272,
+        "retractions": 0,
+        "uncached": 11274
+      },
+      "django__django-15863": {
+        "calls": 44,
+        "prompt": 648953,
+        "cached": 622336,
+        "retractions": 0,
+        "uncached": 26617
+      },
+      "django__django-15561": {
+        "calls": 64,
+        "prompt": 1538490,
+        "cached": 1493568,
+        "retractions": 0,
+        "uncached": 44922
+      },
+      "django__django-15572": {
+        "calls": 24,
+        "prompt": 167238,
+        "cached": 151104,
+        "retractions": 0,
+        "uncached": 16134
+      },
+      "django__django-15695": {
+        "calls": 64,
+        "prompt": 1031164,
+        "cached": 999360,
+        "retractions": 0,
+        "uncached": 31804
+      },
+      "django__django-15973": {
+        "calls": 64,
+        "prompt": 1842535,
+        "cached": 1788992,
+        "retractions": 0,
+        "uncached": 53543
+      },
+      "django__django-15741": {
+        "calls": 64,
+        "prompt": 1120589,
+        "cached": 1089024,
+        "retractions": 0,
+        "uncached": 31565
+      },
+      "django__django-16032": {
+        "calls": 33,
+        "prompt": 350972,
+        "cached": 331584,
+        "retractions": 0,
+        "uncached": 19388
+      },
+      "django__django-16082": {
+        "calls": 62,
+        "prompt": 1138569,
+        "cached": 1106048,
+        "retractions": 0,
+        "uncached": 32521
+      },
+      "django__django-16116": {
+        "calls": 64,
+        "prompt": 1254464,
+        "cached": 1218944,
+        "retractions": 0,
+        "uncached": 35520
+      },
+      "django__django-16145": {
+        "calls": 60,
+        "prompt": 1330477,
+        "cached": 1291456,
+        "retractions": 0,
+        "uncached": 39021
+      },
+      "django__django-16429": {
+        "calls": 52,
+        "prompt": 714518,
+        "cached": 688576,
+        "retractions": 0,
+        "uncached": 25942
+      },
+      "django__django-15814": {
+        "calls": 64,
+        "prompt": 1247734,
+        "cached": 1210176,
+        "retractions": 0,
+        "uncached": 37558
+      },
+      "django__django-15987": {
+        "calls": 39,
+        "prompt": 531073,
+        "cached": 504576,
+        "retractions": 0,
+        "uncached": 26497
+      },
+      "django__django-16100": {
+        "calls": 57,
+        "prompt": 1108751,
+        "cached": 1073088,
+        "retractions": 0,
+        "uncached": 35663
+      },
+      "django__django-16256": {
+        "calls": 64,
+        "prompt": 1203661,
+        "cached": 1166016,
+        "retractions": 0,
+        "uncached": 37645
+      },
+      "django__django-16139": {
+        "calls": 60,
+        "prompt": 1193363,
+        "cached": 1157440,
+        "retractions": 0,
+        "uncached": 35923
+      },
+      "django__django-16255": {
+        "calls": 15,
+        "prompt": 63102,
+        "cached": 56192,
+        "retractions": 0,
+        "uncached": 6910
+      },
+      "django__django-16136": {
+        "calls": 38,
+        "prompt": 487016,
+        "cached": 460416,
+        "retractions": 0,
+        "uncached": 26600
+      },
+      "django__django-16315": {
+        "calls": 36,
+        "prompt": 330607,
+        "cached": 312832,
+        "retractions": 0,
+        "uncached": 17775
+      },
+      "django__django-16333": {
+        "calls": 40,
+        "prompt": 518268,
+        "cached": 494528,
+        "retractions": 0,
+        "uncached": 23740
+      },
+      "django__django-16485": {
+        "calls": 48,
+        "prompt": 746685,
+        "cached": 717760,
+        "retractions": 0,
+        "uncached": 28925
+      },
+      "django__django-16493": {
+        "calls": 64,
+        "prompt": 1112629,
+        "cached": 1082688,
+        "retractions": 0,
+        "uncached": 29941
+      },
+      "django__django-16263": {
+        "calls": 64,
+        "prompt": 928672,
+        "cached": 897920,
+        "retractions": 0,
+        "uncached": 30752
+      },
+      "django__django-16595": {
+        "calls": 35,
+        "prompt": 428133,
+        "cached": 405504,
+        "retractions": 0,
+        "uncached": 22629
+      },
+      "django__django-16612": {
+        "calls": 54,
+        "prompt": 708276,
+        "cached": 683456,
+        "retractions": 0,
+        "uncached": 24820
+      },
+      "django__django-16642": {
+        "calls": 40,
+        "prompt": 447410,
+        "cached": 428480,
+        "retractions": 0,
+        "uncached": 18930
+      },
+      "django__django-16877": {
+        "calls": 64,
+        "prompt": 1013695,
+        "cached": 983296,
+        "retractions": 0,
+        "uncached": 30399
+      },
+      "django__django-16899": {
+        "calls": 53,
+        "prompt": 714998,
+        "cached": 690944,
+        "retractions": 0,
+        "uncached": 24054
+      },
+      "django__django-16667": {
+        "calls": 27,
+        "prompt": 283786,
+        "cached": 262528,
+        "retractions": 0,
+        "uncached": 21258
+      },
+      "django__django-16801": {
+        "calls": 39,
+        "prompt": 672685,
+        "cached": 643712,
+        "retractions": 0,
+        "uncached": 28973
+      },
+      "django__django-16819": {
+        "calls": 64,
+        "prompt": 1310860,
+        "cached": 1276864,
+        "retractions": 0,
+        "uncached": 33996
+      },
+      "django__django-16901": {
+        "calls": 64,
+        "prompt": 1537575,
+        "cached": 1496832,
+        "retractions": 0,
+        "uncached": 40743
+      },
+      "django__django-17084": {
+        "calls": 64,
+        "prompt": 1372570,
+        "cached": 1332160,
+        "retractions": 0,
+        "uncached": 40410
+      },
+      "django__django-17087": {
+        "calls": 64,
+        "prompt": 1232294,
+        "cached": 1199040,
+        "retractions": 0,
+        "uncached": 33254
+      },
+      "matplotlib__matplotlib-14623": {
+        "calls": 17,
+        "prompt": 88552,
+        "cached": 78912,
+        "retractions": 0,
+        "uncached": 9640
+      },
+      "matplotlib__matplotlib-20488": {
+        "calls": 64,
+        "prompt": 1422856,
+        "cached": 1382080,
+        "retractions": 0,
+        "uncached": 40776
+      },
+      "matplotlib__matplotlib-20676": {
+        "calls": 64,
+        "prompt": 1331680,
+        "cached": 1295488,
+        "retractions": 0,
+        "uncached": 36192
+      },
+      "matplotlib__matplotlib-20826": {
+        "calls": 43,
+        "prompt": 546889,
+        "cached": 522752,
+        "retractions": 0,
+        "uncached": 24137
+      },
+      "matplotlib__matplotlib-20859": {
+        "calls": 64,
+        "prompt": 943632,
+        "cached": 914112,
+        "retractions": 0,
+        "uncached": 29520
+      },
+      "matplotlib__matplotlib-22719": {
+        "calls": 45,
+        "prompt": 539482,
+        "cached": 517184,
+        "retractions": 0,
+        "uncached": 22298
+      },
+      "matplotlib__matplotlib-22871": {
+        "calls": 64,
+        "prompt": 1330186,
+        "cached": 1294336,
+        "retractions": 0,
+        "uncached": 35850
+      },
+      "matplotlib__matplotlib-23299": {
+        "calls": 64,
+        "prompt": 1093324,
+        "cached": 1061376,
+        "retractions": 0,
+        "uncached": 31948
+      },
+      "django__django-16560": {
+        "calls": 49,
+        "prompt": 1318952,
+        "cached": 1271040,
+        "retractions": 0,
+        "uncached": 47912
+      },
+      "django__django-16502": {
+        "calls": 64,
+        "prompt": 1605093,
+        "cached": 1561920,
+        "retractions": 0,
+        "uncached": 43173
+      },
+      "django__django-16454": {
+        "calls": 57,
+        "prompt": 1202531,
+        "cached": 1163264,
+        "retractions": 0,
+        "uncached": 39267
+      },
+      "django__django-16661": {
+        "calls": 64,
+        "prompt": 1669789,
+        "cached": 1620864,
+        "retractions": 0,
+        "uncached": 48925
+      },
+      "django__django-16631": {
+        "calls": 64,
+        "prompt": 1644084,
+        "cached": 1599168,
+        "retractions": 0,
+        "uncached": 44916
+      },
+      "django__django-16662": {
+        "calls": 50,
+        "prompt": 781239,
+        "cached": 751296,
+        "retractions": 0,
+        "uncached": 29943
+      },
+      "matplotlib__matplotlib-23412": {
+        "calls": 64,
+        "prompt": 1006208,
+        "cached": 975552,
+        "retractions": 0,
+        "uncached": 30656
+      },
+      "matplotlib__matplotlib-24149": {
+        "calls": 56,
+        "prompt": 1088639,
+        "cached": 1052672,
+        "retractions": 0,
+        "uncached": 35967
+      },
+      "matplotlib__matplotlib-24177": {
+        "calls": 15,
+        "prompt": 111608,
+        "cached": 98624,
+        "retractions": 0,
+        "uncached": 12984
+      },
+      "django__django-16569": {
+        "calls": 20,
+        "prompt": 111996,
+        "cached": 98496,
+        "retractions": 0,
+        "uncached": 13500
+      },
+      "django__django-16938": {
+        "calls": 64,
+        "prompt": 1627143,
+        "cached": 1579840,
+        "retractions": 0,
+        "uncached": 47303
+      },
+      "matplotlib__matplotlib-23314": {
+        "calls": 64,
+        "prompt": 984002,
+        "cached": 954560,
+        "retractions": 0,
+        "uncached": 29442
+      },
+      "matplotlib__matplotlib-21568": {
+        "calls": 26,
+        "prompt": 344560,
+        "cached": 321728,
+        "retractions": 0,
+        "uncached": 22832
+      },
+      "matplotlib__matplotlib-24570": {
+        "calls": 28,
+        "prompt": 371961,
+        "cached": 346112,
+        "retractions": 0,
+        "uncached": 25849
+      },
+      "matplotlib__matplotlib-13989": {
+        "calls": 27,
+        "prompt": 244482,
+        "cached": 227712,
+        "retractions": 0,
+        "uncached": 16770
+      },
+      "django__django-17029": {
+        "calls": 50,
+        "prompt": 760866,
+        "cached": 724800,
+        "retractions": 0,
+        "uncached": 36066
+      },
+      "matplotlib__matplotlib-24637": {
+        "calls": 64,
+        "prompt": 1305561,
+        "cached": 1263680,
+        "retractions": 0,
+        "uncached": 41881
+      },
+      "django__django-16950": {
+        "calls": 64,
+        "prompt": 1409827,
+        "cached": 1366784,
+        "retractions": 0,
+        "uncached": 43043
+      },
+      "django__django-7530": {
+        "calls": 53,
+        "prompt": 853448,
+        "cached": 823488,
+        "retractions": 0,
+        "uncached": 29960
+      },
+      "django__django-16527": {
+        "calls": 35,
+        "prompt": 310777,
+        "cached": 292416,
+        "retractions": 0,
+        "uncached": 18361
+      },
+      "matplotlib__matplotlib-24026": {
+        "calls": 17,
+        "prompt": 141039,
+        "cached": 126592,
+        "retractions": 0,
+        "uncached": 14447
+      },
+      "matplotlib__matplotlib-24870": {
+        "calls": 25,
+        "prompt": 314673,
+        "cached": 292352,
+        "retractions": 0,
+        "uncached": 22321
+      },
+      "matplotlib__matplotlib-24970": {
+        "calls": 36,
+        "prompt": 333910,
+        "cached": 315840,
+        "retractions": 0,
+        "uncached": 18070
+      },
+      "matplotlib__matplotlib-24627": {
+        "calls": 64,
+        "prompt": 983748,
+        "cached": 956096,
+        "retractions": 0,
+        "uncached": 27652
+      },
+      "matplotlib__matplotlib-23476": {
+        "calls": 64,
+        "prompt": 1163568,
+        "cached": 1127488,
+        "retractions": 0,
+        "uncached": 36080
+      },
+      "django__django-9296": {
+        "calls": 20,
+        "prompt": 124202,
+        "cached": 111744,
+        "retractions": 0,
+        "uncached": 12458
+      },
+      "matplotlib__matplotlib-25287": {
+        "calls": 14,
+        "prompt": 48786,
+        "cached": 43072,
+        "retractions": 0,
+        "uncached": 5714
+      },
+      "matplotlib__matplotlib-22865": {
+        "calls": 49,
+        "prompt": 705315,
+        "cached": 679808,
+        "retractions": 0,
+        "uncached": 25507
+      },
+      "matplotlib__matplotlib-25479": {
+        "calls": 51,
+        "prompt": 799546,
+        "cached": 769920,
+        "retractions": 0,
+        "uncached": 29626
+      },
+      "matplotlib__matplotlib-25122": {
+        "calls": 29,
+        "prompt": 256968,
+        "cached": 237248,
+        "retractions": 0,
+        "uncached": 19720
+      },
+      "matplotlib__matplotlib-25311": {
+        "calls": 64,
+        "prompt": 1217997,
+        "cached": 1180672,
+        "retractions": 0,
+        "uncached": 37325
+      },
+      "matplotlib__matplotlib-25775": {
+        "calls": 64,
+        "prompt": 899798,
+        "cached": 870464,
+        "retractions": 0,
+        "uncached": 29334
+      },
+      "matplotlib__matplotlib-25960": {
+        "calls": 64,
+        "prompt": 1046549,
+        "cached": 1010752,
+        "retractions": 0,
+        "uncached": 35797
+      },
+      "matplotlib__matplotlib-26466": {
+        "calls": 56,
+        "prompt": 1242096,
+        "cached": 1202432,
+        "retractions": 0,
+        "uncached": 39664
+      },
+      "matplotlib__matplotlib-26208": {
+        "calls": 64,
+        "prompt": 946644,
+        "cached": 912320,
+        "retractions": 0,
+        "uncached": 34324
+      },
+      "matplotlib__matplotlib-26291": {
+        "calls": 41,
+        "prompt": 594631,
+        "cached": 568320,
+        "retractions": 0,
+        "uncached": 26311
+      },
+      "matplotlib__matplotlib-26342": {
+        "calls": 59,
+        "prompt": 995097,
+        "cached": 963840,
+        "retractions": 0,
+        "uncached": 31257
+      },
+      "mwaskom__seaborn-3069": {
+        "calls": 64,
+        "prompt": 1304898,
+        "cached": 1270848,
+        "retractions": 0,
+        "uncached": 34050
+      },
+      "psf__requests-1142": {
+        "calls": 35,
+        "prompt": 379757,
+        "cached": 358784,
+        "retractions": 0,
+        "uncached": 20973
+      },
+      "psf__requests-1724": {
+        "calls": 55,
+        "prompt": 949191,
+        "cached": 914880,
+        "retractions": 0,
+        "uncached": 34311
+      },
+      "psf__requests-1921": {
+        "calls": 64,
+        "prompt": 1436385,
+        "cached": 1394624,
+        "retractions": 0,
+        "uncached": 41761
+      },
+      "matplotlib__matplotlib-26113": {
+        "calls": 38,
+        "prompt": 396993,
+        "cached": 377408,
+        "retractions": 0,
+        "uncached": 19585
+      },
+      "psf__requests-1766": {
+        "calls": 30,
+        "prompt": 210053,
+        "cached": 196032,
+        "retractions": 0,
+        "uncached": 14021
+      },
+      "psf__requests-2317": {
+        "calls": 64,
+        "prompt": 828127,
+        "cached": 800192,
+        "retractions": 0,
+        "uncached": 27935
+      },
+      "pallets__flask-5014": {
+        "calls": 64,
+        "prompt": 1127787,
+        "cached": 1096960,
+        "retractions": 0,
+        "uncached": 30827
+      },
+      "psf__requests-5414": {
+        "calls": 64,
+        "prompt": 882360,
+        "cached": 852992,
+        "retractions": 0,
+        "uncached": 29368
+      },
+      "psf__requests-6028": {
+        "calls": 64,
+        "prompt": 1179114,
+        "cached": 1143872,
+        "retractions": 0,
+        "uncached": 35242
+      },
+      "pydata__xarray-3305": {
+        "calls": 34,
+        "prompt": 296516,
+        "cached": 277312,
+        "retractions": 0,
+        "uncached": 19204
+      },
+      "psf__requests-2931": {
+        "calls": 56,
+        "prompt": 854340,
+        "cached": 824256,
+        "retractions": 0,
+        "uncached": 30084
+      },
+      "pydata__xarray-3993": {
+        "calls": 58,
+        "prompt": 905189,
+        "cached": 871680,
+        "retractions": 0,
+        "uncached": 33509
+      },
+      "pydata__xarray-3151": {
+        "calls": 22,
+        "prompt": 208896,
+        "cached": 190400,
+        "retractions": 0,
+        "uncached": 18496
+      },
+      "pydata__xarray-4075": {
+        "calls": 23,
+        "prompt": 202557,
+        "cached": 185856,
+        "retractions": 0,
+        "uncached": 16701
+      },
+      "pydata__xarray-3677": {
+        "calls": 42,
+        "prompt": 663698,
+        "cached": 634816,
+        "retractions": 0,
+        "uncached": 28882
+      },
+      "pydata__xarray-4356": {
+        "calls": 5,
+        "prompt": 8547,
+        "cached": 5504,
+        "retractions": 0,
+        "uncached": 3043
+      },
+      "pydata__xarray-4629": {
+        "calls": 24,
+        "prompt": 140319,
+        "cached": 129216,
+        "retractions": 0,
+        "uncached": 11103
+      },
+      "pydata__xarray-4695": {
+        "calls": 40,
+        "prompt": 795886,
+        "cached": 758080,
+        "retractions": 0,
+        "uncached": 37806
+      },
+      "pydata__xarray-7393": {
+        "calls": 53,
+        "prompt": 648943,
+        "cached": 624896,
+        "retractions": 0,
+        "uncached": 24047
+      },
+      "pylint-dev__pylint-4661": {
+        "calls": 47,
+        "prompt": 715441,
+        "cached": 688576,
+        "retractions": 0,
+        "uncached": 26865
+      },
+      "pylint-dev__pylint-6903": {
+        "calls": 30,
+        "prompt": 400287,
+        "cached": 375552,
+        "retractions": 0,
+        "uncached": 24735
+      },
+      "pydata__xarray-7233": {
+        "calls": 44,
+        "prompt": 646879,
+        "cached": 616704,
+        "retractions": 0,
+        "uncached": 30175
+      },
+      "pylint-dev__pylint-6528": {
+        "calls": 64,
+        "prompt": 1064045,
+        "cached": 1034688,
+        "retractions": 0,
+        "uncached": 29357
+      },
+      "pylint-dev__pylint-7277": {
+        "calls": 18,
+        "prompt": 142836,
+        "cached": 126784,
+        "retractions": 0,
+        "uncached": 16052
+      },
+      "pytest-dev__pytest-10051": {
+        "calls": 34,
+        "prompt": 451854,
+        "cached": 430144,
+        "retractions": 0,
+        "uncached": 21710
+      },
+      "pytest-dev__pytest-10356": {
+        "calls": 64,
+        "prompt": 1203335,
+        "cached": 1171008,
+        "retractions": 0,
+        "uncached": 32327
+      },
+      "pytest-dev__pytest-5262": {
+        "calls": 33,
+        "prompt": 368987,
+        "cached": 349760,
+        "retractions": 0,
+        "uncached": 19227
+      },
+      "pytest-dev__pytest-10081": {
+        "calls": 59,
+        "prompt": 1116457,
+        "cached": 1083776,
+        "retractions": 0,
+        "uncached": 32681
+      },
+      "pylint-dev__pylint-8898": {
+        "calls": 64,
+        "prompt": 1149865,
+        "cached": 1116544,
+        "retractions": 0,
+        "uncached": 33321
+      },
+      "pytest-dev__pytest-6202": {
+        "calls": 40,
+        "prompt": 386979,
+        "cached": 367360,
+        "retractions": 0,
+        "uncached": 19619
+      },
+      "pytest-dev__pytest-5809": {
+        "calls": 11,
+        "prompt": 36728,
+        "cached": 30976,
+        "retractions": 0,
+        "uncached": 5752
+      },
+      "pytest-dev__pytest-5631": {
+        "calls": 49,
+        "prompt": 688205,
+        "cached": 655680,
+        "retractions": 0,
+        "uncached": 32525
+      },
+      "pytest-dev__pytest-8399": {
+        "calls": 50,
+        "prompt": 831542,
+        "cached": 805952,
+        "retractions": 0,
+        "uncached": 25590
+      },
+      "pytest-dev__pytest-7205": {
+        "calls": 52,
+        "prompt": 745707,
+        "cached": 719360,
+        "retractions": 0,
+        "uncached": 26347
+      },
+      "pytest-dev__pytest-7982": {
+        "calls": 64,
+        "prompt": 1092767,
+        "cached": 1051136,
+        "retractions": 0,
+        "uncached": 41631
+      },
+      "pytest-dev__pytest-7521": {
+        "calls": 37,
+        "prompt": 513301,
+        "cached": 488960,
+        "retractions": 0,
+        "uncached": 24341
+      },
+      "scikit-learn__scikit-learn-10844": {
+        "calls": 29,
+        "prompt": 212562,
+        "cached": 197376,
+        "retractions": 0,
+        "uncached": 15186
+      },
+      "scikit-learn__scikit-learn-10908": {
+        "calls": 28,
+        "prompt": 285731,
+        "cached": 267776,
+        "retractions": 0,
+        "uncached": 17955
+      },
+      "pytest-dev__pytest-7432": {
+        "calls": 18,
+        "prompt": 133143,
+        "cached": 119616,
+        "retractions": 0,
+        "uncached": 13527
+      },
+      "scikit-learn__scikit-learn-11578": {
+        "calls": 16,
+        "prompt": 195822,
+        "cached": 175296,
+        "retractions": 0,
+        "uncached": 20526
+      },
+      "scikit-learn__scikit-learn-12585": {
+        "calls": 20,
+        "prompt": 162174,
+        "cached": 147456,
+        "retractions": 0,
+        "uncached": 14718
+      },
+      "scikit-learn__scikit-learn-13135": {
+        "calls": 24,
+        "prompt": 247398,
+        "cached": 230016,
+        "retractions": 0,
+        "uncached": 17382
+      },
+      "scikit-learn__scikit-learn-13439": {
+        "calls": 16,
+        "prompt": 88545,
+        "cached": 79040,
+        "retractions": 0,
+        "uncached": 9505
+      },
+      "scikit-learn__scikit-learn-13779": {
+        "calls": 25,
+        "prompt": 164033,
+        "cached": 150720,
+        "retractions": 0,
+        "uncached": 13313
+      },
+      "scikit-learn__scikit-learn-14053": {
+        "calls": 24,
+        "prompt": 242784,
+        "cached": 223040,
+        "retractions": 0,
+        "uncached": 19744
+      },
+      "scikit-learn__scikit-learn-14141": {
+        "calls": 14,
+        "prompt": 35863,
+        "cached": 31040,
+        "retractions": 0,
+        "uncached": 4823
+      },
+      "scikit-learn__scikit-learn-14894": {
+        "calls": 20,
+        "prompt": 173615,
+        "cached": 157952,
+        "retractions": 0,
+        "uncached": 15663
+      },
+      "scikit-learn__scikit-learn-15100": {
+        "calls": 41,
+        "prompt": 360448,
+        "cached": 338560,
+        "retractions": 0,
+        "uncached": 21888
+      },
+      "scikit-learn__scikit-learn-14983": {
+        "calls": 45,
+        "prompt": 514884,
+        "cached": 490624,
+        "retractions": 0,
+        "uncached": 24260
+      },
+      "scikit-learn__scikit-learn-14496": {
+        "calls": 21,
+        "prompt": 151834,
+        "cached": 138816,
+        "retractions": 0,
+        "uncached": 13018
+      },
+      "scikit-learn__scikit-learn-12682": {
+        "calls": 64,
+        "prompt": 1303640,
+        "cached": 1259904,
+        "retractions": 0,
+        "uncached": 43736
+      },
+      "scikit-learn__scikit-learn-12973": {
+        "calls": 23,
+        "prompt": 179065,
+        "cached": 162752,
+        "retractions": 0,
+        "uncached": 16313
+      },
+      "scikit-learn__scikit-learn-25931": {
+        "calls": 33,
+        "prompt": 427990,
+        "cached": 404800,
+        "retractions": 0,
+        "uncached": 23190
+      },
+      "scikit-learn__scikit-learn-25973": {
+        "calls": 30,
+        "prompt": 443724,
+        "cached": 411264,
+        "retractions": 0,
+        "uncached": 32460
+      },
+      "scikit-learn__scikit-learn-13142": {
+        "calls": 26,
+        "prompt": 339643,
+        "cached": 318208,
+        "retractions": 0,
+        "uncached": 21435
+      },
+      "sphinx-doc__sphinx-7462": {
+        "calls": 31,
+        "prompt": 225641,
+        "cached": 210048,
+        "retractions": 0,
+        "uncached": 15593
+      },
+      "sphinx-doc__sphinx-8120": {
+        "calls": 16,
+        "prompt": 145435,
+        "cached": 130560,
+        "retractions": 0,
+        "uncached": 14875
+      },
+      "sphinx-doc__sphinx-8621": {
+        "calls": 16,
+        "prompt": 110374,
+        "cached": 93824,
+        "retractions": 0,
+        "uncached": 16550
+      },
+      "sphinx-doc__sphinx-9230": {
+        "calls": 13,
+        "prompt": 87274,
+        "cached": 75072,
+        "retractions": 0,
+        "uncached": 12202
+      },
+      "sphinx-doc__sphinx-9367": {
+        "calls": 19,
+        "prompt": 134353,
+        "cached": 120000,
+        "retractions": 0,
+        "uncached": 14353
+      },
+      "sympy__sympy-13480": {
+        "calls": 12,
+        "prompt": 30383,
+        "cached": 25152,
+        "retractions": 0,
+        "uncached": 5231
+      },
+      "sphinx-doc__sphinx-8548": {
+        "calls": 4,
+        "prompt": 5662,
+        "cached": 2624,
+        "retractions": 0,
+        "uncached": 3038
+      }
+    },
+    "middle_retractions": 0
+  },
+  "raw_decode": {
+    "calls": 25262,
+    "prompt": 445526640,
+    "decode": 4946973,
+    "uncached": 15520560,
+    "retractions": 0
+  },
+  "raw_missing_metrics_skipped": {
+    "prefill-0": 684,
+    "prefill-1": 765
+  },
+  "raw_skipped_finish_reasons": {
+    "{'type': 'abort', 'message': 'Abort in waiting queue'}": 1449
+  },
+  "paths": {
+    "event_counts": {
+      "fast_arrival": 4,
+      "registered_arena_prewarm_complete": 28,
+      "startup_prewarm_complete": 8,
+      "tp_p2d_decode_select": 38098,
+      "request_seen": 50524,
+      "direct_offer": 50498,
+      "fast_arrival_seen": 18229,
+      "direct_rank_send_complete": 15512,
+      "fast_arrival_retained_tp": 18229,
+      "d_generation_release": 50524,
+      "tp_decode_release_commit": 50498,
+      "direct_fallback": 9762,
+      "slow_host_select": 9605,
+      "host_staging_offer": 19504,
+      "shared_host_d2h_start": 19504,
+      "registered_host_extent": 53624,
+      "shared_host_d2h_complete": 19504,
+      "d_release_after_p_host": 9752,
+      "direct_abort_published": 317,
+      "direct_session_returned": 428,
+      "app_final_release": 411,
+      "slow_host_select_fallback": 147,
+      "p2d_host_h2d_complete": 7384,
+      "final_skip": 26,
+      "tp_p2d_prefill_submit_select": 2,
+      "tp_p2d_prefill_head": 18618,
+      "tp_p2d_prefill_select": 10014,
+      "tp_p2d_submit": 43140,
+      "p_to_d_release": 50524,
+      "early_direct_start": 31602,
+      "early_direct_group_complete": 15086,
+      "early_direct_bind": 39756,
+      "early_direct_bind_prepared": 39756,
+      "early_direct_admit": 30172,
+      "direct_before_enqueue": 30172,
+      "direct_after_enqueue": 30172,
+      "p_rematch": 30316,
+      "shared_host_remote_map": 9642,
+      "shared_host_materialize_complete": 19352,
+      "shared_host_h2d_start": 19352,
+      "shared_host_h2d_complete": 19352,
+      "shared_host_group_commit_release": 19352,
+      "tp_direct_abort_requested": 839,
+      "early_direct_drop": 1438,
+      "tp_direct_background_abort_complete": 839,
+      "shared_host_extent_ready": 19504,
+      "shared_host_ready": 19504,
+      "stale": 3051,
+      "shared_host_remote_recovery_release": 9642,
+      "direct_abort_complete": 464,
+      "early_direct_abort_deferred": 389,
+      "p2d_host_d2h_queued": 7384,
+      "p2d_host_d2h_complete": 7384,
+      "p2d_host_release": 7384,
+      "p2d_host_prefill_release": 7384,
+      "shared_host_final_release": 152,
+      "tp_direct_stale_abort": 4
+    },
+    "missing_host_arrivals": 0,
+    "windows": {
+      "full": {
+        "direct": 15086,
+        "slow": 9676,
+        "mean_snapshot_occupancy_approx": {
+          "host_ready_arrived_wait_io": 23.187523071400204,
+          "host_ready_arrived_wait_hbm": 24.413304876135488,
+          "host_wait_next_arrival": 1.6152789748777185,
+          "h2d_io_wall_envelope": 1.225781804735282
+        }
+      },
+      "middle": {
+        "direct": 5175,
+        "slow": 2770,
+        "mean_snapshot_occupancy_approx": {
+          "host_ready_arrived_wait_io": 36.393584041992824,
+          "host_ready_arrived_wait_hbm": 38.36889392217,
+          "host_wait_next_arrival": 1.1506905392805735,
+          "h2d_io_wall_envelope": 1.97530988017718
+        }
+      }
+    }
+  },
+  "tail": [
+    {
+      "instance": "sympy__sympy-22456",
+      "finished_after_s": 4616.924172401428,
+      "latency": 1541.0429310798645,
+      "model": 1478.1302034645341,
+      "tool": 50.03015416441485,
+      "verifier": 4.114926198031753,
+      "verifier_status": "completed"
+    },
+    {
+      "instance": "sympy__sympy-23413",
+      "finished_after_s": 4828.750174999237,
+      "latency": 1729.6548244953156,
+      "model": 1665.0953645347618,
+      "tool": 49.55613549007103,
+      "verifier": 3.250769117847085,
+      "verifier_status": "completed"
+    },
+    {
+      "instance": "scikit-learn__scikit-learn-14710",
+      "finished_after_s": 6428.208482265472,
+      "latency": 4332.036762237549,
+      "model": 400.43717109039426,
+      "tool": 1527.6659427792765,
+      "verifier": 2400.203065769747,
+      "verifier_status": "timeout"
+    }
+  ],
+  "limitations": [
+    "Pool gauges are non-evictable usage; full occupied/free split was not exported.",
+    "No ideal increment inferred from prompt lengths alone: exact token/checkpoint alignment requires separate audit.",
+    "Host stage occupancy uses one-second log timestamps; TP ranks are grouped. No byte-occupancy history inferred from final tombstones."
+  ]
+}

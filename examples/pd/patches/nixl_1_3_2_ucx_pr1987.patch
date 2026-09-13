@@ -1,0 +1,137 @@
+diff --git a/src/plugins/ucx/ucx_backend.cpp b/src/plugins/ucx/ucx_backend.cpp
+index 900344a..578e998 100644
+--- a/src/plugins/ucx/ucx_backend.cpp
++++ b/src/plugins/ucx/ucx_backend.cpp
+@@ -989,6 +989,12 @@ nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
+             // TODO: err: remote connection not found
+             return NIXL_ERR_NOT_FOUND;
+         }
++        for (size_t i = 0; i < uws.size(); ++i) {
++            const nixl_status_t status = it->second->getEp(i)->checkTxState();
++            if (status != NIXL_SUCCESS) {
++                return status;
++            }
++        }
+         // nixlSerDes::_stringToBytes() was used to "unpack" blob here.
+         output = new nixlUcxPublicMetadata(
+             it->second, makePublicMetadataRkeys(it->second, uws.size(), blob.data()));
+diff --git a/src/plugins/ucx/ucx_utils.cpp b/src/plugins/ucx/ucx_utils.cpp
+index 97f22d0..3b0aa4b 100644
+--- a/src/plugins/ucx/ucx_utils.cpp
++++ b/src/plugins/ucx/ucx_utils.cpp
+@@ -86,15 +86,15 @@ err_cb_wrapper(void *arg, ucp_ep_h ucp_ep, ucs_status_t status) {
+ 
+ void
+ nixlUcxEp::err_cb(ucp_ep_h ucp_ep, ucs_status_t status) {
+-    ucs_status_ptr_t request;
++    const auto current_state = state_.load(std::memory_order_relaxed);
+ 
+-    NIXL_DEBUG << "ep " << eph << ": state " << state
++    NIXL_DEBUG << "ep " << eph << ": state " << current_state
+                << ", UCX error handling callback was invoked with status " << status << " ("
+                << ucs_status_string(status) << ")";
+ 
+     NIXL_ASSERT(eph == ucp_ep);
+ 
+-    switch (state) {
++    switch (current_state) {
+     case nixl::ucx::ep_state_t::UNINITIALIZED:
+     case nixl::ucx::ep_state_t::FAILED:
+         // The error was already handled, nothing to do
+@@ -103,39 +103,45 @@ nixlUcxEp::err_cb(ucp_ep_h ucp_ep, ucs_status_t status) {
+         return;
+     case nixl::ucx::ep_state_t::CONNECTED:
+         setState(nixl::ucx::ep_state_t::FAILED);
+-        request = ucp_ep_close_nb(ucp_ep, UCP_EP_CLOSE_MODE_FORCE);
+-        if (UCS_PTR_IS_PTR(request)) {
+-            ucp_request_free(request);
+-        }
+         return;
+     }
+-    NIXL_FATAL << "Invalid endpoint state: " << state;
++    NIXL_FATAL << "Invalid endpoint state: " << current_state;
+     std::terminate();
+ }
+ 
+ void
+ nixlUcxEp::setState(nixl::ucx::ep_state_t new_state) {
+-    NIXL_ASSERT(new_state != state);
+-    NIXL_DEBUG << "ep " << eph << ": state " << state << " -> " << new_state;
+-    state = new_state;
++    const auto old_state = state_.load(std::memory_order_relaxed);
++    NIXL_ASSERT(new_state != old_state);
++    NIXL_DEBUG << "ep " << eph << ": state " << old_state << " -> " << new_state;
++    state_ = new_state;
+ }
+ 
+ nixl_status_t
+ nixlUcxEp::closeImpl(ucp_ep_close_flags_t flags) {
+     ucs_status_ptr_t request = nullptr;
++    const nixl::ucx::ep_state_t current_state = state_;
+     ucp_request_param_t req_param = {.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS, .flags = flags};
+ 
+-    switch (state) {
++    switch (current_state) {
+     case nixl::ucx::ep_state_t::UNINITIALIZED:
+     case nixl::ucx::ep_state_t::DISCONNECTED:
+         // The EP has not been connected, or already disconnected.
+         // Nothing to do.
+         NIXL_ASSERT(eph == nullptr);
+         return NIXL_SUCCESS;
+-    case nixl::ucx::ep_state_t::FAILED:
+-        // The EP was closed in error callback, just return error.
++    case nixl::ucx::ep_state_t::FAILED: {
++        const ucp_request_param_t force_req_param = {
++            .op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS,
++            .flags = UCP_EP_CLOSE_FLAG_FORCE,
++        };
++        request = ucp_ep_close_nbx(eph, &force_req_param);
++        if (UCS_PTR_IS_PTR(request)) {
++            ucp_request_free(request);
++        }
+         eph = nullptr;
+         return NIXL_ERR_REMOTE_DISCONNECT;
++    }
+     case nixl::ucx::ep_state_t::CONNECTED:
+         request = ucp_ep_close_nbx(eph, &req_param);
+         if (request == nullptr) {
+@@ -152,7 +158,7 @@ nixlUcxEp::closeImpl(ucp_ep_close_flags_t flags) {
+         eph = nullptr;
+         return NIXL_SUCCESS;
+     }
+-    NIXL_FATAL << "Invalid endpoint state: " << state;
++    NIXL_FATAL << "Invalid endpoint state: " << current_state;
+     std::terminate();
+ }
+ 
+diff --git a/src/plugins/ucx/ucx_utils.h b/src/plugins/ucx/ucx_utils.h
+index 0b05b08..9852d7c 100644
+--- a/src/plugins/ucx/ucx_utils.h
++++ b/src/plugins/ucx/ucx_utils.h
+@@ -17,6 +17,7 @@
+ #ifndef NIXL_SRC_UTILS_UCX_UCX_UTILS_H
+ #define NIXL_SRC_UTILS_UCX_UCX_UTILS_H
+ 
++#include <atomic>
+ #include <memory>
+ #include <type_traits>
+ 
+@@ -62,7 +63,7 @@ class nixlUcxMem;
+ class nixlUcxEp {
+ private:
+     ucp_ep_h eph{nullptr};
+-    nixl::ucx::ep_state_t state = nixl::ucx::ep_state_t::UNINITIALIZED;
++    std::atomic<nixl::ucx::ep_state_t> state_{nixl::ucx::ep_state_t::UNINITIALIZED};
+ 
+     void
+     setState(nixl::ucx::ep_state_t new_state);
+@@ -82,7 +83,7 @@ public:
+ 
+     [[nodiscard]] nixl_status_t
+     checkTxState() const noexcept {
+-        return nixl::ucx::toNixlStatus(state);
++        return nixl::ucx::toNixlStatus(state_);
+     }
+ 
+     nixlUcxEp(ucp_worker_h worker, void *addr, ucp_err_handling_mode_t err_handling_mode);
+

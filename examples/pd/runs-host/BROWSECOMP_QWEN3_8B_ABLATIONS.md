@@ -1,99 +1,162 @@
-# BrowseComp + Qwen3-8B：D→P 路径消融实验
+# BrowseComp + Qwen3-8B：完整方案与消融
 
-## 对齐设置
+2026-09-09更新。第一行固定为 **全局Slow恢复拥堵反馈重算** 完整方案（5148组）。
+此前混合失败出口的旧结果已从此表移除；“Direct失败一律重算”使用新的4668组。
+其余保留结果作为消融或基线参考，不把旧数据重新标成同一代码版本测试。
 
-四组实验采用完全相同的服务负载，仅改变表中注明的 D→P 路径策略。
+## 对齐配置与方法差异
 
-| 项目 | 设置 |
+共同配置：Qwen3-8B，BrowseComp固定source-order n680循环，TP=1、4P:4D、c512，
+temperature=0/top_p=1/top_k=-1，300秒业务预热＋1200秒正式测量。
+P四卡0.80，D四卡0.80/0.80/0.80/0.60，搜索服务在GPU7。
+自定义方法原生HiCache/Mooncake关闭；启用Host的方向沿用D→P 128 GiB/P、P→D 32 GiB/P，
+D接收目标1.0，P→D grace=0.5秒，预注册完成后才开始业务预热。
+
+| 方案 | 具体语义 |
 |---|---|
-| 模型 | Qwen3-8B |
-| 数据 | BrowseComp，固定 source-order `n680`，完成后按同一顺序循环 |
-| PD 配置 | 4P:4D，TP=1，全局 Host 恢复 |
-| 并发 | 512 个 closed-loop Agent |
-| 采样 | `temperature=0`、`top_p=1`、`top_k=-1` |
-| 时间 | 300 秒预热 + 1,200 秒正式测量 |
-| 原生 HiCache/Mooncake | 关闭 |
-| P 显存比例 | 四张 P 均为 `mem_fraction_static=0.80` |
-| D 显存比例 | `0.80/0.80/0.80/0.60`；GPU 7 同时运行搜索服务 |
-| D 接收目标 | `D_TARGET_KV_FRACTION=1.0` |
-| P→D Host 判定等待 | 0.5 秒 |
-| P→D Host 慢路径 | 四组均开启 |
+| 完整方案 | 工具>1秒走Slow；快工具Direct失败后，恢复队列拥堵则重算，否则Slow |
+| 快慢路径 | 去掉拥堵反馈，快工具Direct失败也总是Slow；保留容量保护/显式驱逐等原有正确性出口 |
+| 仅慢路径 | 不尝试D→P Direct，所有可复用parent均走Host |
+| Direct失败一律重算 | 工具>1秒仍Slow；快工具Direct失败，无论是否曾claim，安全取消后均重算，不看拥堵 |
+| 仅快路径＋失败重算 | 工具不设实际可触发的快慢阈值；返回后尝试Direct，建链超过1秒重算，关闭D→P Slow |
+| 纯重算（当前方法单变量消融） | 保留当前方法的P→D late binding、D Router和P→D Host；仅关闭D→P Direct/Slow，所有后续轮完整Prefill |
+| P→D预绑定＋仅Direct（失败） | 关闭P→D late binding和P→D Host；预热阶段发生D transfer与P workset环形等待，不计吞吐 |
+| 关闭P→D Host | 保留P→D late binding和D→P全部路径，只关闭Prefill完成KV的Shared Host staging |
+| 原生No-reverse PD参考 | 同样不回传D→P KV，但使用原生PD预留/transfer控制路径，不是当前方法的单变量消融 |
 
-## 四种消融语义
+完整方案Q：工具已返回、Host durable、尚未被H2D worker接手的唯一parent generation。
+跨P不重复、等待工具不计入；每秒采样，连续两次Q≥32启用重算，Q≤8退出。
+Q不包括worker接手后的CPU准备/DMA；信号缺失或超过3秒陈旧则保守Slow。
+已claim的Direct失败也必须遵循DMA fence，不能因为拥堵提前释放源KV。
 
-1. **快慢路径**：工具在 1 秒内返回则尝试 Direct；Direct 在 1 秒内未建立，
-   或工具超过 1 秒才返回，均进入 Slow。这是旧版完整方法。
-2. **慢路径**：D→P Direct 完全关闭，所有可复用 parent snapshot 均进入
-   Shared Host Arena。
-3. **快慢路径 + 重算（当前新方法）**：工具超过 1 秒才返回时进入 Slow；工具
-   在 1 秒内返回则尝试 Direct，Direct 在 1 秒内未建立时显式完整重算，不再
-   转入 Slow。
-4. **快路径 + 重算**：不设置实际可触发的工具快慢阈值；工具返回后均尝试
-   Direct，Direct 在 1 秒内未建立时完整重算，D→P Slow 关闭。
+**可比性限制：**纯重算已使用当前自定义引擎单开关正式重跑；原生No-reverse PD只作为控制路径参考，
+不能用来单独归因反向KV收益。其余结果是相同工作负载/显存设置下的历史正式运行，
+并非全部同一commit同步重跑。表中性能差异不能全部机械归因于单一开关。
 
-## 正式结果
+## 正式吞吐
 
-| 方案 | Decode token/s | 单张 D | Agent/s | 相对“快慢路径” | 状态 |
-|---|---:|---:|---:|---:|---|
-| 快慢路径 | 4,550.7 | 1,137.7 | 2.247 | 基准 | 完成 |
-| 慢路径 | 4,398.1 | 1,099.5 | 2.161 | -3.35% | 完成 |
-| **快慢路径 + 重算（当前新方法）** | **4,888.2** | **1,222.1** | **2.275** | **+7.42%** | **完成** |
-| 快路径 + 重算 | 4,584.4 | 1,146.1 | 2.217 | +0.74% | 完成 |
+Decode为四张D的总墙钟吞吐，单张D为总量除以4。
 
-## 资源与数据特征
+| 方案 | Decode token/s | 单张D token/s | Agent/s | 相对完整方案 |
+|---|---:|---:|---:|---:|
+| 完整方案：快慢路径＋拥堵反馈重算 | 5,148.4 | 1,287.1 | 2.387 | 基准 |
+| 消融：快慢路径 | 4,550.7 | 1,137.7 | 2.247 | -11.61% |
+| 消融：仅慢路径 | 4,398.1 | 1,099.5 | 2.161 | -14.57% |
+| 消融：Direct失败一律重算 | 4,668.1 | 1,167.0 | 2.293 | -9.33% |
+| 消融：仅快路径＋失败重算 | 4,584.4 | 1,146.1 | 2.217 | -10.95% |
+| 消融：纯重算（仅关闭D→P） | 1,938.8 | 484.7 | 0.957 | -62.34% |
+| 消融：P→D预绑定＋仅Direct | 失败（预热停滞） | — | — | 不计 |
+| 消融：关闭P→D Host | 4,867.7 | 1,216.9 | 2.388 | -5.45% |
+| 控制路径参考：原生No-reverse PD | 1,984.4 | 496.1 | 0.966 | -61.46% |
 
-所有利用率和队列指标均为 1,200 秒正式窗口的平均值。Forward 按每张物理 GPU
-统计；KV、queue、running、prealloc 和 transfer 也换算为每张卡平均值。
+## P→D Host消融（单独并发表）
 
-| 方案 | Prefill token/s | 实际 Prefill/Agent | Decode/Agent | 父KV复用率 | P Forward | D Forward | P KV | P queue | P inflight | D KV | D running | D prealloc | D transfer |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 快慢路径 | 31,537 | 14,000 | 2,020 | **99.30%** | 83.08% | 96.91% | 96.78% | 13.22 | 13.03 | 86.41% | 53.77 | 1.77 | 0.30 |
-| 慢路径 | 31,708 | 14,637 | 2,030 | 97.55% | 84.42% | 94.85% | 83.40% | 3.04 | 11.30 | 85.80% | 58.44 | 1.85 | 0.32 |
-| **快慢路径 + 重算（当前新方法）** | **38,232** | 16,790 | 2,147 | 93.44% | 97.04% | 99.62% | 50.60% | 65.37 | 6.38 | 70.49% | 48.44 | 1.30 | 0.20 |
-| 快路径 + 重算 | 38,429 | 17,299 | 2,064 | 91.17% | 98.10% | 99.72% | 50.12% | 69.42 | 6.23 | 70.18% | 44.79 | 1.12 | 0.20 |
+细粒度复核：[c512/c576/统一Host池的30秒分析](analysis/p2d-host-c512-c576/ANALYSIS.md)，
+[时间序列图](analysis/p2d-host-c512-c576/time_slices_30s.png)。
 
-“父KV复用率”是 page-aligned parent-prefix token 的复用率。重算方案用更多
-P 计算换取更少的反向 Host 传输，因此该指标下降是显式策略结果，不代表 KV
-无故丢失。
+以下按c512、c576分别比较。各组均为4P:4D、source-order n680、temperature=0、
+P显存比例均0.80、D为0.80/0.80/0.80/0.60、300秒业务预热＋1200秒正式测量；消融只关闭
+P→D Shared Host Arena，保留late binding以及D→P Direct/Slow/拥堵反馈重算。
 
-## 路径统计
+### c512
 
-下表计数覆盖整轮运行，包括 300 秒预热及正式窗口边界附近的尾部事件，不应直接
-除以 1,200 秒吞吐计数。比例仅以已经得到明确路径结果的 snapshot 为分母。
+| c512方案 | Decode token/s | 单张D token/s | Agent/s | P Forward | D Forward | P KV | D KV | D running |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 完整方案 | **5,148.4** | **1,287.1** | 2.387 | 88.99% | 99.07% | 55.01% | 74.91% | 52.48 |
+| 消融：关闭P→D Host | 4,867.7 | 1,216.9 | 2.388 | 93.08% | 99.29% | 59.9% | 68.8% | 46.78 |
 
-| 方案 | D→P Direct完成 | D→P Slow/fallback | Direct失败重算 | D→P路径比例 | P→D Host D2H/H2D |
-|---|---:|---:|---:|---|---:|
-| 快慢路径 | 3,829 | 5,145 | 0 | 42.7% Direct / 57.3% Slow | 7,253 / 7,225 |
-| 慢路径 | 0 | 9,435 | 0 | 100% Slow | 6,991 / 6,950 |
-| **快慢路径 + 重算（当前新方法）** | **8,207** | 427 | 637 | 88.5% Direct / 4.6% Slow / 6.9%重算 | 4,690 / 4,650 |
-| 快路径 + 重算 | 7,998 | 0 | 740 | 91.5% Direct / 8.5%重算 | 4,601 / 4,488 |
+关闭P→D Host后，本轮Decode吞吐下降5.45%，Agent/s基本持平；窗口Decode/完成Agent
+由2153降至2034 tokens，完成集合差异需一并考虑。路径、分段和Host统计见
+[c512完整报告](current/ablations/browsecomp-qwen3-8b-4p4d-c512/p2d-host-disabled-20260910-r1/RESULTS.md)。
 
-## 结论
+### c576
 
-- “慢路径”比“快慢路径”低 3.35%。所有 parent KV 都支付 D2H、Host
-  ownership/recovery 和 H2D 开销后，D Forward 也是四组最低。
-- “快慢路径 + 重算”吞吐最高。这个 workload 下 P 有计算余量；将少量失败
-  Direct 改为重算，显著减少 D→P Host 压力，使 D Forward 达到 99.62%。
-- 该收益存在明确代价：实际 Prefill 从 14.0k 增至 16.8k tokens/Agent，父KV
-  复用率从 99.30% 降至 93.44%。因此必须同时报告吞吐、重算次数和额外Prefill。
-- “快路径 + 重算”取消了慢工具的 Host 保护，重算更多，但吞吐只比“快慢路径”
-  高 0.74%。Slow 仍应保留给慢工具，不能被完全删除。
-- 根据这组对齐消融，后续文档中的“当前新方法”专指第3种“快慢路径 + 重算”。
-  旧“Direct失败→Slow”的实验均属于历史方案，需要按新语义重跑。
+| c576方案 | Decode token/s | 单张D token/s | Agent/s | P Forward | D Forward | P KV | D KV | D running |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 完整方案（旧独立Host） | 4,822.5 | 1,205.6 | 2.334 | 90.57% | 99.11% | 57.2% | 76.8% | 49.61 |
+| 消融：关闭P→D Host | **4,965.7** | **1,241.4** | **2.395** | 93.87% | 99.43% | 54.6% | 69.0% | 47.54 |
 
-## 结果目录
+本次单轮提高2.97%，但完成集合及轨迹存在自然差异，不能据此直接认定所有负载下
+关闭P→D Host都更优。路径、分段和生命周期核对见
+[c576完整报告](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/current-method-p2d-direct-only-20260910-r1/RESULTS.md)。
 
-| 方案 | 目录 |
-|---|---|
-| 快慢路径 | `current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260907-r3/full-1s` |
-| 慢路径 | `current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260907-r3/d2p-slow-only-1s` |
-| 快慢路径 + 重算 | `current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260908-r4/fast-direct-fail-recompute-1s` |
-| 快路径 + 重算 | `current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260908-r9/direct-only-recompute-1s` |
+## 数据与计算量
 
-## 正确性说明
+| 方案 | Prefill token/s | 实际Prefill/完成Agent | Decode/完成Agent | 父KV token复用率 |
+|---|---:|---:|---:|---:|
+| 完整方案：快慢路径＋拥堵反馈重算 | 35,195 | 14,719 | 2,153 | 96.30% |
+| 消融：快慢路径 | 31,537 | 14,000 | 2,020 | 99.30% |
+| 消融：仅慢路径 | 31,708 | 14,637 | 2,030 | 97.55% |
+| 消融：Direct失败一律重算 | 38,707 | 16,845 | 2,032 | 91.12% |
+| 消融：仅快路径＋失败重算 | 38,429 | 17,299 | 2,064 | 91.17% |
+| 消融：纯重算（仅关闭D→P） | 43,009 | 44,890 | 2,024 | 0.00%（D→P） |
+| 消融：关闭P→D Host | 36,332 | 15,185 | 2,034 | 96.44% |
+| 控制路径参考：原生No-reverse PD | 42,803 | 44,251 | 2,051 | 0.00% |
 
-“快路径 + 重算”初次测试暴露了一个生命周期边界：P 可能在 NIXL 尚未提交前
-退回 Direct claim，使 D 停留在 `DIRECT_READY` 并等待已经被消费的 marker。
-修复后，该状态会在 D 释放 KV 前原子、持久地转为显式重算。最终正式窗口完成
-2,660 个 Agent，请求失败为 0，没有 Router 500 或 600 秒 P-ready 超时；
-相关 SGLang Agentic-PD 专项测试为 `326 passed`。
+Prefill/完成Agent、Decode/完成Agent为窗口引擎计算量除以完成数；
+父KV复用为完成轨迹的page-aligned parent-prefix token比例，显式重算也计入未复用量，不等于KV无故丢失。
+
+## KV、队列与Forward
+
+正式窗口每物理卡/每引擎平均值。
+
+| 方案 | P Forward | P KV | P queue | P inflight | D Forward | D KV | D running | D prealloc | D transfer |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 完整方案：快慢路径＋拥堵反馈重算 | 88.99% | 55.01% | 55.76 | 9.37 | 99.07% | 74.91% | 52.48 | 1.65 | 0.20 |
+| 消融：快慢路径 | 83.08% | 96.78% | 13.22 | 13.03 | 96.91% | 86.41% | 53.77 | 1.77 | 0.30 |
+| 消融：仅慢路径 | 84.42% | 83.40% | 3.04 | 11.30 | 94.85% | 85.80% | 58.44 | 1.85 | 0.32 |
+| 消融：Direct失败一律重算 | 98.10% | 45.68% | 72.41 | 5.90 | 99.64% | 65.02% | 43.14 | 1.03 | 0.18 |
+| 消融：仅快路径＋失败重算 | 98.10% | 50.12% | 69.42 | 6.23 | 99.72% | 70.18% | 44.79 | 1.12 | 0.20 |
+| 消融：纯重算（仅关闭D→P） | 99.99% | 8.62% | 118.83 | 1.00 | 98.94% | 10.73% | 6.96 | 0.03 | 0.03 |
+| 消融：关闭P→D Host | 93.08% | 59.9% | 67.35 | 9.44 | 99.29% | 68.8% | 46.78 | 1.28 | 0.13 |
+| 控制路径参考：原生No-reverse PD | 99.20% | 7.92% | 16.84 | 0.72 | 98.59% | 92.01% | 8.63 | 100.05 | 19.25 |
+
+## 正式窗口路径计数
+
+下表统一为1200秒，不再混用含预热的整轮计数。路径按snapshot去重；
+重复fallback尝试不重复计数，Slow选择与Host完成事件的少量差额按原始边界分别保留。
+比例分母仅为三类已记录路径结果，不是Agent比例。
+纯重算不创建D→P snapshot事件；“4090次终态释放”是正式窗口内D完成generation的计数，
+不能把0个Direct/Slow事件写成0%重算。P→D仍使用当前方法，本轮D始终可接收，未触发P→D Host。
+
+| 方案 | Direct完成 | Slow | 显式重算 | Direct / Slow / 重算 | D→P Host写入 / 恢复 | P→D Host写入 / 恢复 |
+|---|---:|---:|---:|---|---|---|
+| 完整方案：快慢路径＋拥堵反馈重算 | 5,785 | 1,126 | 244 | 80.85% / 15.74% / 3.41% | 1,126 / 1,095 | 3,090 / 3,013 |
+| 消融：快慢路径 | 2,839 | 4,068 | 0 | 41.10% / 58.90% / 0.00% | 4,068 / 4,020 | 5,901 / 5,895 |
+| 消融：仅慢路径 | 0 | 7,321 | 0 | 0.00% / 100.00% / 0.00% | 7,318 / 6,463 | 5,647 / 5,656 |
+| 消融：Direct失败一律重算 | 6,413 | 80 | 518 | 91.47% / 1.14% / 7.39% | 80 / 66 | 2,375 / 2,375 |
+| 消融：仅快路径＋失败重算 | 6,417 | 0 | 499 | 92.78% / 0.00% / 7.22% | 0 / 0 | 3,482 / 3,482 |
+| 消融：纯重算（仅关闭D→P） | 0 | 0 | 全部后续轮完整Prefill | 不适用 | 0 / 0 | 0 / 0 |
+| 消融：关闭P→D Host | 5,815 | 1,450 | 324 | 76.62% / 19.11% / 4.27% | 1,450 / 1,447 | 0 / 0 |
+| 控制路径参考：原生No-reverse PD | 不适用 | 不适用 | 全部后续轮不回传重算 | 不适用 | 不适用 | 不适用 |
+
+## 完整方案Slow详细核对
+
+- 正式窗口D→Host写入1126个、1991.7 GiB，1126个均有D HBM释放记录。
+- 同批snapshot中1095个窗口内恢复到P；29个在边界后恢复；2个Agent因budget结束不再需要下一轮。
+- H2D窗口累计1947.2 GiB。累计GiB不是同时Host占用量。
+- Host durable到H2D开始平均约4.76秒，P90约10.45秒；该值为已恢复集合按秒级日志匹配，
+  不含尚未恢复项，不能当作D→Host排队耗时。
+- D2H任务墙钟平均288毫秒、H2D任务墙钟平均251毫秒；前者不包含启动D2H前全部排队。
+- P→D Host写入3090、恢复3013；4次P释放及1次D→P Host释放跨窗口边界，已找到释放记录。
+- Q样本平均4.8、峰值42，拥堵模式占采样4.4%；不是精确的时间加权占比。
+- 正式请求失败0，CPU回归446项通过、独立审核GO。预算终止后Host清理及时性仍需核对，
+  不把“无恢复需求”自动解释为Host已经释放。
+
+完整方案在当前保留结果中吞吐最高，同时相较固定失败重算提高了父KV复用。
+这是一轮配置匹配比较，尚不是多seed显著性结论；c384/c576需按完整方案重测。
+
+## 原始结果
+
+- 完整方案：快慢路径＋拥堵反馈重算：[summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-slow-congestion-1s-20260909-r1/offload_analysis_summary.json)，目录：`current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-slow-congestion-1s-20260909-r1`。
+- 消融：快慢路径：[summary](current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260907-r3/full-1s/offload_analysis_summary.json)，目录：`current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260907-r3/full-1s`。
+- 消融：仅慢路径：[summary](current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260907-r3/d2p-slow-only-1s/offload_analysis_summary.json)，目录：`current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260907-r3/d2p-slow-only-1s`。
+- 消融：Direct失败一律重算：[summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-all-direct-fail-recompute-1s-20260909-r2/offload_analysis_summary.json)，目录：`current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-all-direct-fail-recompute-1s-20260909-r2`。
+- 消融：仅快路径＋失败重算：[summary](current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260908-r9/direct-only-recompute-1s/offload_analysis_summary.json)，目录：`current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260908-r9/direct-only-recompute-1s`。
+- 消融：纯重算（仅关闭D→P）：[summary](current/ablations/browsecomp-qwen3-8b-4p4d-c512/pure-recompute-20260909-r1/offload_analysis_summary.json)，目录：`current/ablations/browsecomp-qwen3-8b-4p4d-c512/pure-recompute-20260909-r1`。
+- 消融：P→D预绑定＋仅Direct：[失败记录](current/ablations/browsecomp-qwen3-8b-4p4d-c512/p2d-prebind-direct-only-20260909-r1/FAILURE.md)，目录：`current/ablations/browsecomp-qwen3-8b-4p4d-c512/p2d-prebind-direct-only-20260909-r1`。
+- 消融：关闭P→D Host：[完整报告](current/ablations/browsecomp-qwen3-8b-4p4d-c512/p2d-host-disabled-20260910-r1/RESULTS.md)，[summary](current/ablations/browsecomp-qwen3-8b-4p4d-c512/p2d-host-disabled-20260910-r1/offload_analysis_summary.json)，目录：`current/ablations/browsecomp-qwen3-8b-4p4d-c512/p2d-host-disabled-20260910-r1`。
+- 控制路径参考：原生No-reverse PD：[summary](current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/no_reverse-aligned-20260908-r1/offload_analysis_summary.json)，目录：`current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/no_reverse-aligned-20260908-r1`。
+- c576关闭P→D Host：[summary](current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/current-method-p2d-direct-only-20260910-r1/offload_analysis_summary.json)，目录：`current/qwen3-8b-tp1-browsecomp-c576-w300-m1200/current-method-p2d-direct-only-20260910-r1`。
+
+主矩阵：[BrowseComp + Qwen3-8B](BROWSECOMP_QWEN3_8B.md)。

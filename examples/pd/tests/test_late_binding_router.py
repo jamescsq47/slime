@@ -6,7 +6,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 import orjson
 import late_binding_router as late_binding_router_module
 from agentic_kv_request import build_agentic_extra_key
@@ -88,6 +88,7 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
         router._prefill_direct_pending_tokens = [0, 0]
         router._prefill_work_tiebreak = 0
         router.ablation_random_routing = False
+        router.p2d_prebind_ablation = False
         router._routing_rng = random.Random(2026)
         router._prefill_pressure_domains = []
         router._prefill_pressure_at = 0.0
@@ -101,6 +102,333 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
 
         self.addAsyncCleanup(close_sessions)
         return router
+
+    async def test_p2d_prebind_submits_decode_before_prefill_and_skips_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.p2d_prebind_ablation = True
+            router.p2d_host_staging = False
+            router.numa_domains = False
+            router.dynamic_prefill_domains = False
+            router.early_claim_store = None
+            router.max_prefill_inflight = 4
+            router._prefill_admission = _PrefillAdmissionGate(4)
+            router._wait_until_prefill_accepted = AsyncMock()
+            router._wait_until_prefill_scheduled = AsyncMock()
+            router._wait_until_prefill_ready = AsyncMock(return_value=1024)
+            router._stage_p2d_until_durable = AsyncMock()
+            reservation = DecodeReservation(
+                reservation_id="prebound",
+                url="http://d0",
+                prompt_tokens=1024,
+                admission_tokens=1536,
+                request_count=1,
+                rooms=(7,),
+                created_at=0.0,
+            )
+            router._select_and_reserve_decode = AsyncMock(
+                return_value=reservation
+            )
+            router._release_reservation_when_admitted = AsyncMock()
+            decode_submitted = asyncio.Event()
+
+            class Response:
+                status = 200
+
+                async def read(self):
+                    return b"{}"
+
+                def release(self):
+                    return None
+
+            class Session:
+                def __init__(self):
+                    self.calls = []
+                    self.prefill_stream = None
+
+                async def post(self, url, **kwargs):
+                    self.calls.append(url)
+                    if url == "http://d0/generate":
+                        decode_submitted.set()
+                    elif url == "http://p0/generate":
+                        self.assert_decode_was_first = decode_submitted.is_set()
+                        self.prefill_stream = kwargs["json"].get("stream")
+                    return Response()
+
+            session = Session()
+            await router._late_dispatch(
+                session,
+                {
+                    "bootstrap_room": 7,
+                    "input_ids": list(range(1024)),
+                    "sampling_params": {},
+                },
+                "http://p0",
+                "generate",
+                {},
+            )
+
+            self.assertTrue(session.assert_decode_was_first)
+            self.assertEqual(
+                session.calls,
+                ["http://d0/generate", "http://p0/generate"],
+            )
+            self.assertIs(session.prefill_stream, False)
+            router._stage_p2d_until_durable.assert_not_awaited()
+            router._select_and_reserve_decode.assert_awaited_once()
+            await router.close()
+
+    async def test_p2d_prebind_selection_failure_does_not_take_p_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.p2d_prebind_ablation = True
+            router.p2d_host_staging = False
+            router.numa_domains = False
+            router.dynamic_prefill_domains = False
+            router.early_claim_store = None
+            router.max_prefill_inflight = 1
+            router._prefill_admission = _PrefillAdmissionGate(1)
+            router._select_and_reserve_decode = AsyncMock(
+                side_effect=TimeoutError("no D capacity")
+            )
+
+            class Session:
+                async def post(self, *_args, **_kwargs):
+                    raise AssertionError("no backend request should be submitted")
+
+            with self.assertRaisesRegex(TimeoutError, "no D capacity"):
+                await router._late_dispatch(
+                    Session(),
+                    {
+                        "bootstrap_room": 8,
+                        "input_ids": [1, 2, 3],
+                        "sampling_params": {},
+                    },
+                    "http://p0",
+                    "generate",
+                    {},
+                )
+            self.assertEqual(router._prefill_admission.active, 0)
+
+    async def test_p2d_prebind_wait_has_deadline_after_decode_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.ready_timeout = 0.01
+
+            class Response:
+                status = 200
+
+            async def pending():
+                await asyncio.Future()
+
+            prefill_task = asyncio.create_task(pending())
+            decode_task = asyncio.create_task(asyncio.sleep(0, result=Response()))
+            try:
+                with self.assertRaisesRegex(
+                    TimeoutError, "native pre-bound Prefill"
+                ):
+                    await router._wait_prebound_prefill_or_redirect(
+                        prefill_task, decode_task, None
+                    )
+            finally:
+                prefill_task.cancel()
+                await asyncio.gather(prefill_task, return_exceptions=True)
+
+    async def test_p2d_prebind_keeps_d_credit_when_abort_is_not_acknowledged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.p2d_prebind_ablation = True
+            router.p2d_host_staging = False
+            router.numa_domains = False
+            router.dynamic_prefill_domains = False
+            router.early_claim_store = None
+            router.max_prefill_inflight = 1
+            router._prefill_admission = _PrefillAdmissionGate(1)
+            reservation = DecodeReservation(
+                reservation_id="abort-not-acked",
+                url="http://d0",
+                prompt_tokens=3,
+                admission_tokens=515,
+                request_count=1,
+                rooms=(9,),
+                created_at=time.monotonic(),
+            )
+
+            async def reserve(*_args, **_kwargs):
+                router._reservations[reservation.reservation_id] = reservation
+                return reservation
+
+            router._select_and_reserve_decode = reserve
+            router._wait_until_prefill_accepted = AsyncMock(
+                side_effect=RuntimeError("P failed")
+            )
+            async def abort_prefill(_session, _server, _request, task):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                return True
+
+            router._abort_prefill_attempt = AsyncMock(side_effect=abort_prefill)
+            router._abort_decode_attempt = AsyncMock(return_value=False)
+
+            class Session:
+                async def post(self, *_args, **_kwargs):
+                    await asyncio.Future()
+
+            with self.assertRaisesRegex(RuntimeError, "P failed"):
+                await router._late_dispatch(
+                    Session(),
+                    {
+                        "bootstrap_room": 9,
+                        "input_ids": [1, 2, 3],
+                        "sampling_params": {},
+                    },
+                    "http://p0",
+                    "generate",
+                    {},
+                )
+            self.assertEqual(router._prefill_admission.active, 0)
+            self.assertIn("abort-not-acked", router._reservations)
+
+    async def test_p2d_prebind_cancel_after_p_fence_aborts_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.p2d_prebind_ablation = True
+            router.p2d_host_staging = False
+            router.numa_domains = False
+            router.dynamic_prefill_domains = False
+            router.early_claim_store = None
+            router.max_prefill_inflight = 1
+            router._prefill_admission = _PrefillAdmissionGate(1)
+            router._wait_until_prefill_accepted = AsyncMock()
+            reservation = DecodeReservation(
+                reservation_id="cancel-after-p",
+                url="http://d0",
+                prompt_tokens=3,
+                admission_tokens=515,
+                request_count=1,
+                rooms=(10,),
+                created_at=time.monotonic(),
+            )
+
+            async def reserve(*_args, **_kwargs):
+                router._reservations[reservation.reservation_id] = reservation
+                return reservation
+
+            router._select_and_reserve_decode = reserve
+            router._abort_prefill_attempt = AsyncMock(return_value=True)
+            router._abort_decode_attempt = AsyncMock(return_value=True)
+            p_fenced = asyncio.Event()
+
+            class Response:
+                status = 200
+
+                async def read(self):
+                    p_fenced.set()
+                    return b"{}"
+
+                def release(self):
+                    return None
+
+            class Session:
+                async def post(self, url, **_kwargs):
+                    if url == "http://d0/generate":
+                        await asyncio.Future()
+                    return Response()
+
+            task = asyncio.create_task(
+                router._late_dispatch(
+                    Session(),
+                    {
+                        "bootstrap_room": 10,
+                        "input_ids": [1, 2, 3],
+                        "sampling_params": {},
+                    },
+                    "http://p0",
+                    "generate",
+                    {},
+                )
+            )
+            await asyncio.wait_for(p_fenced.wait(), timeout=1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+            router._abort_decode_attempt.assert_awaited_once()
+            self.assertEqual(router._prefill_admission.active, 0)
+            self.assertEqual(router._active_prefill_attempts, {})
+
+    async def test_p2d_prebind_redirect_replaces_owner_without_leaking_old_room(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = self.make_router(Path(directory))
+            router.p2d_prebind_ablation = True
+            router.p2d_host_staging = False
+            router.numa_domains = False
+            router.dynamic_prefill_domains = True
+            router.early_claim_store = None
+            router.max_prefill_inflight = 1
+            router._prefill_admission = _PrefillAdmissionGate(1)
+            router._prefill_admissions = [
+                _PrefillAdmissionGate(1),
+                _PrefillAdmissionGate(1),
+            ]
+            router._wait_until_prefill_accepted = AsyncMock()
+            router._abort_prefill_attempt = AsyncMock(return_value=True)
+            router._abort_decode_attempt = AsyncMock(return_value=True)
+            router._ensure_prefill_pressure_monitor = lambda: None
+            work = _PrefillWorkReservation(domain=0, tokens=3)
+            router._prefill_pending_tokens = [3, 0]
+            router._prefill_pending_requests = [1, 0]
+            router._resolve_dynamic_prefill_work = AsyncMock(return_value=work)
+            reservations = [
+                DecodeReservation(
+                    reservation_id=f"redirect-{index}",
+                    url="http://d0",
+                    prompt_tokens=3,
+                    admission_tokens=515,
+                    request_count=1,
+                    rooms=(10 + index,),
+                    created_at=time.monotonic(),
+                )
+                for index in range(2)
+            ]
+
+            async def reserve(*_args, **_kwargs):
+                reservation = reservations.pop(0)
+                router._reservations[reservation.reservation_id] = reservation
+                return reservation
+
+            router._select_and_reserve_decode = reserve
+
+            class Response:
+                status = 200
+
+                async def read(self):
+                    return b"{}"
+
+                def release(self):
+                    return None
+
+            router._wait_prebound_prefill_or_redirect = AsyncMock(
+                side_effect=[
+                    late_binding_router_module._PrefillRedirect(1, "host"),
+                    Response(),
+                ]
+            )
+
+            class Session:
+                async def post(self, *_args, **_kwargs):
+                    return Response()
+
+            request = {
+                "bootstrap_room": 10,
+                "input_ids": [1, 2, 3],
+                "sampling_params": {},
+            }
+            await router._late_dispatch(
+                Session(), request, "http://p0", "generate", {}
+            )
+
+            self.assertNotIn(10, router._active_prefill_attempts)
+            self.assertEqual(router._active_prefill_attempts, {})
 
     def test_p2d_host_metadata_uses_chat_custom_params(self):
         request = {

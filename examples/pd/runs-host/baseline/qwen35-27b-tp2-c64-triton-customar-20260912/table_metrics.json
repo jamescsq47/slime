@@ -1,0 +1,4642 @@
+{
+  "run": "/tmp/pd-persist/baseline-qwen35-27b-tp2-swe500-colocated-c64-20260912-r4-triton-customar",
+  "begin": 1789241237.2348902,
+  "end": 1789248999.5893307,
+  "windows": {
+    "full": {
+      "completed": 500,
+      "seconds": 7762.354440450668,
+      "sglang_num_running_reqs": 7.206808288256418,
+      "sglang_num_running_reqs_max": 22.0,
+      "sglang_num_queue_reqs": 0.03418143902765838,
+      "sglang_num_queue_reqs_max": 8.0,
+      "sglang_num_decode_prealloc_queue_reqs": 0.0,
+      "sglang_num_decode_prealloc_queue_reqs_max": 0.0,
+      "sglang_num_decode_transfer_queue_reqs": 0.0,
+      "sglang_num_decode_transfer_queue_reqs_max": 0.0,
+      "kv_capacity": 633328.0,
+      "kv_capacity_max": 635392.0,
+      "kv_used_fraction": 0.23746694283958955,
+      "kv_used_fraction_max": 0.7745769540692989,
+      "kv_evictable_fraction": 0.1412452011502283,
+      "kv_evictable_fraction_max": 0.5323327961321515,
+      "kv_available_fraction": 0.6212878560101821,
+      "kv_available_fraction_max": 1.0,
+      "kv_occupied_fraction": 0.37871214398981784,
+      "kv_occupied_fraction_max": 0.7860596293311846,
+      "mamba_capacity": 242.25,
+      "mamba_capacity_max": 243.0,
+      "mamba_used_fraction": 0.12435105677891085,
+      "mamba_used_fraction_max": 0.3292181069958848,
+      "mamba_evictable_fraction": 0.8646846840692823,
+      "mamba_evictable_fraction_max": 0.9917695473251029,
+      "mamba_available_fraction": 0.010968655632652806,
+      "mamba_available_fraction_max": 1.0,
+      "mamba_occupied_fraction": 0.9890313443673472,
+      "mamba_occupied_fraction_max": 1.0,
+      "prefill_compute_tokens": 15960255.999999998,
+      "prefill_cache_tokens": 443860288.0,
+      "decode_tokens": 5068707.0
+    },
+    "middle_300_1500": {
+      "completed": 142,
+      "seconds": 1200.0,
+      "sglang_num_running_reqs": 13.637832030348662,
+      "sglang_num_running_reqs_max": 19.0,
+      "sglang_num_queue_reqs": 0.029665368472536403,
+      "sglang_num_queue_reqs_max": 7.0,
+      "sglang_num_decode_prealloc_queue_reqs": 0.0,
+      "sglang_num_decode_prealloc_queue_reqs_max": 0.0,
+      "sglang_num_decode_transfer_queue_reqs": 0.0,
+      "sglang_num_decode_transfer_queue_reqs_max": 0.0,
+      "kv_capacity": 633328.0,
+      "kv_capacity_max": 635392.0,
+      "kv_used_fraction": 0.4745525530663681,
+      "kv_used_fraction_max": 0.7745769540692989,
+      "kv_evictable_fraction": 0.07271240657349778,
+      "kv_evictable_fraction_max": 0.348402898254924,
+      "kv_available_fraction": 0.4527350403601341,
+      "kv_available_fraction_max": 0.6557211925866236,
+      "kv_occupied_fraction": 0.5472649596398659,
+      "kv_occupied_fraction_max": 0.7860596293311846,
+      "mamba_capacity": 242.25,
+      "mamba_capacity_max": 243.0,
+      "mamba_used_fraction": 0.23463582541219205,
+      "mamba_used_fraction_max": 0.3292181069958848,
+      "mamba_evictable_fraction": 0.760295037265905,
+      "mamba_evictable_fraction_max": 0.8683127572016461,
+      "mamba_available_fraction": 0.005069137321903082,
+      "mamba_available_fraction_max": 0.05761316872427984,
+      "mamba_occupied_fraction": 0.9949308626780969,
+      "mamba_occupied_fraction_max": 1.0,
+      "prefill_compute_tokens": 3978939.1741247755,
+      "prefill_cache_tokens": 137711578.4086793,
+      "decode_tokens": 1461047.254112155
+    }
+  },
+  "prompt": {
+    "count": 25904,
+    "mean": 17718.997760963557,
+    "p50": 16444.0,
+    "p90": 32720.7,
+    "p99": 46313.97,
+    "total": 458992918
+  },
+  "decode": {
+    "count": 25904,
+    "mean": 195.71128011117975,
+    "p50": 87.0,
+    "p90": 471.0,
+    "p99": 1169.0,
+    "total": 5069705
+  },
+  "initial_prompt": {
+    "count": 500,
+    "mean": 920.968,
+    "p50": 755.0,
+    "p90": 1413.1000000000004,
+    "p99": 3260.8099999999995,
+    "total": 460484
+  },
+  "tools": {
+    "count": 25643,
+    "mean": 1.2892854550488695,
+    "p50": 0.5403073360212147,
+    "p90": 1.449458118714392,
+    "p99": 7.9548763156215605,
+    "total": 33061.14692381816
+  },
+  "tool_bins": [
+    21078,
+    3011,
+    1361,
+    193
+  ],
+  "compacted_events": 0,
+  "structured_action_errors": 23,
+  "cross_worker_tasks": 198,
+  "raw_totals": {
+    "prompt": 458992918,
+    "decode": 5069705,
+    "cached": 443860288,
+    "retractions": 0,
+    "calls": 25904,
+    "harness_prompt_tokens": 458992918,
+    "uncached_prompt_tokens": 15132630
+  },
+  "issue_header_fallback_tasks": 2,
+  "raw_windows": {
+    "full": {
+      "calls": 25904,
+      "retractions": 0
+    },
+    "middle_300_1500": {
+      "calls": 7672,
+      "retractions": 0
+    }
+  },
+  "per_task": {
+    "astropy__astropy-13398": {
+      "prompt": 1760598,
+      "decode": 13735,
+      "cached": 1726784,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1760598,
+      "uncached_prompt_tokens": 33814
+    },
+    "astropy__astropy-12907": {
+      "prompt": 77560,
+      "decode": 3024,
+      "cached": 69120,
+      "retractions": 0,
+      "calls": 13,
+      "harness_prompt_tokens": 77560,
+      "uncached_prompt_tokens": 8440
+    },
+    "astropy__astropy-14096": {
+      "prompt": 127527,
+      "decode": 17353,
+      "cached": 122240,
+      "retractions": 0,
+      "calls": 18,
+      "harness_prompt_tokens": 127527,
+      "uncached_prompt_tokens": 5287
+    },
+    "astropy__astropy-7606": {
+      "prompt": 162959,
+      "decode": 4310,
+      "cached": 155584,
+      "retractions": 0,
+      "calls": 30,
+      "harness_prompt_tokens": 162959,
+      "uncached_prompt_tokens": 7375
+    },
+    "astropy__astropy-8707": {
+      "prompt": 1083500,
+      "decode": 10130,
+      "cached": 1052864,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1083500,
+      "uncached_prompt_tokens": 30636
+    },
+    "astropy__astropy-8872": {
+      "prompt": 1195778,
+      "decode": 12396,
+      "cached": 1169024,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1195778,
+      "uncached_prompt_tokens": 26754
+    },
+    "astropy__astropy-14365": {
+      "prompt": 359203,
+      "decode": 3432,
+      "cached": 342848,
+      "retractions": 0,
+      "calls": 30,
+      "harness_prompt_tokens": 359203,
+      "uncached_prompt_tokens": 16355
+    },
+    "django__django-11149": {
+      "prompt": 1482019,
+      "decode": 10577,
+      "cached": 1447104,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1482019,
+      "uncached_prompt_tokens": 34915
+    },
+    "django__django-11141": {
+      "prompt": 742128,
+      "decode": 10285,
+      "cached": 725184,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 742128,
+      "uncached_prompt_tokens": 16944
+    },
+    "django__django-11133": {
+      "prompt": 809718,
+      "decode": 7384,
+      "cached": 791488,
+      "retractions": 0,
+      "calls": 60,
+      "harness_prompt_tokens": 809718,
+      "uncached_prompt_tokens": 18230
+    },
+    "django__django-11099": {
+      "prompt": 172320,
+      "decode": 3264,
+      "cached": 155968,
+      "retractions": 0,
+      "calls": 23,
+      "harness_prompt_tokens": 172320,
+      "uncached_prompt_tokens": 16352
+    },
+    "django__django-11239": {
+      "prompt": 465771,
+      "decode": 6542,
+      "cached": 445504,
+      "retractions": 0,
+      "calls": 39,
+      "harness_prompt_tokens": 465771,
+      "uncached_prompt_tokens": 20267
+    },
+    "django__django-11276": {
+      "prompt": 1551871,
+      "decode": 8719,
+      "cached": 1518976,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1551871,
+      "uncached_prompt_tokens": 32895
+    },
+    "django__django-11555": {
+      "prompt": 978603,
+      "decode": 7604,
+      "cached": 957312,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 978603,
+      "uncached_prompt_tokens": 21291
+    },
+    "django__django-11433": {
+      "prompt": 376398,
+      "decode": 10167,
+      "cached": 363392,
+      "retractions": 0,
+      "calls": 31,
+      "harness_prompt_tokens": 376398,
+      "uncached_prompt_tokens": 13006
+    },
+    "django__django-11477": {
+      "prompt": 1441657,
+      "decode": 7234,
+      "cached": 1411456,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1441657,
+      "uncached_prompt_tokens": 30201
+    },
+    "django__django-11749": {
+      "prompt": 1309251,
+      "decode": 7291,
+      "cached": 1272704,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1309251,
+      "uncached_prompt_tokens": 36547
+    },
+    "django__django-11790": {
+      "prompt": 555361,
+      "decode": 3946,
+      "cached": 533312,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 555361,
+      "uncached_prompt_tokens": 22049
+    },
+    "django__django-10914": {
+      "prompt": 944890,
+      "decode": 8175,
+      "cached": 923392,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 944890,
+      "uncached_prompt_tokens": 21498
+    },
+    "django__django-11603": {
+      "prompt": 402111,
+      "decode": 4395,
+      "cached": 383360,
+      "retractions": 0,
+      "calls": 35,
+      "harness_prompt_tokens": 402111,
+      "uncached_prompt_tokens": 18751
+    },
+    "django__django-10973": {
+      "prompt": 275307,
+      "decode": 4602,
+      "cached": 258112,
+      "retractions": 0,
+      "calls": 32,
+      "harness_prompt_tokens": 275307,
+      "uncached_prompt_tokens": 17195
+    },
+    "django__django-10880": {
+      "prompt": 671461,
+      "decode": 7158,
+      "cached": 647424,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 671461,
+      "uncached_prompt_tokens": 24037
+    },
+    "django__django-11400": {
+      "prompt": 1424940,
+      "decode": 17417,
+      "cached": 1393408,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1424940,
+      "uncached_prompt_tokens": 31532
+    },
+    "django__django-11532": {
+      "prompt": 967492,
+      "decode": 9594,
+      "cached": 944064,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 967492,
+      "uncached_prompt_tokens": 23428
+    },
+    "django__django-11163": {
+      "prompt": 192371,
+      "decode": 4404,
+      "cached": 182208,
+      "retractions": 0,
+      "calls": 27,
+      "harness_prompt_tokens": 192371,
+      "uncached_prompt_tokens": 10163
+    },
+    "astropy__astropy-14182": {
+      "prompt": 252509,
+      "decode": 4158,
+      "cached": 237056,
+      "retractions": 0,
+      "calls": 23,
+      "harness_prompt_tokens": 252509,
+      "uncached_prompt_tokens": 15453
+    },
+    "django__django-11951": {
+      "prompt": 710828,
+      "decode": 5571,
+      "cached": 688576,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 710828,
+      "uncached_prompt_tokens": 22252
+    },
+    "django__django-12039": {
+      "prompt": 1130380,
+      "decode": 12106,
+      "cached": 1104896,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 1130380,
+      "uncached_prompt_tokens": 25484
+    },
+    "django__django-12050": {
+      "prompt": 715747,
+      "decode": 8109,
+      "cached": 697728,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 715747,
+      "uncached_prompt_tokens": 18019
+    },
+    "django__django-12193": {
+      "prompt": 1283087,
+      "decode": 13690,
+      "cached": 1258496,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 1283087,
+      "uncached_prompt_tokens": 24591
+    },
+    "django__django-12308": {
+      "prompt": 1280492,
+      "decode": 7134,
+      "cached": 1249728,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1280492,
+      "uncached_prompt_tokens": 30764
+    },
+    "django__django-12325": {
+      "prompt": 1138743,
+      "decode": 11557,
+      "cached": 1115328,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1138743,
+      "uncached_prompt_tokens": 23415
+    },
+    "django__django-12406": {
+      "prompt": 1130223,
+      "decode": 11853,
+      "cached": 1107904,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1130223,
+      "uncached_prompt_tokens": 22319
+    },
+    "django__django-12419": {
+      "prompt": 2268496,
+      "decode": 13923,
+      "cached": 2213248,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 2268496,
+      "uncached_prompt_tokens": 55248
+    },
+    "django__django-12663": {
+      "prompt": 1042697,
+      "decode": 19875,
+      "cached": 1019648,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 1042697,
+      "uncached_prompt_tokens": 23049
+    },
+    "django__django-12713": {
+      "prompt": 670571,
+      "decode": 9675,
+      "cached": 657152,
+      "retractions": 0,
+      "calls": 60,
+      "harness_prompt_tokens": 670571,
+      "uncached_prompt_tokens": 13419
+    },
+    "django__django-12741": {
+      "prompt": 579986,
+      "decode": 4800,
+      "cached": 547072,
+      "retractions": 0,
+      "calls": 57,
+      "harness_prompt_tokens": 579986,
+      "uncached_prompt_tokens": 32914
+    },
+    "django__django-12774": {
+      "prompt": 930877,
+      "decode": 9730,
+      "cached": 911424,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 930877,
+      "uncached_prompt_tokens": 19453
+    },
+    "django__django-13023": {
+      "prompt": 949955,
+      "decode": 8918,
+      "cached": 925504,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 949955,
+      "uncached_prompt_tokens": 24451
+    },
+    "django__django-13158": {
+      "prompt": 323080,
+      "decode": 3269,
+      "cached": 309248,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 323080,
+      "uncached_prompt_tokens": 13832
+    },
+    "django__django-13279": {
+      "prompt": 1827722,
+      "decode": 17617,
+      "cached": 1793728,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1827722,
+      "uncached_prompt_tokens": 33994
+    },
+    "django__django-13315": {
+      "prompt": 955579,
+      "decode": 8872,
+      "cached": 933120,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 955579,
+      "uncached_prompt_tokens": 22459
+    },
+    "django__django-13363": {
+      "prompt": 601401,
+      "decode": 10353,
+      "cached": 579840,
+      "retractions": 0,
+      "calls": 38,
+      "harness_prompt_tokens": 601401,
+      "uncached_prompt_tokens": 21561
+    },
+    "django__django-13401": {
+      "prompt": 1141721,
+      "decode": 10645,
+      "cached": 1117056,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1141721,
+      "uncached_prompt_tokens": 24665
+    },
+    "django__django-13410": {
+      "prompt": 264926,
+      "decode": 4710,
+      "cached": 241600,
+      "retractions": 0,
+      "calls": 35,
+      "harness_prompt_tokens": 264926,
+      "uncached_prompt_tokens": 23326
+    },
+    "django__django-13417": {
+      "prompt": 1318285,
+      "decode": 14408,
+      "cached": 1287872,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1318285,
+      "uncached_prompt_tokens": 30413
+    },
+    "django__django-13512": {
+      "prompt": 1203268,
+      "decode": 6303,
+      "cached": 1171648,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1203268,
+      "uncached_prompt_tokens": 31620
+    },
+    "django__django-13516": {
+      "prompt": 1079442,
+      "decode": 7562,
+      "cached": 1055360,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1079442,
+      "uncached_prompt_tokens": 24082
+    },
+    "django__django-13568": {
+      "prompt": 1032804,
+      "decode": 7405,
+      "cached": 1005824,
+      "retractions": 0,
+      "calls": 50,
+      "harness_prompt_tokens": 1032804,
+      "uncached_prompt_tokens": 26980
+    },
+    "django__django-13590": {
+      "prompt": 1146382,
+      "decode": 10810,
+      "cached": 1099776,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1146382,
+      "uncached_prompt_tokens": 46606
+    },
+    "django__django-13741": {
+      "prompt": 936820,
+      "decode": 8100,
+      "cached": 916608,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 936820,
+      "uncached_prompt_tokens": 20212
+    },
+    "django__django-13821": {
+      "prompt": 893232,
+      "decode": 4952,
+      "cached": 860480,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 893232,
+      "uncached_prompt_tokens": 32752
+    },
+    "django__django-13925": {
+      "prompt": 1204827,
+      "decode": 17844,
+      "cached": 1182656,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1204827,
+      "uncached_prompt_tokens": 22171
+    },
+    "django__django-13933": {
+      "prompt": 1053839,
+      "decode": 9185,
+      "cached": 1033152,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1053839,
+      "uncached_prompt_tokens": 20687
+    },
+    "django__django-14007": {
+      "prompt": 1004068,
+      "decode": 9159,
+      "cached": 980224,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1004068,
+      "uncached_prompt_tokens": 23844
+    },
+    "django__django-14017": {
+      "prompt": 1371943,
+      "decode": 11767,
+      "cached": 1313472,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1371943,
+      "uncached_prompt_tokens": 58471
+    },
+    "django__django-14034": {
+      "prompt": 994024,
+      "decode": 11636,
+      "cached": 963584,
+      "retractions": 0,
+      "calls": 45,
+      "harness_prompt_tokens": 994024,
+      "uncached_prompt_tokens": 30440
+    },
+    "django__django-14089": {
+      "prompt": 302561,
+      "decode": 3719,
+      "cached": 289024,
+      "retractions": 0,
+      "calls": 29,
+      "harness_prompt_tokens": 302561,
+      "uncached_prompt_tokens": 13537
+    },
+    "django__django-14122": {
+      "prompt": 69126,
+      "decode": 1370,
+      "cached": 60672,
+      "retractions": 0,
+      "calls": 15,
+      "harness_prompt_tokens": 69126,
+      "uncached_prompt_tokens": 8454
+    },
+    "django__django-14170": {
+      "prompt": 901427,
+      "decode": 12062,
+      "cached": 878080,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 901427,
+      "uncached_prompt_tokens": 23347
+    },
+    "django__django-14140": {
+      "prompt": 969948,
+      "decode": 11000,
+      "cached": 951360,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 969948,
+      "uncached_prompt_tokens": 18588
+    },
+    "django__django-14155": {
+      "prompt": 516876,
+      "decode": 5182,
+      "cached": 498944,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 516876,
+      "uncached_prompt_tokens": 17932
+    },
+    "django__django-14238": {
+      "prompt": 1066514,
+      "decode": 8325,
+      "cached": 1039552,
+      "retractions": 0,
+      "calls": 52,
+      "harness_prompt_tokens": 1066514,
+      "uncached_prompt_tokens": 26962
+    },
+    "django__django-14373": {
+      "prompt": 479005,
+      "decode": 5192,
+      "cached": 460224,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 479005,
+      "uncached_prompt_tokens": 18781
+    },
+    "django__django-14376": {
+      "prompt": 196566,
+      "decode": 3006,
+      "cached": 188288,
+      "retractions": 0,
+      "calls": 27,
+      "harness_prompt_tokens": 196566,
+      "uncached_prompt_tokens": 8278
+    },
+    "django__django-14404": {
+      "prompt": 1645085,
+      "decode": 12944,
+      "cached": 1611456,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1645085,
+      "uncached_prompt_tokens": 33629
+    },
+    "django__django-14434": {
+      "prompt": 714699,
+      "decode": 9149,
+      "cached": 678784,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 714699,
+      "uncached_prompt_tokens": 35915
+    },
+    "django__django-14500": {
+      "prompt": 1270016,
+      "decode": 16914,
+      "cached": 1241600,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1270016,
+      "uncached_prompt_tokens": 28416
+    },
+    "django__django-14608": {
+      "prompt": 1131344,
+      "decode": 7685,
+      "cached": 1105856,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1131344,
+      "uncached_prompt_tokens": 25488
+    },
+    "django__django-14631": {
+      "prompt": 1581566,
+      "decode": 10830,
+      "cached": 1517248,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1581566,
+      "uncached_prompt_tokens": 64318
+    },
+    "django__django-14725": {
+      "prompt": 125981,
+      "decode": 1381,
+      "cached": 114560,
+      "retractions": 0,
+      "calls": 17,
+      "harness_prompt_tokens": 125981,
+      "uncached_prompt_tokens": 11421
+    },
+    "django__django-14771": {
+      "prompt": 591862,
+      "decode": 5400,
+      "cached": 574080,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 591862,
+      "uncached_prompt_tokens": 17782
+    },
+    "django__django-14792": {
+      "prompt": 1753249,
+      "decode": 13995,
+      "cached": 1716288,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1753249,
+      "uncached_prompt_tokens": 36961
+    },
+    "django__django-14787": {
+      "prompt": 747378,
+      "decode": 7934,
+      "cached": 704128,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 747378,
+      "uncached_prompt_tokens": 43250
+    },
+    "django__django-14855": {
+      "prompt": 1063705,
+      "decode": 5491,
+      "cached": 1016896,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1063705,
+      "uncached_prompt_tokens": 46809
+    },
+    "django__django-14915": {
+      "prompt": 489100,
+      "decode": 5228,
+      "cached": 470016,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 489100,
+      "uncached_prompt_tokens": 19084
+    },
+    "django__django-15022": {
+      "prompt": 912950,
+      "decode": 21370,
+      "cached": 886272,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 912950,
+      "uncached_prompt_tokens": 26678
+    },
+    "django__django-15104": {
+      "prompt": 167414,
+      "decode": 2513,
+      "cached": 153984,
+      "retractions": 0,
+      "calls": 22,
+      "harness_prompt_tokens": 167414,
+      "uncached_prompt_tokens": 13430
+    },
+    "django__django-15161": {
+      "prompt": 923693,
+      "decode": 8143,
+      "cached": 905536,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 923693,
+      "uncached_prompt_tokens": 18157
+    },
+    "django__django-15277": {
+      "prompt": 642951,
+      "decode": 6946,
+      "cached": 612608,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 642951,
+      "uncached_prompt_tokens": 30343
+    },
+    "django__django-15278": {
+      "prompt": 7797,
+      "decode": 504,
+      "cached": 3008,
+      "retractions": 0,
+      "calls": 4,
+      "harness_prompt_tokens": 7797,
+      "uncached_prompt_tokens": 4789
+    },
+    "django__django-15315": {
+      "prompt": 913699,
+      "decode": 8467,
+      "cached": 894144,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 913699,
+      "uncached_prompt_tokens": 19555
+    },
+    "django__django-15368": {
+      "prompt": 1157550,
+      "decode": 6486,
+      "cached": 1129472,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1157550,
+      "uncached_prompt_tokens": 28078
+    },
+    "django__django-15382": {
+      "prompt": 1426733,
+      "decode": 5692,
+      "cached": 1390528,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1426733,
+      "uncached_prompt_tokens": 36205
+    },
+    "django__django-15467": {
+      "prompt": 564674,
+      "decode": 7630,
+      "cached": 547968,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 564674,
+      "uncached_prompt_tokens": 16706
+    },
+    "django__django-15561": {
+      "prompt": 1539708,
+      "decode": 10462,
+      "cached": 1505088,
+      "retractions": 0,
+      "calls": 57,
+      "harness_prompt_tokens": 1539708,
+      "uncached_prompt_tokens": 34620
+    },
+    "django__django-15572": {
+      "prompt": 806026,
+      "decode": 7683,
+      "cached": 781952,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 806026,
+      "uncached_prompt_tokens": 24074
+    },
+    "django__django-15731": {
+      "prompt": 361186,
+      "decode": 5549,
+      "cached": 348864,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 361186,
+      "uncached_prompt_tokens": 12322
+    },
+    "django__django-15916": {
+      "prompt": 1126654,
+      "decode": 15953,
+      "cached": 1108032,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1126654,
+      "uncached_prompt_tokens": 18622
+    },
+    "django__django-15863": {
+      "prompt": 493939,
+      "decode": 6809,
+      "cached": 472384,
+      "retractions": 0,
+      "calls": 34,
+      "harness_prompt_tokens": 493939,
+      "uncached_prompt_tokens": 21555
+    },
+    "django__django-16032": {
+      "prompt": 1584210,
+      "decode": 18843,
+      "cached": 1551744,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1584210,
+      "uncached_prompt_tokens": 32466
+    },
+    "django__django-16100": {
+      "prompt": 1143327,
+      "decode": 9720,
+      "cached": 1114624,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 1143327,
+      "uncached_prompt_tokens": 28703
+    },
+    "django__django-15987": {
+      "prompt": 1000601,
+      "decode": 9686,
+      "cached": 979776,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1000601,
+      "uncached_prompt_tokens": 20825
+    },
+    "django__django-16116": {
+      "prompt": 1020308,
+      "decode": 8706,
+      "cached": 1001280,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1020308,
+      "uncached_prompt_tokens": 19028
+    },
+    "django__django-16139": {
+      "prompt": 1474652,
+      "decode": 11808,
+      "cached": 1439424,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1474652,
+      "uncached_prompt_tokens": 35228
+    },
+    "django__django-16145": {
+      "prompt": 979705,
+      "decode": 9793,
+      "cached": 956480,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 979705,
+      "uncached_prompt_tokens": 23225
+    },
+    "django__django-16263": {
+      "prompt": 878540,
+      "decode": 6503,
+      "cached": 856896,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 878540,
+      "uncached_prompt_tokens": 21644
+    },
+    "django__django-16315": {
+      "prompt": 948466,
+      "decode": 13752,
+      "cached": 926720,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 948466,
+      "uncached_prompt_tokens": 21746
+    },
+    "django__django-16333": {
+      "prompt": 733382,
+      "decode": 8796,
+      "cached": 691904,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 733382,
+      "uncached_prompt_tokens": 41478
+    },
+    "django__django-16429": {
+      "prompt": 1144406,
+      "decode": 8887,
+      "cached": 1117056,
+      "retractions": 0,
+      "calls": 55,
+      "harness_prompt_tokens": 1144406,
+      "uncached_prompt_tokens": 27350
+    },
+    "django__django-16485": {
+      "prompt": 451515,
+      "decode": 5907,
+      "cached": 434880,
+      "retractions": 0,
+      "calls": 39,
+      "harness_prompt_tokens": 451515,
+      "uncached_prompt_tokens": 16635
+    },
+    "django__django-16527": {
+      "prompt": 336061,
+      "decode": 3360,
+      "cached": 320960,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 336061,
+      "uncached_prompt_tokens": 15101
+    },
+    "django__django-16560": {
+      "prompt": 2329954,
+      "decode": 17011,
+      "cached": 2286720,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 2329954,
+      "uncached_prompt_tokens": 43234
+    },
+    "django__django-16569": {
+      "prompt": 113457,
+      "decode": 3388,
+      "cached": 101056,
+      "retractions": 0,
+      "calls": 27,
+      "harness_prompt_tokens": 113457,
+      "uncached_prompt_tokens": 12401
+    },
+    "django__django-16595": {
+      "prompt": 332617,
+      "decode": 4989,
+      "cached": 318528,
+      "retractions": 0,
+      "calls": 30,
+      "harness_prompt_tokens": 332617,
+      "uncached_prompt_tokens": 14089
+    },
+    "django__django-16612": {
+      "prompt": 854179,
+      "decode": 6432,
+      "cached": 833984,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 854179,
+      "uncached_prompt_tokens": 20195
+    },
+    "django__django-16631": {
+      "prompt": 999208,
+      "decode": 24140,
+      "cached": 975168,
+      "retractions": 0,
+      "calls": 54,
+      "harness_prompt_tokens": 999208,
+      "uncached_prompt_tokens": 24040
+    },
+    "django__django-16661": {
+      "prompt": 1831055,
+      "decode": 27617,
+      "cached": 1807872,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1831055,
+      "uncached_prompt_tokens": 23183
+    },
+    "django__django-16877": {
+      "prompt": 808327,
+      "decode": 5325,
+      "cached": 773568,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 808327,
+      "uncached_prompt_tokens": 34759
+    },
+    "django__django-16899": {
+      "prompt": 433013,
+      "decode": 4538,
+      "cached": 413760,
+      "retractions": 0,
+      "calls": 36,
+      "harness_prompt_tokens": 433013,
+      "uncached_prompt_tokens": 19253
+    },
+    "django__django-16950": {
+      "prompt": 814646,
+      "decode": 7823,
+      "cached": 782848,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 814646,
+      "uncached_prompt_tokens": 31798
+    },
+    "django__django-17029": {
+      "prompt": 404640,
+      "decode": 4016,
+      "cached": 384768,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 404640,
+      "uncached_prompt_tokens": 19872
+    },
+    "matplotlib__matplotlib-13989": {
+      "prompt": 347142,
+      "decode": 5797,
+      "cached": 330304,
+      "retractions": 0,
+      "calls": 30,
+      "harness_prompt_tokens": 347142,
+      "uncached_prompt_tokens": 16838
+    },
+    "django__django-7530": {
+      "prompt": 1195452,
+      "decode": 8273,
+      "cached": 1165568,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1195452,
+      "uncached_prompt_tokens": 29884
+    },
+    "matplotlib__matplotlib-21568": {
+      "prompt": 1356937,
+      "decode": 11012,
+      "cached": 1321600,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1356937,
+      "uncached_prompt_tokens": 35337
+    },
+    "matplotlib__matplotlib-22719": {
+      "prompt": 1035481,
+      "decode": 10663,
+      "cached": 1012928,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 1035481,
+      "uncached_prompt_tokens": 22553
+    },
+    "matplotlib__matplotlib-22871": {
+      "prompt": 1288155,
+      "decode": 19069,
+      "cached": 1268096,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1288155,
+      "uncached_prompt_tokens": 20059
+    },
+    "matplotlib__matplotlib-23314": {
+      "prompt": 1070623,
+      "decode": 10865,
+      "cached": 995200,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1070623,
+      "uncached_prompt_tokens": 75423
+    },
+    "matplotlib__matplotlib-24570": {
+      "prompt": 1588172,
+      "decode": 27613,
+      "cached": 1564096,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 1588172,
+      "uncached_prompt_tokens": 24076
+    },
+    "matplotlib__matplotlib-24627": {
+      "prompt": 1027027,
+      "decode": 7825,
+      "cached": 959104,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1027027,
+      "uncached_prompt_tokens": 67923
+    },
+    "matplotlib__matplotlib-24870": {
+      "prompt": 1369491,
+      "decode": 16151,
+      "cached": 1343232,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1369491,
+      "uncached_prompt_tokens": 26259
+    },
+    "matplotlib__matplotlib-25122": {
+      "prompt": 901291,
+      "decode": 11445,
+      "cached": 875072,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 901291,
+      "uncached_prompt_tokens": 26219
+    },
+    "matplotlib__matplotlib-25311": {
+      "prompt": 825522,
+      "decode": 10180,
+      "cached": 806208,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 825522,
+      "uncached_prompt_tokens": 19314
+    },
+    "matplotlib__matplotlib-25332": {
+      "prompt": 20839,
+      "decode": 709,
+      "cached": 18304,
+      "retractions": 0,
+      "calls": 10,
+      "harness_prompt_tokens": 20839,
+      "uncached_prompt_tokens": 2535
+    },
+    "matplotlib__matplotlib-25775": {
+      "prompt": 1257378,
+      "decode": 9383,
+      "cached": 1232064,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1257378,
+      "uncached_prompt_tokens": 25314
+    },
+    "matplotlib__matplotlib-25960": {
+      "prompt": 1047873,
+      "decode": 18258,
+      "cached": 1024000,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 1047873,
+      "uncached_prompt_tokens": 23873
+    },
+    "matplotlib__matplotlib-26342": {
+      "prompt": 964101,
+      "decode": 8676,
+      "cached": 916352,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 964101,
+      "uncached_prompt_tokens": 47749
+    },
+    "matplotlib__matplotlib-26466": {
+      "prompt": 1240739,
+      "decode": 7461,
+      "cached": 1216192,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1240739,
+      "uncached_prompt_tokens": 24547
+    },
+    "mwaskom__seaborn-3069": {
+      "prompt": 1419946,
+      "decode": 7797,
+      "cached": 1391168,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1419946,
+      "uncached_prompt_tokens": 28778
+    },
+    "mwaskom__seaborn-3187": {
+      "prompt": 1110328,
+      "decode": 17458,
+      "cached": 1057856,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1110328,
+      "uncached_prompt_tokens": 52472
+    },
+    "psf__requests-1142": {
+      "prompt": 1025469,
+      "decode": 14663,
+      "cached": 1004672,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 1025469,
+      "uncached_prompt_tokens": 20797
+    },
+    "psf__requests-1766": {
+      "prompt": 148262,
+      "decode": 4228,
+      "cached": 140608,
+      "retractions": 0,
+      "calls": 23,
+      "harness_prompt_tokens": 148262,
+      "uncached_prompt_tokens": 7654
+    },
+    "psf__requests-5414": {
+      "prompt": 1136581,
+      "decode": 10668,
+      "cached": 1103808,
+      "retractions": 0,
+      "calls": 62,
+      "harness_prompt_tokens": 1136581,
+      "uncached_prompt_tokens": 32773
+    },
+    "pydata__xarray-4629": {
+      "prompt": 219909,
+      "decode": 4947,
+      "cached": 209472,
+      "retractions": 0,
+      "calls": 31,
+      "harness_prompt_tokens": 219909,
+      "uncached_prompt_tokens": 10437
+    },
+    "pydata__xarray-6599": {
+      "prompt": 1612649,
+      "decode": 13202,
+      "cached": 1570112,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1612649,
+      "uncached_prompt_tokens": 42537
+    },
+    "pydata__xarray-6744": {
+      "prompt": 1531986,
+      "decode": 20298,
+      "cached": 1380096,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 1531986,
+      "uncached_prompt_tokens": 151890
+    },
+    "pydata__xarray-7233": {
+      "prompt": 759013,
+      "decode": 10081,
+      "cached": 695360,
+      "retractions": 0,
+      "calls": 38,
+      "harness_prompt_tokens": 759013,
+      "uncached_prompt_tokens": 63653
+    },
+    "pylint-dev__pylint-4551": {
+      "prompt": 1388988,
+      "decode": 15548,
+      "cached": 1327744,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1388988,
+      "uncached_prompt_tokens": 61244
+    },
+    "pylint-dev__pylint-4970": {
+      "prompt": 811374,
+      "decode": 7315,
+      "cached": 792768,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 811374,
+      "uncached_prompt_tokens": 18606
+    },
+    "pylint-dev__pylint-6386": {
+      "prompt": 1528453,
+      "decode": 10293,
+      "cached": 1486400,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1528453,
+      "uncached_prompt_tokens": 42053
+    },
+    "pylint-dev__pylint-6528": {
+      "prompt": 854994,
+      "decode": 7005,
+      "cached": 835136,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 854994,
+      "uncached_prompt_tokens": 19858
+    },
+    "pylint-dev__pylint-6903": {
+      "prompt": 270310,
+      "decode": 17886,
+      "cached": 259840,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 270310,
+      "uncached_prompt_tokens": 10470
+    },
+    "pylint-dev__pylint-7277": {
+      "prompt": 494881,
+      "decode": 10412,
+      "cached": 443072,
+      "retractions": 0,
+      "calls": 42,
+      "harness_prompt_tokens": 494881,
+      "uncached_prompt_tokens": 51809
+    },
+    "pytest-dev__pytest-10051": {
+      "prompt": 1311799,
+      "decode": 18117,
+      "cached": 1291712,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1311799,
+      "uncached_prompt_tokens": 20087
+    },
+    "pytest-dev__pytest-10356": {
+      "prompt": 520960,
+      "decode": 4749,
+      "cached": 501696,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 520960,
+      "uncached_prompt_tokens": 19264
+    },
+    "pytest-dev__pytest-5631": {
+      "prompt": 582339,
+      "decode": 7412,
+      "cached": 563968,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 582339,
+      "uncached_prompt_tokens": 18371
+    },
+    "pytest-dev__pytest-5787": {
+      "prompt": 1619583,
+      "decode": 14615,
+      "cached": 1581312,
+      "retractions": 0,
+      "calls": 60,
+      "harness_prompt_tokens": 1619583,
+      "uncached_prompt_tokens": 38271
+    },
+    "pytest-dev__pytest-5840": {
+      "prompt": 1448664,
+      "decode": 14761,
+      "cached": 1380224,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1448664,
+      "uncached_prompt_tokens": 68440
+    },
+    "pytest-dev__pytest-6202": {
+      "prompt": 728547,
+      "decode": 5915,
+      "cached": 711616,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 728547,
+      "uncached_prompt_tokens": 16931
+    },
+    "pytest-dev__pytest-7324": {
+      "prompt": 914511,
+      "decode": 10305,
+      "cached": 890176,
+      "retractions": 0,
+      "calls": 52,
+      "harness_prompt_tokens": 914511,
+      "uncached_prompt_tokens": 24335
+    },
+    "pytest-dev__pytest-7571": {
+      "prompt": 455299,
+      "decode": 7464,
+      "cached": 413760,
+      "retractions": 0,
+      "calls": 36,
+      "harness_prompt_tokens": 455299,
+      "uncached_prompt_tokens": 41539
+    },
+    "pytest-dev__pytest-7982": {
+      "prompt": 804224,
+      "decode": 7948,
+      "cached": 777216,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 804224,
+      "uncached_prompt_tokens": 27008
+    },
+    "pytest-dev__pytest-8399": {
+      "prompt": 519112,
+      "decode": 3852,
+      "cached": 501760,
+      "retractions": 0,
+      "calls": 42,
+      "harness_prompt_tokens": 519112,
+      "uncached_prompt_tokens": 17352
+    },
+    "scikit-learn__scikit-learn-12585": {
+      "prompt": 157892,
+      "decode": 3792,
+      "cached": 148416,
+      "retractions": 0,
+      "calls": 24,
+      "harness_prompt_tokens": 157892,
+      "uncached_prompt_tokens": 9476
+    },
+    "scikit-learn__scikit-learn-13124": {
+      "prompt": 858690,
+      "decode": 11904,
+      "cached": 799360,
+      "retractions": 0,
+      "calls": 35,
+      "harness_prompt_tokens": 858690,
+      "uncached_prompt_tokens": 59330
+    },
+    "scikit-learn__scikit-learn-13496": {
+      "prompt": 923531,
+      "decode": 8958,
+      "cached": 828032,
+      "retractions": 0,
+      "calls": 42,
+      "harness_prompt_tokens": 923531,
+      "uncached_prompt_tokens": 95499
+    },
+    "scikit-learn__scikit-learn-14053": {
+      "prompt": 251230,
+      "decode": 5312,
+      "cached": 234752,
+      "retractions": 0,
+      "calls": 24,
+      "harness_prompt_tokens": 251230,
+      "uncached_prompt_tokens": 16478
+    },
+    "scikit-learn__scikit-learn-14087": {
+      "prompt": 916757,
+      "decode": 14084,
+      "cached": 808896,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 916757,
+      "uncached_prompt_tokens": 107861
+    },
+    "scikit-learn__scikit-learn-14141": {
+      "prompt": 22895,
+      "decode": 1021,
+      "cached": 20288,
+      "retractions": 0,
+      "calls": 11,
+      "harness_prompt_tokens": 22895,
+      "uncached_prompt_tokens": 2607
+    },
+    "scikit-learn__scikit-learn-14894": {
+      "prompt": 455615,
+      "decode": 11607,
+      "cached": 442176,
+      "retractions": 0,
+      "calls": 33,
+      "harness_prompt_tokens": 455615,
+      "uncached_prompt_tokens": 13439
+    },
+    "scikit-learn__scikit-learn-25102": {
+      "prompt": 1581566,
+      "decode": 19244,
+      "cached": 1440448,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1581566,
+      "uncached_prompt_tokens": 141118
+    },
+    "scikit-learn__scikit-learn-25232": {
+      "prompt": 895334,
+      "decode": 9159,
+      "cached": 832128,
+      "retractions": 0,
+      "calls": 50,
+      "harness_prompt_tokens": 895334,
+      "uncached_prompt_tokens": 63206
+    },
+    "scikit-learn__scikit-learn-25973": {
+      "prompt": 1365709,
+      "decode": 9725,
+      "cached": 1263296,
+      "retractions": 0,
+      "calls": 60,
+      "harness_prompt_tokens": 1365709,
+      "uncached_prompt_tokens": 102413
+    },
+    "scikit-learn__scikit-learn-26323": {
+      "prompt": 762144,
+      "decode": 9292,
+      "cached": 740672,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 762144,
+      "uncached_prompt_tokens": 21472
+    },
+    "scikit-learn__scikit-learn-9288": {
+      "prompt": 966375,
+      "decode": 8899,
+      "cached": 791040,
+      "retractions": 0,
+      "calls": 49,
+      "harness_prompt_tokens": 966375,
+      "uncached_prompt_tokens": 175335
+    },
+    "scikit-learn__scikit-learn-25931": {
+      "prompt": 828816,
+      "decode": 9913,
+      "cached": 712064,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 828816,
+      "uncached_prompt_tokens": 116752
+    },
+    "sphinx-doc__sphinx-10614": {
+      "prompt": 1502143,
+      "decode": 14996,
+      "cached": 1443648,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1502143,
+      "uncached_prompt_tokens": 58495
+    },
+    "sphinx-doc__sphinx-7440": {
+      "prompt": 1474268,
+      "decode": 12277,
+      "cached": 1327424,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1474268,
+      "uncached_prompt_tokens": 146844
+    },
+    "sphinx-doc__sphinx-7748": {
+      "prompt": 1299132,
+      "decode": 18630,
+      "cached": 1227200,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1299132,
+      "uncached_prompt_tokens": 71932
+    },
+    "sphinx-doc__sphinx-7889": {
+      "prompt": 662182,
+      "decode": 7563,
+      "cached": 639808,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 662182,
+      "uncached_prompt_tokens": 22374
+    },
+    "sphinx-doc__sphinx-7910": {
+      "prompt": 758453,
+      "decode": 10034,
+      "cached": 695552,
+      "retractions": 0,
+      "calls": 50,
+      "harness_prompt_tokens": 758453,
+      "uncached_prompt_tokens": 62901
+    },
+    "sphinx-doc__sphinx-8035": {
+      "prompt": 1696327,
+      "decode": 16930,
+      "cached": 1664000,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1696327,
+      "uncached_prompt_tokens": 32327
+    },
+    "sphinx-doc__sphinx-8265": {
+      "prompt": 1321351,
+      "decode": 8940,
+      "cached": 1258432,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1321351,
+      "uncached_prompt_tokens": 62919
+    },
+    "sphinx-doc__sphinx-8459": {
+      "prompt": 1076014,
+      "decode": 17126,
+      "cached": 1026432,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 1076014,
+      "uncached_prompt_tokens": 49582
+    },
+    "sphinx-doc__sphinx-8548": {
+      "prompt": 1066451,
+      "decode": 10610,
+      "cached": 1042176,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1066451,
+      "uncached_prompt_tokens": 24275
+    },
+    "sphinx-doc__sphinx-8593": {
+      "prompt": 843096,
+      "decode": 7169,
+      "cached": 821504,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 843096,
+      "uncached_prompt_tokens": 21592
+    },
+    "sphinx-doc__sphinx-8595": {
+      "prompt": 1056670,
+      "decode": 11236,
+      "cached": 1028992,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1056670,
+      "uncached_prompt_tokens": 27678
+    },
+    "sphinx-doc__sphinx-8721": {
+      "prompt": 504460,
+      "decode": 5944,
+      "cached": 482112,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 504460,
+      "uncached_prompt_tokens": 22348
+    },
+    "sphinx-doc__sphinx-9230": {
+      "prompt": 1296743,
+      "decode": 12287,
+      "cached": 1267968,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1296743,
+      "uncached_prompt_tokens": 28775
+    },
+    "sphinx-doc__sphinx-9258": {
+      "prompt": 1680324,
+      "decode": 15736,
+      "cached": 1646080,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1680324,
+      "uncached_prompt_tokens": 34244
+    },
+    "sphinx-doc__sphinx-9281": {
+      "prompt": 1232957,
+      "decode": 9299,
+      "cached": 1205120,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1232957,
+      "uncached_prompt_tokens": 27837
+    },
+    "sphinx-doc__sphinx-9367": {
+      "prompt": 208885,
+      "decode": 3744,
+      "cached": 195584,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 208885,
+      "uncached_prompt_tokens": 13301
+    },
+    "sphinx-doc__sphinx-9602": {
+      "prompt": 1772792,
+      "decode": 16937,
+      "cached": 1738304,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1772792,
+      "uncached_prompt_tokens": 34488
+    },
+    "sphinx-doc__sphinx-9673": {
+      "prompt": 1211664,
+      "decode": 10956,
+      "cached": 1178944,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 1211664,
+      "uncached_prompt_tokens": 32720
+    },
+    "sympy__sympy-12096": {
+      "prompt": 415544,
+      "decode": 8984,
+      "cached": 404416,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 415544,
+      "uncached_prompt_tokens": 11128
+    },
+    "sympy__sympy-12419": {
+      "prompt": 970567,
+      "decode": 16207,
+      "cached": 932288,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 970567,
+      "uncached_prompt_tokens": 38279
+    },
+    "sympy__sympy-12489": {
+      "prompt": 1212846,
+      "decode": 11399,
+      "cached": 1162240,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1212846,
+      "uncached_prompt_tokens": 50606
+    },
+    "sympy__sympy-13031": {
+      "prompt": 557701,
+      "decode": 16640,
+      "cached": 532800,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 557701,
+      "uncached_prompt_tokens": 24901
+    },
+    "sympy__sympy-13372": {
+      "prompt": 180163,
+      "decode": 4946,
+      "cached": 171008,
+      "retractions": 0,
+      "calls": 28,
+      "harness_prompt_tokens": 180163,
+      "uncached_prompt_tokens": 9155
+    },
+    "sympy__sympy-13480": {
+      "prompt": 61041,
+      "decode": 2423,
+      "cached": 55872,
+      "retractions": 0,
+      "calls": 17,
+      "harness_prompt_tokens": 61041,
+      "uncached_prompt_tokens": 5169
+    },
+    "sympy__sympy-13757": {
+      "prompt": 1058143,
+      "decode": 11052,
+      "cached": 1037312,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1058143,
+      "uncached_prompt_tokens": 20831
+    },
+    "sympy__sympy-13798": {
+      "prompt": 753182,
+      "decode": 9612,
+      "cached": 736320,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 753182,
+      "uncached_prompt_tokens": 16862
+    },
+    "sympy__sympy-14531": {
+      "prompt": 1383498,
+      "decode": 11482,
+      "cached": 1353152,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1383498,
+      "uncached_prompt_tokens": 30346
+    },
+    "sympy__sympy-14711": {
+      "prompt": 567418,
+      "decode": 8420,
+      "cached": 551808,
+      "retractions": 0,
+      "calls": 53,
+      "harness_prompt_tokens": 567418,
+      "uncached_prompt_tokens": 15610
+    },
+    "sympy__sympy-14976": {
+      "prompt": 1308845,
+      "decode": 10771,
+      "cached": 1285440,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1308845,
+      "uncached_prompt_tokens": 23405
+    },
+    "sympy__sympy-15809": {
+      "prompt": 779847,
+      "decode": 5435,
+      "cached": 762304,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 779847,
+      "uncached_prompt_tokens": 17543
+    },
+    "sympy__sympy-15875": {
+      "prompt": 1029559,
+      "decode": 17220,
+      "cached": 1016576,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1029559,
+      "uncached_prompt_tokens": 12983
+    },
+    "sympy__sympy-15976": {
+      "prompt": 1571547,
+      "decode": 13912,
+      "cached": 1514368,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1571547,
+      "uncached_prompt_tokens": 57179
+    },
+    "sympy__sympy-16597": {
+      "prompt": 1225472,
+      "decode": 7325,
+      "cached": 1170432,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1225472,
+      "uncached_prompt_tokens": 55040
+    },
+    "sympy__sympy-16766": {
+      "prompt": 507653,
+      "decode": 5280,
+      "cached": 490880,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 507653,
+      "uncached_prompt_tokens": 16773
+    },
+    "sympy__sympy-16886": {
+      "prompt": 75188,
+      "decode": 1484,
+      "cached": 68864,
+      "retractions": 0,
+      "calls": 15,
+      "harness_prompt_tokens": 75188,
+      "uncached_prompt_tokens": 6324
+    },
+    "sympy__sympy-17655": {
+      "prompt": 948852,
+      "decode": 9751,
+      "cached": 926336,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 948852,
+      "uncached_prompt_tokens": 22516
+    },
+    "sympy__sympy-19495": {
+      "prompt": 1366855,
+      "decode": 14157,
+      "cached": 1330688,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1366855,
+      "uncached_prompt_tokens": 36167
+    },
+    "sympy__sympy-19783": {
+      "prompt": 822785,
+      "decode": 10895,
+      "cached": 782400,
+      "retractions": 0,
+      "calls": 54,
+      "harness_prompt_tokens": 822785,
+      "uncached_prompt_tokens": 40385
+    },
+    "sympy__sympy-20154": {
+      "prompt": 438262,
+      "decode": 6966,
+      "cached": 410624,
+      "retractions": 0,
+      "calls": 49,
+      "harness_prompt_tokens": 438262,
+      "uncached_prompt_tokens": 27638
+    },
+    "sympy__sympy-20590": {
+      "prompt": 20038,
+      "decode": 724,
+      "cached": 17856,
+      "retractions": 0,
+      "calls": 10,
+      "harness_prompt_tokens": 20038,
+      "uncached_prompt_tokens": 2182
+    },
+    "sympy__sympy-20801": {
+      "prompt": 824217,
+      "decode": 11085,
+      "cached": 808320,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 824217,
+      "uncached_prompt_tokens": 15897
+    },
+    "sympy__sympy-20916": {
+      "prompt": 1086654,
+      "decode": 13059,
+      "cached": 1065024,
+      "retractions": 0,
+      "calls": 60,
+      "harness_prompt_tokens": 1086654,
+      "uncached_prompt_tokens": 21630
+    },
+    "sympy__sympy-21596": {
+      "prompt": 1315226,
+      "decode": 14269,
+      "cached": 1292160,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1315226,
+      "uncached_prompt_tokens": 23066
+    },
+    "sympy__sympy-21847": {
+      "prompt": 320265,
+      "decode": 8618,
+      "cached": 307200,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 320265,
+      "uncached_prompt_tokens": 13065
+    },
+    "sympy__sympy-22080": {
+      "prompt": 1156175,
+      "decode": 14111,
+      "cached": 1132672,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1156175,
+      "uncached_prompt_tokens": 23503
+    },
+    "sympy__sympy-22456": {
+      "prompt": 968209,
+      "decode": 8287,
+      "cached": 947520,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 968209,
+      "uncached_prompt_tokens": 20689
+    },
+    "sympy__sympy-23262": {
+      "prompt": 554567,
+      "decode": 7735,
+      "cached": 520448,
+      "retractions": 0,
+      "calls": 43,
+      "harness_prompt_tokens": 554567,
+      "uncached_prompt_tokens": 34119
+    },
+    "sympy__sympy-23413": {
+      "prompt": 26580,
+      "decode": 9319,
+      "cached": 16832,
+      "retractions": 0,
+      "calls": 8,
+      "harness_prompt_tokens": 26580,
+      "uncached_prompt_tokens": 9748
+    },
+    "sympy__sympy-24066": {
+      "prompt": 766923,
+      "decode": 13777,
+      "cached": 753536,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 766923,
+      "uncached_prompt_tokens": 13387
+    },
+    "sympy__sympy-24213": {
+      "prompt": 191638,
+      "decode": 4670,
+      "cached": 179648,
+      "retractions": 0,
+      "calls": 22,
+      "harness_prompt_tokens": 191638,
+      "uncached_prompt_tokens": 11990
+    },
+    "astropy__astropy-13033": {
+      "prompt": 905621,
+      "decode": 16376,
+      "cached": 886592,
+      "retractions": 0,
+      "calls": 49,
+      "harness_prompt_tokens": 905621,
+      "uncached_prompt_tokens": 19029
+    },
+    "astropy__astropy-14539": {
+      "prompt": 383382,
+      "decode": 6365,
+      "cached": 367360,
+      "retractions": 0,
+      "calls": 33,
+      "harness_prompt_tokens": 383382,
+      "uncached_prompt_tokens": 16022
+    },
+    "astropy__astropy-14508": {
+      "prompt": 789994,
+      "decode": 11139,
+      "cached": 764032,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 789994,
+      "uncached_prompt_tokens": 25962
+    },
+    "astropy__astropy-14309": {
+      "prompt": 114149,
+      "decode": 3821,
+      "cached": 101760,
+      "retractions": 0,
+      "calls": 13,
+      "harness_prompt_tokens": 114149,
+      "uncached_prompt_tokens": 12389
+    },
+    "astropy__astropy-14995": {
+      "prompt": 439823,
+      "decode": 6727,
+      "cached": 372160,
+      "retractions": 0,
+      "calls": 29,
+      "harness_prompt_tokens": 439823,
+      "uncached_prompt_tokens": 67663
+    },
+    "django__django-11551": {
+      "prompt": 1685470,
+      "decode": 15111,
+      "cached": 1624768,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1685470,
+      "uncached_prompt_tokens": 60702
+    },
+    "django__django-11087": {
+      "prompt": 1277425,
+      "decode": 19969,
+      "cached": 1235904,
+      "retractions": 0,
+      "calls": 52,
+      "harness_prompt_tokens": 1277425,
+      "uncached_prompt_tokens": 41521
+    },
+    "django__django-11299": {
+      "prompt": 1487897,
+      "decode": 10843,
+      "cached": 1451648,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1487897,
+      "uncached_prompt_tokens": 36249
+    },
+    "django__django-11848": {
+      "prompt": 1068273,
+      "decode": 13401,
+      "cached": 1007232,
+      "retractions": 0,
+      "calls": 62,
+      "harness_prompt_tokens": 1068273,
+      "uncached_prompt_tokens": 61041
+    },
+    "django__django-11451": {
+      "prompt": 304190,
+      "decode": 4193,
+      "cached": 292096,
+      "retractions": 0,
+      "calls": 32,
+      "harness_prompt_tokens": 304190,
+      "uncached_prompt_tokens": 12094
+    },
+    "django__django-11119": {
+      "prompt": 714117,
+      "decode": 8055,
+      "cached": 681856,
+      "retractions": 0,
+      "calls": 49,
+      "harness_prompt_tokens": 714117,
+      "uncached_prompt_tokens": 32261
+    },
+    "django__django-10554": {
+      "prompt": 1187527,
+      "decode": 7321,
+      "cached": 1158528,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1187527,
+      "uncached_prompt_tokens": 28999
+    },
+    "django__django-11095": {
+      "prompt": 1248704,
+      "decode": 9320,
+      "cached": 1199808,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1248704,
+      "uncached_prompt_tokens": 48896
+    },
+    "django__django-11880": {
+      "prompt": 815315,
+      "decode": 8200,
+      "cached": 797504,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 815315,
+      "uncached_prompt_tokens": 17811
+    },
+    "django__django-11885": {
+      "prompt": 1287906,
+      "decode": 11651,
+      "cached": 1225856,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1287906,
+      "uncached_prompt_tokens": 62050
+    },
+    "django__django-12125": {
+      "prompt": 1527809,
+      "decode": 21210,
+      "cached": 1504768,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1527809,
+      "uncached_prompt_tokens": 23041
+    },
+    "django__django-12155": {
+      "prompt": 1096737,
+      "decode": 17187,
+      "cached": 1076288,
+      "retractions": 0,
+      "calls": 62,
+      "harness_prompt_tokens": 1096737,
+      "uncached_prompt_tokens": 20449
+    },
+    "django__django-12262": {
+      "prompt": 1125956,
+      "decode": 12662,
+      "cached": 1106048,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1125956,
+      "uncached_prompt_tokens": 19908
+    },
+    "django__django-12304": {
+      "prompt": 768529,
+      "decode": 12364,
+      "cached": 750784,
+      "retractions": 0,
+      "calls": 52,
+      "harness_prompt_tokens": 768529,
+      "uncached_prompt_tokens": 17745
+    },
+    "django__django-13028": {
+      "prompt": 1073656,
+      "decode": 8939,
+      "cached": 1047936,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1073656,
+      "uncached_prompt_tokens": 25720
+    },
+    "django__django-13089": {
+      "prompt": 461142,
+      "decode": 6280,
+      "cached": 401536,
+      "retractions": 0,
+      "calls": 33,
+      "harness_prompt_tokens": 461142,
+      "uncached_prompt_tokens": 59606
+    },
+    "django__django-13128": {
+      "prompt": 839141,
+      "decode": 12129,
+      "cached": 815296,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 839141,
+      "uncached_prompt_tokens": 23845
+    },
+    "django__django-13297": {
+      "prompt": 1454598,
+      "decode": 14092,
+      "cached": 1427392,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1454598,
+      "uncached_prompt_tokens": 27206
+    },
+    "django__django-13344": {
+      "prompt": 2253824,
+      "decode": 31838,
+      "cached": 2223936,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 2253824,
+      "uncached_prompt_tokens": 29888
+    },
+    "django__django-13346": {
+      "prompt": 1017159,
+      "decode": 7038,
+      "cached": 992640,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1017159,
+      "uncached_prompt_tokens": 24519
+    },
+    "django__django-13121": {
+      "prompt": 1074794,
+      "decode": 8311,
+      "cached": 1031936,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1074794,
+      "uncached_prompt_tokens": 42858
+    },
+    "django__django-13569": {
+      "prompt": 1527713,
+      "decode": 11919,
+      "cached": 1491584,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1527713,
+      "uncached_prompt_tokens": 36129
+    },
+    "django__django-12858": {
+      "prompt": 831080,
+      "decode": 9064,
+      "cached": 797824,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 831080,
+      "uncached_prompt_tokens": 33256
+    },
+    "django__django-13794": {
+      "prompt": 939100,
+      "decode": 10441,
+      "cached": 919936,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 939100,
+      "uncached_prompt_tokens": 19164
+    },
+    "django__django-13837": {
+      "prompt": 1118405,
+      "decode": 12983,
+      "cached": 1097472,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1118405,
+      "uncached_prompt_tokens": 20933
+    },
+    "django__django-14011": {
+      "prompt": 63613,
+      "decode": 1286,
+      "cached": 56704,
+      "retractions": 0,
+      "calls": 14,
+      "harness_prompt_tokens": 63613,
+      "uncached_prompt_tokens": 6909
+    },
+    "django__django-14053": {
+      "prompt": 1718435,
+      "decode": 19517,
+      "cached": 1687680,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1718435,
+      "uncached_prompt_tokens": 30755
+    },
+    "django__django-13343": {
+      "prompt": 1381326,
+      "decode": 9520,
+      "cached": 1327936,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1381326,
+      "uncached_prompt_tokens": 53390
+    },
+    "django__django-13820": {
+      "prompt": 488453,
+      "decode": 8084,
+      "cached": 470144,
+      "retractions": 0,
+      "calls": 43,
+      "harness_prompt_tokens": 488453,
+      "uncached_prompt_tokens": 18309
+    },
+    "django__django-14534": {
+      "prompt": 1376719,
+      "decode": 14679,
+      "cached": 1351104,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1376719,
+      "uncached_prompt_tokens": 25615
+    },
+    "django__django-14539": {
+      "prompt": 910651,
+      "decode": 14296,
+      "cached": 805632,
+      "retractions": 0,
+      "calls": 49,
+      "harness_prompt_tokens": 910651,
+      "uncached_prompt_tokens": 105019
+    },
+    "django__django-14672": {
+      "prompt": 482106,
+      "decode": 5933,
+      "cached": 463232,
+      "retractions": 0,
+      "calls": 34,
+      "harness_prompt_tokens": 482106,
+      "uncached_prompt_tokens": 18874
+    },
+    "django__django-14752": {
+      "prompt": 127751,
+      "decode": 2450,
+      "cached": 118208,
+      "retractions": 0,
+      "calls": 17,
+      "harness_prompt_tokens": 127751,
+      "uncached_prompt_tokens": 9543
+    },
+    "django__django-14765": {
+      "prompt": 302546,
+      "decode": 3487,
+      "cached": 282368,
+      "retractions": 0,
+      "calls": 29,
+      "harness_prompt_tokens": 302546,
+      "uncached_prompt_tokens": 20178
+    },
+    "django__django-15098": {
+      "prompt": 1307427,
+      "decode": 11750,
+      "cached": 1276608,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1307427,
+      "uncached_prompt_tokens": 30819
+    },
+    "django__django-15252": {
+      "prompt": 1536624,
+      "decode": 20292,
+      "cached": 1469120,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1536624,
+      "uncached_prompt_tokens": 67504
+    },
+    "django__django-15268": {
+      "prompt": 1136239,
+      "decode": 10646,
+      "cached": 1113728,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1136239,
+      "uncached_prompt_tokens": 22511
+    },
+    "django__django-15280": {
+      "prompt": 1806699,
+      "decode": 26154,
+      "cached": 1757760,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1806699,
+      "uncached_prompt_tokens": 48939
+    },
+    "django__django-15503": {
+      "prompt": 1737957,
+      "decode": 17039,
+      "cached": 1702976,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1737957,
+      "uncached_prompt_tokens": 34981
+    },
+    "django__django-15525": {
+      "prompt": 1766590,
+      "decode": 21461,
+      "cached": 1727232,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1766590,
+      "uncached_prompt_tokens": 39358
+    },
+    "django__django-15741": {
+      "prompt": 1344014,
+      "decode": 8399,
+      "cached": 1309824,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1344014,
+      "uncached_prompt_tokens": 34190
+    },
+    "django__django-16136": {
+      "prompt": 769680,
+      "decode": 7817,
+      "cached": 752704,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 769680,
+      "uncached_prompt_tokens": 16976
+    },
+    "django__django-16256": {
+      "prompt": 1099471,
+      "decode": 6444,
+      "cached": 1068736,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1099471,
+      "uncached_prompt_tokens": 30735
+    },
+    "django__django-15973": {
+      "prompt": 130706,
+      "decode": 1882,
+      "cached": 114368,
+      "retractions": 0,
+      "calls": 20,
+      "harness_prompt_tokens": 130706,
+      "uncached_prompt_tokens": 16338
+    },
+    "django__django-15851": {
+      "prompt": 556145,
+      "decode": 9088,
+      "cached": 527168,
+      "retractions": 0,
+      "calls": 38,
+      "harness_prompt_tokens": 556145,
+      "uncached_prompt_tokens": 28977
+    },
+    "django__django-16901": {
+      "prompt": 1376835,
+      "decode": 9464,
+      "cached": 1350400,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1376835,
+      "uncached_prompt_tokens": 26435
+    },
+    "django__django-9296": {
+      "prompt": 427875,
+      "decode": 3757,
+      "cached": 406592,
+      "retractions": 0,
+      "calls": 38,
+      "harness_prompt_tokens": 427875,
+      "uncached_prompt_tokens": 21283
+    },
+    "matplotlib__matplotlib-20488": {
+      "prompt": 794223,
+      "decode": 10783,
+      "cached": 777152,
+      "retractions": 0,
+      "calls": 50,
+      "harness_prompt_tokens": 794223,
+      "uncached_prompt_tokens": 17071
+    },
+    "matplotlib__matplotlib-20676": {
+      "prompt": 1133456,
+      "decode": 10188,
+      "cached": 1110464,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1133456,
+      "uncached_prompt_tokens": 22992
+    },
+    "matplotlib__matplotlib-22865": {
+      "prompt": 166752,
+      "decode": 12862,
+      "cached": 156992,
+      "retractions": 0,
+      "calls": 21,
+      "harness_prompt_tokens": 166752,
+      "uncached_prompt_tokens": 9760
+    },
+    "matplotlib__matplotlib-23476": {
+      "prompt": 1641845,
+      "decode": 20891,
+      "cached": 1611200,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1641845,
+      "uncached_prompt_tokens": 30645
+    },
+    "matplotlib__matplotlib-14623": {
+      "prompt": 1471132,
+      "decode": 11715,
+      "cached": 1422784,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 1471132,
+      "uncached_prompt_tokens": 48348
+    },
+    "matplotlib__matplotlib-24637": {
+      "prompt": 558677,
+      "decode": 6368,
+      "cached": 541504,
+      "retractions": 0,
+      "calls": 45,
+      "harness_prompt_tokens": 558677,
+      "uncached_prompt_tokens": 17173
+    },
+    "matplotlib__matplotlib-24970": {
+      "prompt": 583921,
+      "decode": 13594,
+      "cached": 570112,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 583921,
+      "uncached_prompt_tokens": 13809
+    },
+    "django__django-16493": {
+      "prompt": 1074566,
+      "decode": 8311,
+      "cached": 1028800,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1074566,
+      "uncached_prompt_tokens": 45766
+    },
+    "matplotlib__matplotlib-26113": {
+      "prompt": 424525,
+      "decode": 9337,
+      "cached": 414912,
+      "retractions": 0,
+      "calls": 39,
+      "harness_prompt_tokens": 424525,
+      "uncached_prompt_tokens": 9613
+    },
+    "django__django-17087": {
+      "prompt": 1122341,
+      "decode": 9334,
+      "cached": 1059520,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1122341,
+      "uncached_prompt_tokens": 62821
+    },
+    "pydata__xarray-2905": {
+      "prompt": 989640,
+      "decode": 9315,
+      "cached": 933312,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 989640,
+      "uncached_prompt_tokens": 56328
+    },
+    "pydata__xarray-3677": {
+      "prompt": 998312,
+      "decode": 10132,
+      "cached": 976128,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 998312,
+      "uncached_prompt_tokens": 22184
+    },
+    "pydata__xarray-4966": {
+      "prompt": 1553077,
+      "decode": 14011,
+      "cached": 1521536,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1553077,
+      "uncached_prompt_tokens": 31541
+    },
+    "pydata__xarray-6938": {
+      "prompt": 1153652,
+      "decode": 12361,
+      "cached": 1129344,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1153652,
+      "uncached_prompt_tokens": 24308
+    },
+    "pydata__xarray-6992": {
+      "prompt": 216051,
+      "decode": 4606,
+      "cached": 181760,
+      "retractions": 0,
+      "calls": 29,
+      "harness_prompt_tokens": 216051,
+      "uncached_prompt_tokens": 34291
+    },
+    "pydata__xarray-7393": {
+      "prompt": 1019508,
+      "decode": 9241,
+      "cached": 968640,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1019508,
+      "uncached_prompt_tokens": 50868
+    },
+    "pylint-dev__pylint-7080": {
+      "prompt": 1639943,
+      "decode": 7880,
+      "cached": 1607488,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1639943,
+      "uncached_prompt_tokens": 32455
+    },
+    "pytest-dev__pytest-10081": {
+      "prompt": 1015098,
+      "decode": 8190,
+      "cached": 992768,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1015098,
+      "uncached_prompt_tokens": 22330
+    },
+    "pytest-dev__pytest-7521": {
+      "prompt": 832718,
+      "decode": 5062,
+      "cached": 809984,
+      "retractions": 0,
+      "calls": 53,
+      "harness_prompt_tokens": 832718,
+      "uncached_prompt_tokens": 22734
+    },
+    "scikit-learn__scikit-learn-10297": {
+      "prompt": 706513,
+      "decode": 7759,
+      "cached": 683968,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 706513,
+      "uncached_prompt_tokens": 22545
+    },
+    "scikit-learn__scikit-learn-10908": {
+      "prompt": 315601,
+      "decode": 6519,
+      "cached": 305472,
+      "retractions": 0,
+      "calls": 38,
+      "harness_prompt_tokens": 315601,
+      "uncached_prompt_tokens": 10129
+    },
+    "scikit-learn__scikit-learn-11310": {
+      "prompt": 821209,
+      "decode": 8545,
+      "cached": 800704,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 821209,
+      "uncached_prompt_tokens": 20505
+    },
+    "scikit-learn__scikit-learn-12682": {
+      "prompt": 1132247,
+      "decode": 11361,
+      "cached": 1068864,
+      "retractions": 0,
+      "calls": 50,
+      "harness_prompt_tokens": 1132247,
+      "uncached_prompt_tokens": 63383
+    },
+    "scikit-learn__scikit-learn-13328": {
+      "prompt": 740173,
+      "decode": 7581,
+      "cached": 668608,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 740173,
+      "uncached_prompt_tokens": 71565
+    },
+    "scikit-learn__scikit-learn-13439": {
+      "prompt": 117124,
+      "decode": 2882,
+      "cached": 109184,
+      "retractions": 0,
+      "calls": 20,
+      "harness_prompt_tokens": 117124,
+      "uncached_prompt_tokens": 7940
+    },
+    "scikit-learn__scikit-learn-13779": {
+      "prompt": 109950,
+      "decode": 3848,
+      "cached": 103360,
+      "retractions": 0,
+      "calls": 17,
+      "harness_prompt_tokens": 109950,
+      "uncached_prompt_tokens": 6590
+    },
+    "scikit-learn__scikit-learn-14496": {
+      "prompt": 293237,
+      "decode": 5324,
+      "cached": 255360,
+      "retractions": 0,
+      "calls": 39,
+      "harness_prompt_tokens": 293237,
+      "uncached_prompt_tokens": 37877
+    },
+    "sphinx-doc__sphinx-10323": {
+      "prompt": 1403494,
+      "decode": 18548,
+      "cached": 1262272,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1403494,
+      "uncached_prompt_tokens": 141222
+    },
+    "sphinx-doc__sphinx-10435": {
+      "prompt": 1117449,
+      "decode": 9131,
+      "cached": 1091328,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1117449,
+      "uncached_prompt_tokens": 26121
+    },
+    "sphinx-doc__sphinx-10449": {
+      "prompt": 1545079,
+      "decode": 11052,
+      "cached": 1444160,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1545079,
+      "uncached_prompt_tokens": 100919
+    },
+    "sphinx-doc__sphinx-10466": {
+      "prompt": 168830,
+      "decode": 3651,
+      "cached": 158272,
+      "retractions": 0,
+      "calls": 20,
+      "harness_prompt_tokens": 168830,
+      "uncached_prompt_tokens": 10558
+    },
+    "sphinx-doc__sphinx-11445": {
+      "prompt": 1026217,
+      "decode": 12848,
+      "cached": 973312,
+      "retractions": 0,
+      "calls": 57,
+      "harness_prompt_tokens": 1026217,
+      "uncached_prompt_tokens": 52905
+    },
+    "sphinx-doc__sphinx-11510": {
+      "prompt": 283859,
+      "decode": 11655,
+      "cached": 268864,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 283859,
+      "uncached_prompt_tokens": 14995
+    },
+    "sphinx-doc__sphinx-7462": {
+      "prompt": 485515,
+      "decode": 5817,
+      "cached": 466816,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 485515,
+      "uncached_prompt_tokens": 18699
+    },
+    "sphinx-doc__sphinx-7985": {
+      "prompt": 1058361,
+      "decode": 9999,
+      "cached": 1036800,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1058361,
+      "uncached_prompt_tokens": 21561
+    },
+    "sphinx-doc__sphinx-8056": {
+      "prompt": 1315802,
+      "decode": 9564,
+      "cached": 1271360,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1315802,
+      "uncached_prompt_tokens": 44442
+    },
+    "sphinx-doc__sphinx-8120": {
+      "prompt": 1170027,
+      "decode": 10545,
+      "cached": 1119680,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1170027,
+      "uncached_prompt_tokens": 50347
+    },
+    "sphinx-doc__sphinx-8269": {
+      "prompt": 629355,
+      "decode": 9986,
+      "cached": 602944,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 629355,
+      "uncached_prompt_tokens": 26411
+    },
+    "sphinx-doc__sphinx-8475": {
+      "prompt": 781110,
+      "decode": 6934,
+      "cached": 750528,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 781110,
+      "uncached_prompt_tokens": 30582
+    },
+    "sphinx-doc__sphinx-8551": {
+      "prompt": 1487974,
+      "decode": 9896,
+      "cached": 1437696,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1487974,
+      "uncached_prompt_tokens": 50278
+    },
+    "sphinx-doc__sphinx-8621": {
+      "prompt": 1475007,
+      "decode": 12088,
+      "cached": 1427072,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1475007,
+      "uncached_prompt_tokens": 47935
+    },
+    "sphinx-doc__sphinx-9229": {
+      "prompt": 1224365,
+      "decode": 12481,
+      "cached": 1144320,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1224365,
+      "uncached_prompt_tokens": 80045
+    },
+    "scikit-learn__scikit-learn-26194": {
+      "prompt": 849692,
+      "decode": 10598,
+      "cached": 791424,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 849692,
+      "uncached_prompt_tokens": 58268
+    },
+    "pytest-dev__pytest-7236": {
+      "prompt": 1672516,
+      "decode": 18410,
+      "cached": 1613504,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1672516,
+      "uncached_prompt_tokens": 59012
+    },
+    "sphinx-doc__sphinx-9320": {
+      "prompt": 367766,
+      "decode": 5043,
+      "cached": 336832,
+      "retractions": 0,
+      "calls": 34,
+      "harness_prompt_tokens": 367766,
+      "uncached_prompt_tokens": 30934
+    },
+    "sphinx-doc__sphinx-8638": {
+      "prompt": 1431571,
+      "decode": 10079,
+      "cached": 1379648,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1431571,
+      "uncached_prompt_tokens": 51923
+    },
+    "sphinx-doc__sphinx-9591": {
+      "prompt": 1229667,
+      "decode": 8455,
+      "cached": 1144704,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1229667,
+      "uncached_prompt_tokens": 84963
+    },
+    "sphinx-doc__sphinx-9698": {
+      "prompt": 360907,
+      "decode": 4256,
+      "cached": 343744,
+      "retractions": 0,
+      "calls": 31,
+      "harness_prompt_tokens": 360907,
+      "uncached_prompt_tokens": 17163
+    },
+    "sphinx-doc__sphinx-9711": {
+      "prompt": 482249,
+      "decode": 8992,
+      "cached": 448704,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 482249,
+      "uncached_prompt_tokens": 33545
+    },
+    "sympy__sympy-12481": {
+      "prompt": 554706,
+      "decode": 6389,
+      "cached": 517440,
+      "retractions": 0,
+      "calls": 42,
+      "harness_prompt_tokens": 554706,
+      "uncached_prompt_tokens": 37266
+    },
+    "sympy__sympy-13091": {
+      "prompt": 1273646,
+      "decode": 14188,
+      "cached": 1239104,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1273646,
+      "uncached_prompt_tokens": 34542
+    },
+    "sympy__sympy-13551": {
+      "prompt": 1369904,
+      "decode": 6943,
+      "cached": 1322048,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1369904,
+      "uncached_prompt_tokens": 47856
+    },
+    "sympy__sympy-13852": {
+      "prompt": 1146396,
+      "decode": 13753,
+      "cached": 1064320,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 1146396,
+      "uncached_prompt_tokens": 82076
+    },
+    "sympy__sympy-13877": {
+      "prompt": 1732874,
+      "decode": 17598,
+      "cached": 1645440,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 1732874,
+      "uncached_prompt_tokens": 87434
+    },
+    "sympy__sympy-13974": {
+      "prompt": 912006,
+      "decode": 13672,
+      "cached": 890496,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 912006,
+      "uncached_prompt_tokens": 21510
+    },
+    "sympy__sympy-15017": {
+      "prompt": 1280116,
+      "decode": 10562,
+      "cached": 1228800,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1280116,
+      "uncached_prompt_tokens": 51316
+    },
+    "sympy__sympy-15345": {
+      "prompt": 908659,
+      "decode": 8410,
+      "cached": 875712,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 908659,
+      "uncached_prompt_tokens": 32947
+    },
+    "sympy__sympy-15599": {
+      "prompt": 1187464,
+      "decode": 21020,
+      "cached": 1161408,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1187464,
+      "uncached_prompt_tokens": 26056
+    },
+    "sympy__sympy-16450": {
+      "prompt": 1022364,
+      "decode": 14410,
+      "cached": 1009216,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1022364,
+      "uncached_prompt_tokens": 13148
+    },
+    "sympy__sympy-17630": {
+      "prompt": 1057403,
+      "decode": 10527,
+      "cached": 1038656,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1057403,
+      "uncached_prompt_tokens": 18747
+    },
+    "sympy__sympy-17318": {
+      "prompt": 376512,
+      "decode": 4310,
+      "cached": 359104,
+      "retractions": 0,
+      "calls": 32,
+      "harness_prompt_tokens": 376512,
+      "uncached_prompt_tokens": 17408
+    },
+    "sympy__sympy-18199": {
+      "prompt": 755590,
+      "decode": 11215,
+      "cached": 740352,
+      "retractions": 0,
+      "calls": 54,
+      "harness_prompt_tokens": 755590,
+      "uncached_prompt_tokens": 15238
+    },
+    "sympy__sympy-18211": {
+      "prompt": 562843,
+      "decode": 8206,
+      "cached": 518144,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 562843,
+      "uncached_prompt_tokens": 44699
+    },
+    "sympy__sympy-19040": {
+      "prompt": 1089808,
+      "decode": 14080,
+      "cached": 1055360,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1089808,
+      "uncached_prompt_tokens": 34448
+    },
+    "sympy__sympy-19346": {
+      "prompt": 479805,
+      "decode": 8107,
+      "cached": 466560,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 479805,
+      "uncached_prompt_tokens": 13245
+    },
+    "sympy__sympy-19637": {
+      "prompt": 213507,
+      "decode": 5290,
+      "cached": 205632,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 213507,
+      "uncached_prompt_tokens": 7875
+    },
+    "sympy__sympy-20438": {
+      "prompt": 978151,
+      "decode": 10515,
+      "cached": 958848,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 978151,
+      "uncached_prompt_tokens": 19303
+    },
+    "sympy__sympy-21379": {
+      "prompt": 1340781,
+      "decode": 17365,
+      "cached": 1311872,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1340781,
+      "uncached_prompt_tokens": 28909
+    },
+    "sympy__sympy-19954": {
+      "prompt": 297120,
+      "decode": 5721,
+      "cached": 272128,
+      "retractions": 0,
+      "calls": 34,
+      "harness_prompt_tokens": 297120,
+      "uncached_prompt_tokens": 24992
+    },
+    "sympy__sympy-23824": {
+      "prompt": 191436,
+      "decode": 4167,
+      "cached": 177664,
+      "retractions": 0,
+      "calls": 22,
+      "harness_prompt_tokens": 191436,
+      "uncached_prompt_tokens": 13772
+    },
+    "sympy__sympy-24443": {
+      "prompt": 1301516,
+      "decode": 18960,
+      "cached": 1283136,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1301516,
+      "uncached_prompt_tokens": 18380
+    },
+    "sympy__sympy-24539": {
+      "prompt": 70453,
+      "decode": 3414,
+      "cached": 66368,
+      "retractions": 0,
+      "calls": 19,
+      "harness_prompt_tokens": 70453,
+      "uncached_prompt_tokens": 4085
+    },
+    "sympy__sympy-23950": {
+      "prompt": 733641,
+      "decode": 10071,
+      "cached": 704320,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 733641,
+      "uncached_prompt_tokens": 29321
+    },
+    "sympy__sympy-22714": {
+      "prompt": 419674,
+      "decode": 8507,
+      "cached": 391616,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 419674,
+      "uncached_prompt_tokens": 28058
+    },
+    "astropy__astropy-14598": {
+      "prompt": 1510341,
+      "decode": 27858,
+      "cached": 1490048,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1510341,
+      "uncached_prompt_tokens": 20293
+    },
+    "astropy__astropy-7671": {
+      "prompt": 446846,
+      "decode": 8724,
+      "cached": 430720,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 446846,
+      "uncached_prompt_tokens": 16126
+    },
+    "astropy__astropy-7336": {
+      "prompt": 248708,
+      "decode": 3984,
+      "cached": 233984,
+      "retractions": 0,
+      "calls": 29,
+      "harness_prompt_tokens": 248708,
+      "uncached_prompt_tokens": 14724
+    },
+    "astropy__astropy-7166": {
+      "prompt": 681021,
+      "decode": 8394,
+      "cached": 662976,
+      "retractions": 0,
+      "calls": 52,
+      "harness_prompt_tokens": 681021,
+      "uncached_prompt_tokens": 18045
+    },
+    "django__django-11211": {
+      "prompt": 1806293,
+      "decode": 16795,
+      "cached": 1769856,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1806293,
+      "uncached_prompt_tokens": 36437
+    },
+    "django__django-11206": {
+      "prompt": 18136,
+      "decode": 9161,
+      "cached": 13696,
+      "retractions": 0,
+      "calls": 7,
+      "harness_prompt_tokens": 18136,
+      "uncached_prompt_tokens": 4440
+    },
+    "django__django-11728": {
+      "prompt": 1235050,
+      "decode": 16689,
+      "cached": 1213696,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1235050,
+      "uncached_prompt_tokens": 21354
+    },
+    "django__django-11815": {
+      "prompt": 1189764,
+      "decode": 8143,
+      "cached": 1144704,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1189764,
+      "uncached_prompt_tokens": 45060
+    },
+    "django__django-11740": {
+      "prompt": 1664182,
+      "decode": 20063,
+      "cached": 1632320,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1664182,
+      "uncached_prompt_tokens": 31862
+    },
+    "django__django-10999": {
+      "prompt": 102937,
+      "decode": 3327,
+      "cached": 93376,
+      "retractions": 0,
+      "calls": 18,
+      "harness_prompt_tokens": 102937,
+      "uncached_prompt_tokens": 9561
+    },
+    "django__django-10097": {
+      "prompt": 1892971,
+      "decode": 19065,
+      "cached": 1863488,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1892971,
+      "uncached_prompt_tokens": 29483
+    },
+    "astropy__astropy-13453": {
+      "prompt": 1302989,
+      "decode": 8482,
+      "cached": 1267072,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 1302989,
+      "uncached_prompt_tokens": 35917
+    },
+    "django__django-11179": {
+      "prompt": 1095761,
+      "decode": 7215,
+      "cached": 1068672,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1095761,
+      "uncached_prompt_tokens": 27089
+    },
+    "django__django-11292": {
+      "prompt": 937294,
+      "decode": 8693,
+      "cached": 900544,
+      "retractions": 0,
+      "calls": 55,
+      "harness_prompt_tokens": 937294,
+      "uncached_prompt_tokens": 36750
+    },
+    "django__django-11734": {
+      "prompt": 234277,
+      "decode": 1529,
+      "cached": 214592,
+      "retractions": 0,
+      "calls": 21,
+      "harness_prompt_tokens": 234277,
+      "uncached_prompt_tokens": 19685
+    },
+    "django__django-11964": {
+      "prompt": 1093241,
+      "decode": 8546,
+      "cached": 1067200,
+      "retractions": 0,
+      "calls": 54,
+      "harness_prompt_tokens": 1093241,
+      "uncached_prompt_tokens": 26041
+    },
+    "django__django-12209": {
+      "prompt": 1556709,
+      "decode": 19443,
+      "cached": 1525632,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1556709,
+      "uncached_prompt_tokens": 31077
+    },
+    "django__django-12276": {
+      "prompt": 699795,
+      "decode": 7165,
+      "cached": 682752,
+      "retractions": 0,
+      "calls": 57,
+      "harness_prompt_tokens": 699795,
+      "uncached_prompt_tokens": 17043
+    },
+    "django__django-12708": {
+      "prompt": 1323253,
+      "decode": 8351,
+      "cached": 1293952,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1323253,
+      "uncached_prompt_tokens": 29301
+    },
+    "django__django-12754": {
+      "prompt": 1274595,
+      "decode": 14617,
+      "cached": 1245568,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1274595,
+      "uncached_prompt_tokens": 29027
+    },
+    "django__django-12965": {
+      "prompt": 1299804,
+      "decode": 5940,
+      "cached": 1269504,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1299804,
+      "uncached_prompt_tokens": 30300
+    },
+    "django__django-13109": {
+      "prompt": 1320007,
+      "decode": 12832,
+      "cached": 1290240,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1320007,
+      "uncached_prompt_tokens": 29767
+    },
+    "django__django-13112": {
+      "prompt": 1050277,
+      "decode": 7778,
+      "cached": 1027008,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1050277,
+      "uncached_prompt_tokens": 23269
+    },
+    "django__django-13195": {
+      "prompt": 1235054,
+      "decode": 13443,
+      "cached": 1209216,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 1235054,
+      "uncached_prompt_tokens": 25838
+    },
+    "django__django-13212": {
+      "prompt": 1697833,
+      "decode": 13731,
+      "cached": 1644928,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1697833,
+      "uncached_prompt_tokens": 52905
+    },
+    "django__django-13551": {
+      "prompt": 675758,
+      "decode": 7411,
+      "cached": 652608,
+      "retractions": 0,
+      "calls": 42,
+      "harness_prompt_tokens": 675758,
+      "uncached_prompt_tokens": 23150
+    },
+    "django__django-13658": {
+      "prompt": 1225280,
+      "decode": 12555,
+      "cached": 1163904,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 1225280,
+      "uncached_prompt_tokens": 61376
+    },
+    "django__django-13786": {
+      "prompt": 1028494,
+      "decode": 11241,
+      "cached": 1002240,
+      "retractions": 0,
+      "calls": 55,
+      "harness_prompt_tokens": 1028494,
+      "uncached_prompt_tokens": 26254
+    },
+    "django__django-13807": {
+      "prompt": 447353,
+      "decode": 7122,
+      "cached": 434688,
+      "retractions": 0,
+      "calls": 42,
+      "harness_prompt_tokens": 447353,
+      "uncached_prompt_tokens": 12665
+    },
+    "django__django-13809": {
+      "prompt": 260980,
+      "decode": 6430,
+      "cached": 230976,
+      "retractions": 0,
+      "calls": 28,
+      "harness_prompt_tokens": 260980,
+      "uncached_prompt_tokens": 30004
+    },
+    "django__django-13810": {
+      "prompt": 1690255,
+      "decode": 30113,
+      "cached": 1623680,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1690255,
+      "uncached_prompt_tokens": 66575
+    },
+    "django__django-13964": {
+      "prompt": 1236333,
+      "decode": 15304,
+      "cached": 1211840,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1236333,
+      "uncached_prompt_tokens": 24493
+    },
+    "django__django-14311": {
+      "prompt": 1105830,
+      "decode": 8910,
+      "cached": 1078016,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1105830,
+      "uncached_prompt_tokens": 27814
+    },
+    "django__django-14351": {
+      "prompt": 307425,
+      "decode": 12594,
+      "cached": 291904,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 307425,
+      "uncached_prompt_tokens": 15521
+    },
+    "django__django-14493": {
+      "prompt": 249635,
+      "decode": 6054,
+      "cached": 240320,
+      "retractions": 0,
+      "calls": 34,
+      "harness_prompt_tokens": 249635,
+      "uncached_prompt_tokens": 9315
+    },
+    "django__django-14559": {
+      "prompt": 719364,
+      "decode": 6770,
+      "cached": 697920,
+      "retractions": 0,
+      "calls": 43,
+      "harness_prompt_tokens": 719364,
+      "uncached_prompt_tokens": 21444
+    },
+    "django__django-14580": {
+      "prompt": 7462,
+      "decode": 512,
+      "cached": 3264,
+      "retractions": 0,
+      "calls": 4,
+      "harness_prompt_tokens": 7462,
+      "uncached_prompt_tokens": 4198
+    },
+    "django__django-14999": {
+      "prompt": 1408043,
+      "decode": 13053,
+      "cached": 1376000,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1408043,
+      "uncached_prompt_tokens": 32043
+    },
+    "django__django-15037": {
+      "prompt": 1304840,
+      "decode": 8829,
+      "cached": 1264256,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1304840,
+      "uncached_prompt_tokens": 40584
+    },
+    "django__django-15103": {
+      "prompt": 1053705,
+      "decode": 8941,
+      "cached": 1021120,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1053705,
+      "uncached_prompt_tokens": 32585
+    },
+    "django__django-15128": {
+      "prompt": 437252,
+      "decode": 6391,
+      "cached": 417472,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 437252,
+      "uncached_prompt_tokens": 19780
+    },
+    "django__django-15127": {
+      "prompt": 18746,
+      "decode": 879,
+      "cached": 13120,
+      "retractions": 0,
+      "calls": 8,
+      "harness_prompt_tokens": 18746,
+      "uncached_prompt_tokens": 5626
+    },
+    "django__django-15375": {
+      "prompt": 1472993,
+      "decode": 12768,
+      "cached": 1440704,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1472993,
+      "uncached_prompt_tokens": 32289
+    },
+    "django__django-15563": {
+      "prompt": 1144645,
+      "decode": 18056,
+      "cached": 1121024,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1144645,
+      "uncached_prompt_tokens": 23621
+    },
+    "django__django-15569": {
+      "prompt": 998949,
+      "decode": 6993,
+      "cached": 975744,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 998949,
+      "uncached_prompt_tokens": 23205
+    },
+    "django__django-15629": {
+      "prompt": 1048286,
+      "decode": 7796,
+      "cached": 1022208,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1048286,
+      "uncached_prompt_tokens": 26078
+    },
+    "django__django-15814": {
+      "prompt": 1298812,
+      "decode": 8354,
+      "cached": 1267648,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1298812,
+      "uncached_prompt_tokens": 31164
+    },
+    "django__django-15957": {
+      "prompt": 870353,
+      "decode": 15840,
+      "cached": 848448,
+      "retractions": 0,
+      "calls": 55,
+      "harness_prompt_tokens": 870353,
+      "uncached_prompt_tokens": 21905
+    },
+    "django__django-16255": {
+      "prompt": 93400,
+      "decode": 2036,
+      "cached": 81536,
+      "retractions": 0,
+      "calls": 16,
+      "harness_prompt_tokens": 93400,
+      "uncached_prompt_tokens": 11864
+    },
+    "django__django-16454": {
+      "prompt": 1048649,
+      "decode": 11763,
+      "cached": 1028352,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1048649,
+      "uncached_prompt_tokens": 20297
+    },
+    "django__django-16502": {
+      "prompt": 1484230,
+      "decode": 11981,
+      "cached": 1444928,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 1484230,
+      "uncached_prompt_tokens": 39302
+    },
+    "django__django-16642": {
+      "prompt": 9353,
+      "decode": 491,
+      "cached": 4992,
+      "retractions": 0,
+      "calls": 5,
+      "harness_prompt_tokens": 9353,
+      "uncached_prompt_tokens": 4361
+    },
+    "django__django-16662": {
+      "prompt": 947419,
+      "decode": 8145,
+      "cached": 928128,
+      "retractions": 0,
+      "calls": 58,
+      "harness_prompt_tokens": 947419,
+      "uncached_prompt_tokens": 19291
+    },
+    "django__django-16801": {
+      "prompt": 1681239,
+      "decode": 16288,
+      "cached": 1649600,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1681239,
+      "uncached_prompt_tokens": 31639
+    },
+    "matplotlib__matplotlib-20826": {
+      "prompt": 1201989,
+      "decode": 8383,
+      "cached": 1172864,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1201989,
+      "uncached_prompt_tokens": 29125
+    },
+    "matplotlib__matplotlib-20859": {
+      "prompt": 500739,
+      "decode": 7509,
+      "cached": 468416,
+      "retractions": 0,
+      "calls": 51,
+      "harness_prompt_tokens": 500739,
+      "uncached_prompt_tokens": 32323
+    },
+    "matplotlib__matplotlib-23299": {
+      "prompt": 1004800,
+      "decode": 15665,
+      "cached": 987968,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1004800,
+      "uncached_prompt_tokens": 16832
+    },
+    "matplotlib__matplotlib-23412": {
+      "prompt": 943287,
+      "decode": 8273,
+      "cached": 922944,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 943287,
+      "uncached_prompt_tokens": 20343
+    },
+    "matplotlib__matplotlib-24149": {
+      "prompt": 701018,
+      "decode": 8228,
+      "cached": 685824,
+      "retractions": 0,
+      "calls": 59,
+      "harness_prompt_tokens": 701018,
+      "uncached_prompt_tokens": 15194
+    },
+    "matplotlib__matplotlib-26291": {
+      "prompt": 70577,
+      "decode": 1292,
+      "cached": 62528,
+      "retractions": 0,
+      "calls": 11,
+      "harness_prompt_tokens": 70577,
+      "uncached_prompt_tokens": 8049
+    },
+    "psf__requests-1724": {
+      "prompt": 1286968,
+      "decode": 11405,
+      "cached": 1262656,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1286968,
+      "uncached_prompt_tokens": 24312
+    },
+    "psf__requests-2317": {
+      "prompt": 903784,
+      "decode": 8642,
+      "cached": 882816,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 903784,
+      "uncached_prompt_tokens": 20968
+    },
+    "psf__requests-2931": {
+      "prompt": 1148963,
+      "decode": 7543,
+      "cached": 1123520,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1148963,
+      "uncached_prompt_tokens": 25443
+    },
+    "psf__requests-6028": {
+      "prompt": 830818,
+      "decode": 9088,
+      "cached": 812288,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 830818,
+      "uncached_prompt_tokens": 18530
+    },
+    "pydata__xarray-3095": {
+      "prompt": 1078191,
+      "decode": 9193,
+      "cached": 1049664,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 1078191,
+      "uncached_prompt_tokens": 28527
+    },
+    "pydata__xarray-3151": {
+      "prompt": 478816,
+      "decode": 8934,
+      "cached": 461568,
+      "retractions": 0,
+      "calls": 36,
+      "harness_prompt_tokens": 478816,
+      "uncached_prompt_tokens": 17248
+    },
+    "pydata__xarray-4094": {
+      "prompt": 641700,
+      "decode": 7838,
+      "cached": 621376,
+      "retractions": 0,
+      "calls": 45,
+      "harness_prompt_tokens": 641700,
+      "uncached_prompt_tokens": 20324
+    },
+    "pydata__xarray-4356": {
+      "prompt": 1148674,
+      "decode": 16825,
+      "cached": 1127680,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1148674,
+      "uncached_prompt_tokens": 20994
+    },
+    "pydata__xarray-4687": {
+      "prompt": 1361343,
+      "decode": 12877,
+      "cached": 1333824,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1361343,
+      "uncached_prompt_tokens": 27519
+    },
+    "pydata__xarray-4695": {
+      "prompt": 1702409,
+      "decode": 19095,
+      "cached": 1668800,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1702409,
+      "uncached_prompt_tokens": 33609
+    },
+    "pydata__xarray-6461": {
+      "prompt": 1169025,
+      "decode": 15059,
+      "cached": 1144768,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1169025,
+      "uncached_prompt_tokens": 24257
+    },
+    "pydata__xarray-6721": {
+      "prompt": 1025397,
+      "decode": 11853,
+      "cached": 959360,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1025397,
+      "uncached_prompt_tokens": 66037
+    },
+    "pydata__xarray-7229": {
+      "prompt": 1614732,
+      "decode": 14206,
+      "cached": 1502848,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1614732,
+      "uncached_prompt_tokens": 111884
+    },
+    "pylint-dev__pylint-4604": {
+      "prompt": 1002048,
+      "decode": 8285,
+      "cached": 981504,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1002048,
+      "uncached_prompt_tokens": 20544
+    },
+    "pylint-dev__pylint-4661": {
+      "prompt": 1208344,
+      "decode": 8068,
+      "cached": 1179712,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1208344,
+      "uncached_prompt_tokens": 28632
+    },
+    "pytest-dev__pytest-7432": {
+      "prompt": 1171665,
+      "decode": 18647,
+      "cached": 1129728,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1171665,
+      "uncached_prompt_tokens": 41937
+    },
+    "scikit-learn__scikit-learn-10844": {
+      "prompt": 586281,
+      "decode": 13098,
+      "cached": 571840,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 586281,
+      "uncached_prompt_tokens": 14441
+    },
+    "scikit-learn__scikit-learn-11578": {
+      "prompt": 106468,
+      "decode": 2791,
+      "cached": 95552,
+      "retractions": 0,
+      "calls": 14,
+      "harness_prompt_tokens": 106468,
+      "uncached_prompt_tokens": 10916
+    },
+    "scikit-learn__scikit-learn-12973": {
+      "prompt": 264490,
+      "decode": 6715,
+      "cached": 250304,
+      "retractions": 0,
+      "calls": 26,
+      "harness_prompt_tokens": 264490,
+      "uncached_prompt_tokens": 14186
+    },
+    "scikit-learn__scikit-learn-13135": {
+      "prompt": 111576,
+      "decode": 3204,
+      "cached": 100608,
+      "retractions": 0,
+      "calls": 15,
+      "harness_prompt_tokens": 111576,
+      "uncached_prompt_tokens": 10968
+    },
+    "scikit-learn__scikit-learn-13142": {
+      "prompt": 866415,
+      "decode": 8360,
+      "cached": 844544,
+      "retractions": 0,
+      "calls": 47,
+      "harness_prompt_tokens": 866415,
+      "uncached_prompt_tokens": 21871
+    },
+    "scikit-learn__scikit-learn-14710": {
+      "prompt": 689528,
+      "decode": 9614,
+      "cached": 573248,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 689528,
+      "uncached_prompt_tokens": 116280
+    },
+    "scikit-learn__scikit-learn-15100": {
+      "prompt": 179311,
+      "decode": 5816,
+      "cached": 169600,
+      "retractions": 0,
+      "calls": 27,
+      "harness_prompt_tokens": 179311,
+      "uncached_prompt_tokens": 9711
+    },
+    "scikit-learn__scikit-learn-25747": {
+      "prompt": 1336715,
+      "decode": 12515,
+      "cached": 1179712,
+      "retractions": 0,
+      "calls": 56,
+      "harness_prompt_tokens": 1336715,
+      "uncached_prompt_tokens": 157003
+    },
+    "sphinx-doc__sphinx-10673": {
+      "prompt": 1360730,
+      "decode": 7768,
+      "cached": 1331840,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1360730,
+      "uncached_prompt_tokens": 28890
+    },
+    "sphinx-doc__sphinx-7454": {
+      "prompt": 1294615,
+      "decode": 9828,
+      "cached": 1205760,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1294615,
+      "uncached_prompt_tokens": 88855
+    },
+    "sphinx-doc__sphinx-7757": {
+      "prompt": 1347545,
+      "decode": 16425,
+      "cached": 1320832,
+      "retractions": 0,
+      "calls": 62,
+      "harness_prompt_tokens": 1347545,
+      "uncached_prompt_tokens": 26713
+    },
+    "sphinx-doc__sphinx-9461": {
+      "prompt": 1463831,
+      "decode": 11439,
+      "cached": 1400000,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1463831,
+      "uncached_prompt_tokens": 63831
+    },
+    "sphinx-doc__sphinx-9658": {
+      "prompt": 1226663,
+      "decode": 15749,
+      "cached": 1183936,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1226663,
+      "uncached_prompt_tokens": 42727
+    },
+    "sympy__sympy-13647": {
+      "prompt": 469068,
+      "decode": 8211,
+      "cached": 455808,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 469068,
+      "uncached_prompt_tokens": 13260
+    },
+    "sympy__sympy-13615": {
+      "prompt": 852363,
+      "decode": 16229,
+      "cached": 829248,
+      "retractions": 0,
+      "calls": 50,
+      "harness_prompt_tokens": 852363,
+      "uncached_prompt_tokens": 23115
+    },
+    "sympy__sympy-13878": {
+      "prompt": 1424809,
+      "decode": 16353,
+      "cached": 1396160,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1424809,
+      "uncached_prompt_tokens": 28649
+    },
+    "sympy__sympy-14248": {
+      "prompt": 625293,
+      "decode": 8309,
+      "cached": 607552,
+      "retractions": 0,
+      "calls": 52,
+      "harness_prompt_tokens": 625293,
+      "uncached_prompt_tokens": 17741
+    },
+    "sympy__sympy-18698": {
+      "prompt": 1450790,
+      "decode": 21406,
+      "cached": 1431104,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1450790,
+      "uncached_prompt_tokens": 19686
+    },
+    "sympy__sympy-21930": {
+      "prompt": 675298,
+      "decode": 8763,
+      "cached": 661760,
+      "retractions": 0,
+      "calls": 61,
+      "harness_prompt_tokens": 675298,
+      "uncached_prompt_tokens": 13538
+    },
+    "sympy__sympy-22914": {
+      "prompt": 526326,
+      "decode": 6438,
+      "cached": 508608,
+      "retractions": 0,
+      "calls": 53,
+      "harness_prompt_tokens": 526326,
+      "uncached_prompt_tokens": 17718
+    },
+    "sympy__sympy-21612": {
+      "prompt": 1377626,
+      "decode": 21606,
+      "cached": 1357632,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1377626,
+      "uncached_prompt_tokens": 19994
+    },
+    "sympy__sympy-18763": {
+      "prompt": 865700,
+      "decode": 11955,
+      "cached": 834752,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 865700,
+      "uncached_prompt_tokens": 30948
+    },
+    "sympy__sympy-24661": {
+      "prompt": 865398,
+      "decode": 8825,
+      "cached": 845312,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 865398,
+      "uncached_prompt_tokens": 20086
+    },
+    "astropy__astropy-13236": {
+      "prompt": 988168,
+      "decode": 9132,
+      "cached": 967424,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 988168,
+      "uncached_prompt_tokens": 20744
+    },
+    "astropy__astropy-13579": {
+      "prompt": 2070571,
+      "decode": 25252,
+      "cached": 2034432,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 2070571,
+      "uncached_prompt_tokens": 36139
+    },
+    "astropy__astropy-14369": {
+      "prompt": 1753298,
+      "decode": 20808,
+      "cached": 1714752,
+      "retractions": 0,
+      "calls": 53,
+      "harness_prompt_tokens": 1753298,
+      "uncached_prompt_tokens": 38546
+    },
+    "astropy__astropy-13977": {
+      "prompt": 955386,
+      "decode": 8658,
+      "cached": 915456,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 955386,
+      "uncached_prompt_tokens": 39930
+    },
+    "django__django-11490": {
+      "prompt": 1008279,
+      "decode": 11349,
+      "cached": 984384,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1008279,
+      "uncached_prompt_tokens": 23895
+    },
+    "django__django-11820": {
+      "prompt": 1050388,
+      "decode": 10675,
+      "cached": 1024576,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1050388,
+      "uncached_prompt_tokens": 25812
+    },
+    "django__django-11265": {
+      "prompt": 1574307,
+      "decode": 10004,
+      "cached": 1538816,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1574307,
+      "uncached_prompt_tokens": 35491
+    },
+    "django__django-11333": {
+      "prompt": 658533,
+      "decode": 18618,
+      "cached": 640704,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 658533,
+      "uncached_prompt_tokens": 17829
+    },
+    "django__django-11138": {
+      "prompt": 1149108,
+      "decode": 5755,
+      "cached": 1121344,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1149108,
+      "uncached_prompt_tokens": 27764
+    },
+    "django__django-11066": {
+      "prompt": 141603,
+      "decode": 2358,
+      "cached": 131392,
+      "retractions": 0,
+      "calls": 21,
+      "harness_prompt_tokens": 141603,
+      "uncached_prompt_tokens": 10211
+    },
+    "django__django-11999": {
+      "prompt": 912221,
+      "decode": 6902,
+      "cached": 891520,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 912221,
+      "uncached_prompt_tokens": 20701
+    },
+    "django__django-12143": {
+      "prompt": 355953,
+      "decode": 5688,
+      "cached": 344640,
+      "retractions": 0,
+      "calls": 43,
+      "harness_prompt_tokens": 355953,
+      "uncached_prompt_tokens": 11313
+    },
+    "django__django-12273": {
+      "prompt": 1986265,
+      "decode": 26301,
+      "cached": 1957376,
+      "retractions": 0,
+      "calls": 63,
+      "harness_prompt_tokens": 1986265,
+      "uncached_prompt_tokens": 28889
+    },
+    "django__django-13012": {
+      "prompt": 995567,
+      "decode": 9999,
+      "cached": 975616,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 995567,
+      "uncached_prompt_tokens": 19951
+    },
+    "django__django-13033": {
+      "prompt": 1637224,
+      "decode": 9796,
+      "cached": 1603520,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1637224,
+      "uncached_prompt_tokens": 33704
+    },
+    "django__django-13406": {
+      "prompt": 1161675,
+      "decode": 10963,
+      "cached": 1136896,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1161675,
+      "uncached_prompt_tokens": 24779
+    },
+    "django__django-13449": {
+      "prompt": 1234926,
+      "decode": 13867,
+      "cached": 1214016,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1234926,
+      "uncached_prompt_tokens": 20910
+    },
+    "django__django-13513": {
+      "prompt": 1146511,
+      "decode": 12575,
+      "cached": 1121088,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1146511,
+      "uncached_prompt_tokens": 25423
+    },
+    "django__django-13670": {
+      "prompt": 680135,
+      "decode": 6620,
+      "cached": 659456,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 680135,
+      "uncached_prompt_tokens": 20679
+    },
+    "django__django-14315": {
+      "prompt": 485774,
+      "decode": 6631,
+      "cached": 472320,
+      "retractions": 0,
+      "calls": 48,
+      "harness_prompt_tokens": 485774,
+      "uncached_prompt_tokens": 13454
+    },
+    "django__django-14349": {
+      "prompt": 686674,
+      "decode": 5698,
+      "cached": 667584,
+      "retractions": 0,
+      "calls": 45,
+      "harness_prompt_tokens": 686674,
+      "uncached_prompt_tokens": 19090
+    },
+    "django__django-15380": {
+      "prompt": 527964,
+      "decode": 4801,
+      "cached": 505408,
+      "retractions": 0,
+      "calls": 35,
+      "harness_prompt_tokens": 527964,
+      "uncached_prompt_tokens": 22556
+    },
+    "django__django-15499": {
+      "prompt": 1110220,
+      "decode": 9579,
+      "cached": 1088320,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1110220,
+      "uncached_prompt_tokens": 21900
+    },
+    "django__django-15554": {
+      "prompt": 1520402,
+      "decode": 25422,
+      "cached": 1491136,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1520402,
+      "uncached_prompt_tokens": 29266
+    },
+    "django__django-15695": {
+      "prompt": 393630,
+      "decode": 4760,
+      "cached": 380288,
+      "retractions": 0,
+      "calls": 39,
+      "harness_prompt_tokens": 393630,
+      "uncached_prompt_tokens": 13342
+    },
+    "django__django-15732": {
+      "prompt": 1370844,
+      "decode": 9807,
+      "cached": 1338560,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1370844,
+      "uncached_prompt_tokens": 32284
+    },
+    "django__django-15930": {
+      "prompt": 1256789,
+      "decode": 9016,
+      "cached": 1231744,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1256789,
+      "uncached_prompt_tokens": 25045
+    },
+    "django__django-16082": {
+      "prompt": 1057033,
+      "decode": 9028,
+      "cached": 1035392,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1057033,
+      "uncached_prompt_tokens": 21641
+    },
+    "django__django-16667": {
+      "prompt": 300182,
+      "decode": 4752,
+      "cached": 288384,
+      "retractions": 0,
+      "calls": 37,
+      "harness_prompt_tokens": 300182,
+      "uncached_prompt_tokens": 11798
+    },
+    "django__django-16819": {
+      "prompt": 1432876,
+      "decode": 14639,
+      "cached": 1404992,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1432876,
+      "uncached_prompt_tokens": 27884
+    },
+    "django__django-16938": {
+      "prompt": 1175936,
+      "decode": 9102,
+      "cached": 1148544,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1175936,
+      "uncached_prompt_tokens": 27392
+    },
+    "django__django-17084": {
+      "prompt": 1035879,
+      "decode": 6970,
+      "cached": 1006464,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1035879,
+      "uncached_prompt_tokens": 29415
+    },
+    "matplotlib__matplotlib-24026": {
+      "prompt": 656065,
+      "decode": 15771,
+      "cached": 599552,
+      "retractions": 0,
+      "calls": 44,
+      "harness_prompt_tokens": 656065,
+      "uncached_prompt_tokens": 56513
+    },
+    "matplotlib__matplotlib-24177": {
+      "prompt": 1710076,
+      "decode": 15095,
+      "cached": 1630208,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1710076,
+      "uncached_prompt_tokens": 79868
+    },
+    "matplotlib__matplotlib-25287": {
+      "prompt": 434482,
+      "decode": 9244,
+      "cached": 393984,
+      "retractions": 0,
+      "calls": 46,
+      "harness_prompt_tokens": 434482,
+      "uncached_prompt_tokens": 40498
+    },
+    "matplotlib__matplotlib-25479": {
+      "prompt": 1108351,
+      "decode": 8143,
+      "cached": 1085056,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1108351,
+      "uncached_prompt_tokens": 23295
+    },
+    "matplotlib__matplotlib-26208": {
+      "prompt": 1368839,
+      "decode": 10186,
+      "cached": 1341120,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1368839,
+      "uncached_prompt_tokens": 27719
+    },
+    "pallets__flask-5014": {
+      "prompt": 404966,
+      "decode": 3928,
+      "cached": 389184,
+      "retractions": 0,
+      "calls": 33,
+      "harness_prompt_tokens": 404966,
+      "uncached_prompt_tokens": 15782
+    },
+    "psf__requests-1921": {
+      "prompt": 571540,
+      "decode": 6732,
+      "cached": 551872,
+      "retractions": 0,
+      "calls": 40,
+      "harness_prompt_tokens": 571540,
+      "uncached_prompt_tokens": 19668
+    },
+    "pydata__xarray-3305": {
+      "prompt": 557458,
+      "decode": 7514,
+      "cached": 538368,
+      "retractions": 0,
+      "calls": 43,
+      "harness_prompt_tokens": 557458,
+      "uncached_prompt_tokens": 19090
+    },
+    "pydata__xarray-3993": {
+      "prompt": 603814,
+      "decode": 8249,
+      "cached": 584448,
+      "retractions": 0,
+      "calls": 45,
+      "harness_prompt_tokens": 603814,
+      "uncached_prompt_tokens": 19366
+    },
+    "pydata__xarray-4075": {
+      "prompt": 112329,
+      "decode": 3347,
+      "cached": 101376,
+      "retractions": 0,
+      "calls": 14,
+      "harness_prompt_tokens": 112329,
+      "uncached_prompt_tokens": 10953
+    },
+    "pylint-dev__pylint-8898": {
+      "prompt": 958699,
+      "decode": 10689,
+      "cached": 937856,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 958699,
+      "uncached_prompt_tokens": 20843
+    },
+    "pytest-dev__pytest-5262": {
+      "prompt": 226936,
+      "decode": 4936,
+      "cached": 216320,
+      "retractions": 0,
+      "calls": 24,
+      "harness_prompt_tokens": 226936,
+      "uncached_prompt_tokens": 10616
+    },
+    "pytest-dev__pytest-5809": {
+      "prompt": 42530,
+      "decode": 1379,
+      "cached": 37952,
+      "retractions": 0,
+      "calls": 12,
+      "harness_prompt_tokens": 42530,
+      "uncached_prompt_tokens": 4578
+    },
+    "pytest-dev__pytest-6197": {
+      "prompt": 1494675,
+      "decode": 22113,
+      "cached": 1472448,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1494675,
+      "uncached_prompt_tokens": 22227
+    },
+    "pytest-dev__pytest-7205": {
+      "prompt": 242743,
+      "decode": 4737,
+      "cached": 230208,
+      "retractions": 0,
+      "calls": 28,
+      "harness_prompt_tokens": 242743,
+      "uncached_prompt_tokens": 12535
+    },
+    "pytest-dev__pytest-7490": {
+      "prompt": 1836412,
+      "decode": 14943,
+      "cached": 1797056,
+      "retractions": 0,
+      "calls": 62,
+      "harness_prompt_tokens": 1836412,
+      "uncached_prompt_tokens": 39356
+    },
+    "scikit-learn__scikit-learn-14629": {
+      "prompt": 985966,
+      "decode": 12404,
+      "cached": 956672,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 985966,
+      "uncached_prompt_tokens": 29294
+    },
+    "scikit-learn__scikit-learn-14983": {
+      "prompt": 287184,
+      "decode": 5097,
+      "cached": 277632,
+      "retractions": 0,
+      "calls": 39,
+      "harness_prompt_tokens": 287184,
+      "uncached_prompt_tokens": 9552
+    },
+    "sphinx-doc__sphinx-7590": {
+      "prompt": 303404,
+      "decode": 18433,
+      "cached": 291200,
+      "retractions": 0,
+      "calls": 34,
+      "harness_prompt_tokens": 303404,
+      "uncached_prompt_tokens": 12204
+    },
+    "sympy__sympy-11618": {
+      "prompt": 459697,
+      "decode": 8910,
+      "cached": 411904,
+      "retractions": 0,
+      "calls": 41,
+      "harness_prompt_tokens": 459697,
+      "uncached_prompt_tokens": 47793
+    },
+    "sympy__sympy-15349": {
+      "prompt": 197086,
+      "decode": 7913,
+      "cached": 190848,
+      "retractions": 0,
+      "calls": 25,
+      "harness_prompt_tokens": 197086,
+      "uncached_prompt_tokens": 6238
+    },
+    "sympy__sympy-16792": {
+      "prompt": 1431176,
+      "decode": 12766,
+      "cached": 1402752,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 1431176,
+      "uncached_prompt_tokens": 28424
+    },
+    "sympy__sympy-17139": {
+      "prompt": 543544,
+      "decode": 7692,
+      "cached": 520000,
+      "retractions": 0,
+      "calls": 55,
+      "harness_prompt_tokens": 543544,
+      "uncached_prompt_tokens": 23544
+    },
+    "sympy__sympy-18189": {
+      "prompt": 170675,
+      "decode": 4917,
+      "cached": 162112,
+      "retractions": 0,
+      "calls": 22,
+      "harness_prompt_tokens": 170675,
+      "uncached_prompt_tokens": 8563
+    },
+    "sympy__sympy-20428": {
+      "prompt": 912321,
+      "decode": 11839,
+      "cached": 895744,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 912321,
+      "uncached_prompt_tokens": 16577
+    },
+    "sympy__sympy-23534": {
+      "prompt": 939266,
+      "decode": 11382,
+      "cached": 921408,
+      "retractions": 0,
+      "calls": 64,
+      "harness_prompt_tokens": 939266,
+      "uncached_prompt_tokens": 17858
+    },
+    "sympy__sympy-24562": {
+      "prompt": 31711,
+      "decode": 11540,
+      "cached": 28544,
+      "retractions": 0,
+      "calls": 10,
+      "harness_prompt_tokens": 31711,
+      "uncached_prompt_tokens": 3167
+    }
+  },
+  "ideal_prefill_tokens": null,
+  "ideal_prefill_limitation": "Exact prompt token IDs/checkpoint insertion events not recorded. Rendered-text re-tokenization length check failed (example: 26523 vs engine 26531 tokens); no precise LCP/ideal/excess inferred."
+}

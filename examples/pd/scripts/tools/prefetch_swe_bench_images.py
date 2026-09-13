@@ -12,25 +12,32 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
 
 
-def read_instances(path: Path) -> list[str]:
+def read_instances(path: Path) -> list[tuple[str, str]]:
     with path.open(encoding="utf-8-sig") as source:
         if path.suffix.lower() == ".jsonl":
             rows = [json.loads(line) for line in source if line.strip()]
         else:
             value = json.load(source)
             rows = value if isinstance(value, list) else value["data"]
-    result = [str(row["instance_id"]) for row in rows]
-    if len(result) != len(set(result)):
+    result = [
+        (str(row["instance_id"]), str(row.get("image_name") or ""))
+        for row in rows
+    ]
+    ids = [instance_id for instance_id, _ in result]
+    if len(ids) != len(set(ids)):
         raise ValueError(f"duplicate instance_id values in {path}")
     return result
 
 
-def image_names(instance_id: str) -> tuple[str, str]:
+def image_names(instance_id: str, explicit_image: str = "") -> tuple[str, str]:
+    if explicit_image:
+        return explicit_image, explicit_image
     source = (
         "ghcr.io/epoch-research/"
         f"swe-bench.eval.x86_64.{instance_id.lower()}:latest"
@@ -63,12 +70,15 @@ async def image_exists(image: str) -> bool:
 async def prefetch_one(
     instance_id: str,
     *,
+    explicit_image: str,
     semaphore: asyncio.Semaphore,
     retries: int,
     timeout: float,
     keep_source_tag: bool,
+    min_free_bytes: int,
+    storage_path: Path,
 ) -> dict[str, Any]:
-    source, destination = image_names(instance_id)
+    source, destination = image_names(instance_id, explicit_image)
     started = time.monotonic()
     if await image_exists(destination):
         return {
@@ -82,6 +92,18 @@ async def prefetch_one(
 
     last_output = ""
     async with semaphore:
+        free_bytes = shutil.disk_usage(storage_path).free
+        if free_bytes < min_free_bytes:
+            return {
+                "instance_id": instance_id,
+                "source": source,
+                "destination": destination,
+                "status": "skipped_low_disk",
+                "attempts": 0,
+                "duration_seconds": time.monotonic() - started,
+                "free_bytes": free_bytes,
+                "minimum_free_bytes": min_free_bytes,
+            }
         for attempt in range(1, retries + 2):
             pull_started = time.monotonic()
             try:
@@ -90,14 +112,15 @@ async def prefetch_one(
                 code, output = 124, f"docker pull exceeded {timeout:g}s"
             last_output = output
             if code == 0:
-                tag_code, tag_output = await command(
-                    "docker", "tag", source, destination, timeout=120
-                )
-                if tag_code != 0:
-                    last_output = tag_output
-                    break
-                if not keep_source_tag:
-                    await command("docker", "image", "rm", source, timeout=120)
+                if source != destination:
+                    tag_code, tag_output = await command(
+                        "docker", "tag", source, destination, timeout=120
+                    )
+                    if tag_code != 0:
+                        last_output = tag_output
+                        break
+                    if not keep_source_tag:
+                        await command("docker", "image", "rm", source, timeout=120)
                 return {
                     "instance_id": instance_id,
                     "source": source,
@@ -129,13 +152,16 @@ async def run(args: argparse.Namespace) -> int:
         asyncio.create_task(
             prefetch_one(
                 instance_id,
+                explicit_image=explicit_image,
                 semaphore=semaphore,
                 retries=args.retries,
                 timeout=args.timeout,
                 keep_source_tag=args.keep_source_tag,
+                min_free_bytes=int(args.min_free_gib * 1024**3),
+                storage_path=args.storage_path,
             )
         )
-        for instance_id in instances
+        for instance_id, explicit_image in instances
     ]
     counts: dict[str, int] = {}
     started = time.monotonic()
@@ -160,7 +186,7 @@ async def run(args: argparse.Namespace) -> int:
         "log": str(args.log),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 1 if counts.get("failed") else 0
+    return 1 if counts.get("failed") or counts.get("skipped_low_disk") else 0
 
 
 def main() -> None:
@@ -171,6 +197,18 @@ def main() -> None:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--keep-source-tag", action="store_true")
+    parser.add_argument(
+        "--min-free-gib",
+        type=float,
+        default=100,
+        help="do not start another pull when this filesystem has less free space",
+    )
+    parser.add_argument(
+        "--storage-path",
+        type=Path,
+        default=Path("/var/lib/docker"),
+        help="filesystem whose free space protects image storage",
+    )
     args = parser.parse_args()
     raise SystemExit(asyncio.run(run(args)))
 

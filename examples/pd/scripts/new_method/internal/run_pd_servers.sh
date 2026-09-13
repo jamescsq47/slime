@@ -13,6 +13,8 @@ cd "${PD_DIR}"
 MODEL_PATH="${MODEL_PATH:-/dataset/model/qwen3/Qwen3-8B}"
 MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-}"
 MODEL_TOOL_CALL_PARSER="${MODEL_TOOL_CALL_PARSER:-}"
+# Opt-in raw request/response capture, isolated per engine and experiment.
+PD_RAW_REQUEST_LOG_DIR="${PD_RAW_REQUEST_LOG_DIR:-}"
 MATH_DATA="${MATH_DATA:-${WORKSPACE_ROOT}/data/dapo-math-17k/dapo-math-17k.jsonl}"
 QA_DATA="${QA_DATA:-${WORKSPACE_ROOT}/data/browsecomp/bc_train.jsonl}"
 WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-}"
@@ -671,6 +673,12 @@ for index in "${!prefill_gpu_groups[@]}"; do
   prefill_numa_vectors+=("${prefill_numa_csv}")
   prefill_numa="${prefill_group_numas[0]}"
   prefill_launch=(setsid)
+  prefill_raw_log_args=()
+  if [[ -n "${PD_RAW_REQUEST_LOG_DIR}" ]]; then
+    mkdir -p "${PD_RAW_REQUEST_LOG_DIR}/prefill-${index}"
+    prefill_raw_log_args=(--log-requests --log-requests-level 3
+      --log-requests-format json --log-requests-target "${PD_RAW_REQUEST_LOG_DIR}/prefill-${index}")
+  fi
   if (( PREFILL_TP_SIZE == 1 )) && [[ "${SGLANG_AGENTIC_KV_HOST_STAGING:-false}" == "true" ]] && command -v numactl >/dev/null 2>&1; then
     prefill_launch+=(numactl --cpunodebind="${prefill_numa}" --membind="${prefill_numa}")
   fi
@@ -693,6 +701,7 @@ for index in "${!prefill_gpu_groups[@]}"; do
       --max-prefill-tokens "${PREFILL_MAX_PREFILL_TOKENS}" \
       "${mamba_args[@]}" \
       "${model_parser_args[@]}" \
+      "${prefill_raw_log_args[@]}" \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \
       --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
@@ -732,6 +741,12 @@ for index in "${!decode_gpu_groups[@]}"; do
   decode_numa_csv="$(IFS=,; echo "${decode_group_numas[*]}")"
   decode_numa="${decode_group_numas[0]}"
   decode_launch=(setsid)
+  decode_raw_log_args=()
+  if [[ -n "${PD_RAW_REQUEST_LOG_DIR}" ]]; then
+    mkdir -p "${PD_RAW_REQUEST_LOG_DIR}/decode-${index}"
+    decode_raw_log_args=(--log-requests --log-requests-level 3
+      --log-requests-format json --log-requests-target "${PD_RAW_REQUEST_LOG_DIR}/decode-${index}")
+  fi
   if (( DECODE_TP_SIZE == 1 )) && [[ "${SGLANG_AGENTIC_KV_HOST_STAGING:-false}" == "true" ]] && command -v numactl >/dev/null 2>&1; then
     decode_launch+=(numactl --cpunodebind="${decode_numa}" --membind="${decode_numa}")
   fi
@@ -762,6 +777,7 @@ for index in "${!decode_gpu_groups[@]}"; do
       --mem-fraction-static "${decode_mem_fraction_statics[$index]}" \
       "${mamba_args[@]}" \
       "${model_parser_args[@]}" \
+      "${decode_raw_log_args[@]}" \
       --enable-metrics --skip-server-warmup \
       --uvicorn-access-log-exclude-prefixes /get_load /metrics /health \
       "${deterministic_args[@]}" \

@@ -11,27 +11,30 @@ P/D `0.85` 的 PD 结果保留数值用于历史诊断，但均标记为“需�
 
 ## 当前新方法定义
 
-从 2026-09-08 起，“当前新方法”固定指 **快慢路径 + Direct失败重算**：
+2026-09-09用户采纳 **快慢路径＋全局Slow恢复拥堵反馈重算**（c512实测5148.410 token/s）。
 
-- 工具超过 1 秒未返回：D→P Slow；
-- 工具在 1 秒内返回：尝试 D→P Direct；
-- Direct admission/receiver/传输在工具返回后的统一 1 秒 deadline 内未建立：
-  进入显式完整重算，不再转 Slow。
+- 工具超过1秒未返回：D→P Slow；否则尝试Direct，建链deadline为1秒。
+- 快工具Direct失败：全局Slow恢复队列拥堵时重算，否则Slow。
+- Q只计工具已返回、Host durable、等待H2D worker接手的唯一parent generation；跨P不重复，等待工具不计。
+- 每秒采样，连续两次Q≥32启用重算，Q≤8退出。过期超过3秒或无有效信号时保守Slow。
+- 已claim失败须先通过原有物理fence；反馈不取消已有Host请求，也不抢占正在传输的KV。
 
-对应正式实验必须显式记录：
+完整方案复现实验须显式记录：
 
 ```text
-SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD=1
-SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT=1
-SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE=true
+FAST_TOOL_THRESHOLD_SECONDS=1
+DIRECT_WAIT_SECONDS=1
+SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE=true
+SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH=32
+SGLANG_AGENTIC_KV_SLOW_CONGESTION_LOW=8
 SGLANG_AGENTIC_KV_HOST_STAGING=true
 ```
 
-除 `BROWSECOMP_QWEN3_8B_ABLATIONS.md` 中新完成的对应行，以及同步回填到
-`BROWSECOMP_QWEN3_8B.md` 的 c512 行外，现有“新方法”实验均早于该定义，应标记
-为旧版快慢路径并重跑。Colocated、No-reverse、原生 Mooncake 等 baseline 不因
-这次新方法定义变化而失效；它们是否需要重跑仍由显存比例、数据顺序和采样参数
-是否对齐决定。
+底层通用开关默认关闭没有改动；必须按此完整方案配置启用，消融时显式关闭反馈。
+BrowseComp/Qwen3-8B的c512已经完成；c384/c576标记需重新测试，旧数值撤出主表。
+完整方案在[消融表](BROWSECOMP_QWEN3_8B_ABLATIONS.md)首行，其余为消融/基线参考。
+Colocated、No-reverse及原生Mooncake已完成的对齐基线保留，不因新方法定义改变而失效。
+本次仅更新记录、清理废弃实验，没有启动重测或修改传输/计算代码。
 
 ## 快慢路径统计口径
 
@@ -76,15 +79,15 @@ Current experiment keys:
 
 - `current/qwen3-8b-tp1-browsecomp-c512-w300-m1200`
   - baseline: fixed source-order BrowseComp on eight colocated GPUs;
-  - the paired Agentic-PD child is historical and requires rerun.
-- `current/ablations/browsecomp-qwen3-8b-4p4d-c512/aligned-p080-d080060-threshold1-20260908-r4/fast-direct-fail-recompute-1s`
-  - current valid new-method checkpoint: aligned 4P:4D, TP=1, c512;
-  - 300-second warmup + 1200-second measurement, 1-second tool/Direct policy.
+  - 当前完整方法见下列slow-congestion子目录；旧paired方法已退出主表。
+- `current/qwen3-8b-tp1-browsecomp-c512-w300-m1200/current-method-slow-congestion-1s-20260909-r1`
+  - 当前完整方法：5148.410 token/s，4P:4D、TP=1、c512；
+  - 300+1200秒，工具/Direct阈值1秒，全局恢复队列32/8反馈。
 - `current/qwen3-32b-tp2-browsecomp-c256-w300-m1200`
   - baseline: fixed source-order BrowseComp on colocated TP=2 workers;
   - new method: 2P:6D, TP=2, 300-second warmup and 1200-second measurement;
-  - the retained Agentic-PD child uses the old Direct-failure-to-Slow policy and
-    requires rerun under the current method.
+  - 当前新方法：`current-method-q32-low8-r6`，1405.70 token/s，Q high/low=32/8；
+    工具/Direct阈值1秒，671条Agent完成、0失败。旧同配置结果已按用户要求清理。
 - `current/qwen3-8b-tp1-mixed1to1-c512-w300-m1200`
   - baseline: fixed 1:1 Retool/BrowseComp workload on eight colocated GPUs;
   - the retained 2P:6D Agentic-PD results use the old path policy and require
@@ -104,6 +107,9 @@ Every current result retains raw request records, two-second engine counters,
 service logs, resolved workload/configuration, summary JSON, and plots.
 
 ## Archive
+
+2026-09-09清理：撤回的旧策略结果与失败重试共15个目录、约1.95 GiB已移入回收站（可恢复），
+未删除当前六组对比依据或baseline。详见[清理清单](CLEANUP_20260909.md)。
 
 - `archive/baseline`: older formal colocated, native-PD, native-Mooncake, and
   workload-characterization results.

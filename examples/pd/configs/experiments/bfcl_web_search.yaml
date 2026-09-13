@@ -1,0 +1,23 @@
+schema_version: 1
+datasets:
+  - id: bfcl
+    harness: bfcl_web_search
+    path: /homes/siqic/data/bfcl-v4-web-search/questions.jsonl
+    weight: 1
+    options:
+      variants: [base]
+      # Live keyless metasearch; record auto rather than claim a fixed provider.
+      search_backend: auto
+      tool_timeout_seconds: 20
+      max_tool_errors: 3
+      page_max_chars: 40000
+      max_turns: 20
+      max_tokens_per_turn: 8192
+      max_response_tokens: 32768
+sampling:
+  policy: random
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1

@@ -10,23 +10,53 @@
 
 传统推理引擎通常把工具调用视为当前请求已经结束并释放 KV；工具返回后，再把完整历史作为新请求重新 Prefill。这会浪费大量算力，尤其是在工具调用较多时。控制并发数或预测工具时间只能缓解问题：许多工具等待时间不可预测（例如用户交互），限制并发也会降低吞吐。
 
-### 当前新方法定义（2026-09-08）
+### 当前完整方案（2026-09-09，全局Slow恢复拥堵反馈重算）
 
-当前新方法采用 **D→P 快慢路径 + Direct 失败显式重算**：
+用户已采纳c512正式结果：Decode 5148.410 token/s，300秒业务预热+1200秒测量。
+本节及下文以此方案为准；旧的固定失败重算、容量拒绝试验均不再定义完整方法。
+只改变快工具Direct失败的出口，不改变physical ownership/fence/workset/TP协议。
 
-- 工具等待阈值默认 1 秒；1 秒内工具未返回的 snapshot 进入 D→P Slow。
-- 工具在 1 秒内返回时尝试 D→P Direct；从工具返回开始，Direct admission、
-  receiver 建立与传输启动共享一个 1 秒 deadline。
-- deadline 内未成功建立 Direct 的 snapshot 不再转 Slow，而是原子切换为
-  `RECOMPUTE_REQUIRED`，由 P 在下一轮完整重算。重算路由持久化后，D 才能释放
-  对应 parent KV。
-- 因而 Slow 只承接慢工具，Direct 建立失败只触发显式重算。两类原因必须分别
-  计数，不能把重算记成 KV 丢失或 Slow fallback。
+- 工具阈值1秒；超过阈值走Slow。快工具的Direct admission/建链共用1秒deadline。
+- 快工具Direct失败后，正常模式走Slow；恢复拥堵模式显式完整重算。
+- 全局Q为工具已返回、Host durable、尚未被H2D worker接手的唯一parent generation。
+  由Router后台dispatch引用和既有Host ledger遍历计算；跨P不重复，仍等工具的不计入。
+- HOST_READY和H2D_LOADING的pinned/leased计入；任一TP rank已到io_inflight/handed不计。
+  io_inflight包含CPU准备，不等于CUDA DMA已开始。恢复失败退回Host可重新计入。
+- 每秒采样，连续两次Q≥high进入拥堵，Q≤low退出。默认high=4×全局逻辑H2D lanes、
+  low=1×lanes；已测4P×2lane为32/8。
+- 随既有P压力快照发布；D后台最多每秒读一次，缺失、无效或超过3秒陈旧时保守Slow。
+- 不取消已经进入Host的snapshot，不因Q高而抢占在途KV；重算前必须P退还claim、
+  DMA fence终态、原子FAILED、重算路由持久化，然后才能释放D源KV。
+- 完整方案须显式启用 `SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE=true`；
+  底层通用开关仍默认关闭，避免改变未选用本方案的实验。
+  它覆盖固定的 `SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE` 出口。
+- 同一数据配置c384/c576需重测；其他TP/模型不能自动沿用本次性能验收。
+  32/8是已验证可运行的参数，不宣称最优。
 
-该选择来自对齐显存配置下的 BrowseComp/Qwen3-8B/c512 消融：相对于所有
-Direct 失败都转 Slow，利用 P 侧剩余算力做少量重算取得了更高 Decode 吞吐。
-它是当前默认设计，但其他模型、数据集、并发和 P:D 配比下的旧结果均需按此语义
-重跑，不能直接沿用旧“Direct 失败→Slow”结果。
+### 纯重算消融
+
+- `SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE=true` 只用于纯重算消融，默认关闭。
+- 该消融保留当前 generation 的 agentic 元数据、P→D late binding、P→D Direct/Host
+  staging 和 D Router；后续 generation 从请求构造开始就不声明 parent generation，
+  因而完整 Prefill，不等待不存在的反向 KV 路由。
+- D 完成该 generation 后不创建 D→P Direct candidate、Shared Host snapshot、claim
+  或重试状态，而是通过 SGLang 已有 finished-request 路径把 D HBM 所有权直接转为
+  `TERMINAL`。应用端也不发布该 generation 的 tool/final 反向复用 ACK。
+- 应用请求构造进程和所有 D rank 必须同时启用此开关；它不是原生 No-reverse PD，
+  也不能关闭或替换当前方法的 P→D 路径。
+
+### P→D 预绑定、无 Host 消融
+
+- `SGLANG_PD_ABLATION_P2D_PREBIND=true` 只用于联合关闭 P→D late binding 与
+  P→D Shared Host 慢路径，默认关闭；完整方法不受影响。
+- 消融仍使用自定义 Router，并完整保留 D→P Direct/Slow、P Router、workset 和
+  request-generation 生命周期。Router 先按现有 D 容量/负载模型选择并预留一个 D，
+  再提交 Prefill；D 在 Prefill 前进入原生 preallocation 等待，P 完成后只通过
+  NIXL Direct 向这个固定 D 交付。
+- 该模式不创建 P→D Host ledger/arena。容量不足时在 Prefill 前等待 D，而不是先算
+  Prefill 或取得 Host ownership；取消/失败仍使用现有 D abort 和 reservation 回收。
+- 该消融当前只允许 `TP=1`；启动脚本和P/D worker都会拒绝 `TP>1`。这是为了避免
+  原生预绑定传输在TP部分失败时绕过跨rank物理fence；完整新方法的TP路径不受影响。
 
 ## 1. KV cache 的管理单位
 
@@ -73,14 +103,14 @@ Decode 完成一轮后，需要准备把该 request-generation 的完整 parent 
 #### 快路径
 
 - 如果工具在阈值内返回，且 P 可以为完整下一轮 workset 分配空间，则使用 NVLink/NIXL 直接把 parent KV 从 D HBM 传到 P HBM。
-- 从工具返回时刻开始，P admission、Direct receiver 建立与传输启动共用同一个 Direct deadline，默认 1 秒；P claim 不得重新开始一个新的 deadline。deadline 内尚未成功启动 Direct 时立即进入显式重算，而不是转 Slow。已经提交给传输层的 DMA 必须先按物理 fence 收敛，不能在仍可能访问源页时强行切换所有权。
+- 从工具返回时刻开始，P admission、Direct receiver 建立与传输启动共用同一个 Direct deadline，默认 1 秒；P claim 不得重新开始一个新的 deadline。Direct失败后按全局Slow恢复拥堵信号选择Slow或显式重算，不用“未claim”推断“没有内存”。已经提交给传输层的 DMA 必须先按物理 fence 收敛，不能在仍可能访问源页时强行切换所有权。
 - 完整 workset 包括 parent KV 和新增 tool-result Prompt 所需 KV 空间；不能只接收 parent，随后因没有 suffix 空间而死锁。
 - P Router 只使用 KV 容量做选择：在能容纳完整 workset 的候选中选择剩余 KV tokens 最大的 P。剩余量必须扣除尚未反映到物理采样中的 Direct/Slow reservation，以避免多个并发 snapshot 选择同一个过期容量；不再把请求队列、Host Arena 压力或加权综合分数用于 D→P 选 P。
 - Direct 成功后，P 对该 snapshot 取得所有权，D 立即释放对应 HBM KV。
 
 #### 慢路径
 
-- 如果工具在 1 秒阈值内没有返回，则进入慢路径。Direct 建立失败不再进入这条路径；一个慢工具或失败的 Direct 都不得阻塞后续 Direct。
+- 如果工具在 1 秒阈值内没有返回，则进入慢路径。快工具Direct失败且恢复不拥堵（或无有效反馈）时也进入 Slow；一个慢工具或失败的 Direct 都不得阻塞后续 Direct。
 - Slow 使用两阶段独立路由。进入 Slow 时只比较各 D→P Shared Host Arena 的可用字节数（容量减去已用空间和尚未反映到物理账本的 Host reservation），选择 Host 剩余空间最大的 Arena；此时不按 P HBM 压力选计算节点。
 - D 通过 PCIe 将完整 snapshot offload 到选中的 D→P Shared Host Arena；tool 执行与 KV offload 并行。Host Arena 的物理落点不绑定后续 Prefill P；同机 P 可以通过 ledger 中的 `arena_path + offset` 读取该完整 extent。
 - Host snapshot durable 后，D 必须立即释放对应 HBM KV，不能等待工具结束，也不能等待 P 有空间。
@@ -88,16 +118,15 @@ Decode 完成一轮后，需要准备把该 request-generation 的完整 parent 
 - Host→P load 完成、P 已取得完整 snapshot 后，立即释放 Shared Host Arena 中该 snapshot 的空间。
 - Decode 节点继续使用 SGLang Radix Cache 共享前缀，但 request-generation 的传输和释放必须保持完整、引用安全。
 
-#### Direct 失败重算
+#### Direct失败后的拥堵反馈重算
 
-- 工具在阈值内返回、但 Direct 在统一 1 秒 deadline 内没有成功启动时，D 将
-  snapshot 原子标记为 `RECOMPUTE_REQUIRED`，并发布持久化的完整重算路由。
-- 只有重算路由已经可见、且任何可能访问旧源页的 DMA 已经通过 fence 收敛后，
-  D 才释放 parent KV；不得留下 `DIRECT_READY`、旧 claim 或无人持有的 snapshot。
-- 下一轮在所选 P 上按完整 Prompt 重新 Prefill。该额外 Prefill、触发次数和
-  Direct 失败原因必须单独统计。
-- 这是有意识地用 P 侧剩余算力换取更低 Host 恢复压力，不属于父 KV
-  correctness failure。
+- 只有已验证为快工具的snapshot，在Direct失败且有效全局反馈处于拥堵模式时才进入本策略重算。
+  工具未按时返回始终Slow，不能把工具等待计为恢复堵塞。
+- 该判据是调度取舍，不是P物理容量不足的证明；不声称“未claim”等于没有内存。
+- 已获claim的失败必须先收敛原有传输fence并退还ownership；已有D-owned DIRECT_READY
+  通过现有claim-safe CAS转FAILED，持久化重算路由后释放D源KV。
+- 下一轮使用完整Prompt重新Prefill；重算次数和额外计算单独统计，不归为无故KV丢失。
+- Q只影响尚未选择失败出口的snapshot，已durable的Host恢复任务不被该策略取消。
 
 #### P Router
 
@@ -105,8 +134,8 @@ Decode 完成一轮后，需要准备把该 request-generation 的完整 parent 
 - D→P Slow 的 D2H 落点只根据 Shared Host Arena 剩余字节选择；Host durable 后的 H2D/Prefill 落点再独立根据 P 的剩余 KV tokens 选择。不得把 Host 剩余量与 P HBM 剩余量合成为加权 pressure score，也不得因为 Host 落在某个 P 管理的 Arena 就把恢复计算固定到该 P。
 - 选择 P 时必须同时考虑 parent KV 和新增 tool-result tokens 的完整 workset，防止 P 被 parent KV 塞满后无法 Prefill。
 - TP 场景由逻辑 TP rank 0 做一次组级决策并广播；所有 rank 必须选择同一个逻辑 P 组。
-- 若 Direct 失败，TP=1 与 TP>1 都进入相同的组级显式重算语义；不得再迁移到
-  Slow，也不得因重路由造成 snapshot 丢失或多重所有权。
+- Direct失败由TP rank0依据全局拥堵模式选择Slow或重算，再走既有组级fence；
+  其他rank不独立选路，不得因重路由造成snapshot丢失或多重所有权。
 
 ### 2.3 Prefill 调度
 
@@ -135,8 +164,8 @@ Direct 与 Slow 必须有独立 I/O 队列，并与计算进度解耦。
 
 ### D 侧
 
-- D→P Direct、Slow 与重算发布完全解耦。Direct 失败后立即发布显式重算，不能
-  转入 Slow，也不能阻塞后续 Direct；慢工具仍可独立进入 Slow。
+- D→P Direct、Slow与重算发布完全解耦。快工具Direct失败按全局恢复拥堵模式选择出口；
+  Slow和显式重算均不能阻塞后续Direct，慢工具仍独立进入Slow。
 - Slow 不做全量 candidate 扫描：每个 D rank 维护 sticky active window，并用 round-robin progress budget 推进。配置上限默认 active window=8、每轮 budget=8，但物理上限按 DMA group 数裁剪；默认 4 个 DMA group，因此同时只让 4 个 snapshot 取得 D2H pipeline，窗口外 snapshot 继续由 D HBM 完整持有，不会取得部分 Host ownership。一次 progress visit 对一个 snapshot 最多推进一个物理阶段，不能把整个 snapshot 的 chunk 全部排入 CUDA 队列。
 - D→P D2H 使用独立低优先级 CUDA stream。传输 worker 从进程内有界 registered-window cache 取得最终 request extent 所覆盖的窗口，并在后台生成一次 CPU token-index mirror；CUDA 13 `cuMemcpyBatchAsync` 把相邻 allocator tokens 合并为 page/run 后批量提交 `HBM→registered final extent`，不再启动占用 SM 的 gather kernel。完成 event 同时是该 chunk 的物理完成与 Host durable fence，不再有 CPU commit memcpy。默认 batch 为 4096 tokens；窗口默认 8 GiB、通用 cache 默认 64 GiB。全局路由下一个进程可能访问 4 个 P domain，正式 Qwen3-8B 4P:4D 配置因此使用 1280 GiB 上限（`4 * (256+64) GiB`）；首次发现 arena 时只启动后台预注册线程，线程逐个 8 GiB 窗口 acquire/release，不能在传输 progress 线程内同步注册完整个 256 GiB arena。只能淘汰 refcount=0 的窗口，snapshot close 先释放窗口引用，不能逐请求 unregister。注册或 batch API 在任何 CUDA 提交前不可用时，才安全回退到原 gather→pinned-bounce/CPU-commit 路径。每条 lane、每个 snapshot 同时最多一个在途 CUDA batch；正式配置只使用两条经 Forward 隔离测试验证的 lane。
 - Host durable 或 Direct 成功后，及时删除 D 上该 request-generation 的 KV，不做无必要的保守保留。
@@ -173,13 +202,45 @@ Direct 与 Slow 必须有独立 I/O 队列，并与计算进度解耦。
 
 ## 5. Shared Host Arena 容量与驱逐
 
+### 2026-09-09：统一 NUMA 物理池（c576已测，暂不替换完整方案）
+
+2026-09-10按用户要求撤回统一池实现，SGLang恢复到`921fbd46ab6d`。
+池代码及启动入口归档到该轮结果的`code-archive`；下列为历史设计记录，
+不代表当前可启用功能。下一轮c576仅关闭P→D Host，保留late binding和D→P全部路径。
+
+2026-09-10完成300+1200秒c576：Decode4656.9 token/s，旧独立Arena为4822.5。
+存在1次终止/续轮不一致的Router超时，不标为零错误验收。该后端继续显式开关，
+详见`NUMA_SHARED_HOST_POOL.md`及对应结果报告；旧默认Host后端保留。
+
+- `SGLANG_AGENTIC_KV_NUMA_HOST_POOL=1` 选择新的 Host 存储后端；未开启时保留原有
+  每P、每方向独立 arena。每 NUMA 启动一个 broker 持有288 GiB memfd CPU DRAM，
+  D→P/P→D各保底96 GiB，共享96 GiB弹性额度。全机两池共576 GiB，不能再把
+  每P的视图容量相加当作物理使用量。实际容量和两个方向用量由broker单独记录。
+- Host写入按源GPU的NUMA优先；本地完整extent不足时远端兜底。broker仅做原子
+  extent分配/归还，不做CUDA、snapshot路由、生命周期判定或DMA。
+- Host恢复在全部P/D中筛选可容纳完整workset/KV的目标，选择并预留在原有Router
+  锁内完成。P剩余容量相差不超过总容量5%或D工作负载相差不超过5%时优先本地。
+  P shadow credit必须在scheduled后由更新的物理压力采样接管，取消时只释放一次。
+- TP保留既有全部shard prepare/claim/fence屏障；每shard grant记录实际extent NUMA。
+  P/D启动时预热两个物理池的canonical路径，仍使用现有registered-window batch DMA，
+  不改变Forward线程或Direct/Slow I/O队列。预热全部完成后才开始300+1200秒业务测量。
+- 每次allocation持有唯一lease ID，重试幂等。原ledger确认传输fence完成、关闭
+  snapshot映射后才归还extent。归还ACK丢失由adapter保留显式释放重试记录。
+  不因进程退出回收仍可能在传输的extent；所有GPU进程退出后launcher才终止broker。
+  broker故障fail-closed，不能重新初始化并复用活跃地址。
+- 容量不足：P→D仍RETAIN_P；D→P仍沿用原未claim snapshot驱逐规则。
+  驱逐仅计本manager的D→P leases与目前可分配额度，不把另一方向/其他manager的
+  bytes当作自己的可驱逐对象。P→D绝不驱逐，取消与TP部分准备失败沿原回滚路径。
+- 本次只改变Host物理分配与Host恢复选择，不修改Direct阈值、拥堵重算、HBM
+  workset、Prefill计算准入、D admission、共享Radix释放或DMA完成判据。
+
 - 只有 D→P Shared Host Arena 允许驱逐：达到预警线（默认约 90%）时才触发 request-generation 级驱逐，驱逐到75%。
 - 驱逐单位必须是完整 request-generation；TP 的所有 shard 一起驱逐。
 - 正在传输、已被消费者 claim 或尚未完成物理 fence 的 snapshot 绝对不能驱逐。
 - 当前没有更精确 profile 时，优先驱逐较短、重算成本较低的 snapshot；相同长度时可优先驱逐已等待更久的 snapshot。
 - 驱逐后必须明确标记为 `RECOMPUTE_REQUIRED`，不能保留看似可恢复但实际缺页的 manifest。
 - P→D Shared Host Arena 不设驱逐水位并默认使用 100% 物理容量。无法为完整 snapshot 分配连续 extent 时，Host 不取得 ownership，结果必须为 `RETAIN_P`：完整 KV 继续留在 P HBM 并反压该 P，等待 Host extent 或 D 容量恢复。P→D Host 一旦取得 ownership 就不能驱逐、舍弃或退回 Direct，必须完成到 D 的交付或显式 fail-closed。
-- 大容量 arena 默认使用普通 CPU DRAM 的匿名 `memfd`，`/dev/shm` 仅保存小型 control ledger/marker；因此数据容量不受 `/dev/shm` mount 上限约束。下一轮 4P:4D、TP=1 实验配置为每个 P 的 D→P arena 256 GiB、P→D arena 64 GiB，两方向容量与 credit 完全独立。
+- 大容量 arena 默认使用普通 CPU DRAM 的匿名 `memfd`，`/dev/shm` 仅保存小型 control ledger/marker；因此数据容量不受 `/dev/shm` mount 上限约束。当前已验证4P:4D、TP=1 BrowseComp配置为每个P的D→P arena 128 GiB、P→D arena 32 GiB，两方向容量与 credit 完全独立。
 - 当前新方法只使用 Shared Host Arena，不依赖原生 SGLang HiCache/Mooncake 作为生命周期兜底。
 
 ## 6. 验收标准（每次修改必须逐项检查）

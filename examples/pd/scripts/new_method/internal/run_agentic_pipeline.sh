@@ -5,6 +5,29 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-9540}"
 DECODE_GPUS="${DECODE_GPUS:-1}"
 
+# P->D pre-binding ablation.  Keep the custom Router (and therefore the
+# complete D->P lifecycle) active, but make the Decode destination acquire
+# capacity before Prefill starts.  A pre-bound generation cannot spill to the
+# P->D Host arena, so the single ablation switch disables that data path for
+# every worker before any arena or ledger is created.
+case "${SGLANG_PD_ABLATION_P2D_PREBIND:-false}" in
+  1|true|TRUE|yes|YES|on|ON)
+    if [[ "${TP_SIZE:-1}" -ne 1 ]]; then
+      echo "SGLANG_PD_ABLATION_P2D_PREBIND currently requires TP_SIZE=1" >&2
+      exit 2
+    fi
+    export SGLANG_PD_ABLATION_P2D_PREBIND=true
+    export SGLANG_AGENTIC_KV_P2D_HOST_STAGING=false
+    ;;
+  0|false|FALSE|no|NO|off|OFF|"")
+    export SGLANG_PD_ABLATION_P2D_PREBIND=false
+    ;;
+  *)
+    echo "SGLANG_PD_ABLATION_P2D_PREBIND must be a boolean" >&2
+    exit 2
+    ;;
+esac
+
 created_ready_dir=0
 created_ledger=0
 created_staging_ledger=0

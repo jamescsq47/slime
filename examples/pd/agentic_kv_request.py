@@ -129,6 +129,15 @@ def lifecycle_enabled() -> bool:
     }
 
 
+def reverse_reuse_enabled() -> bool:
+    """Whether later generations may reference a Decode-produced parent KV."""
+
+    return not (
+        os.getenv("SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE", "false").lower()
+        in {"1", "true", "yes", "y"}
+    )
+
+
 def confirm_agentic_generation_final(
     trajectory_metadata: Mapping[str, Any],
     generation: int,
@@ -138,7 +147,7 @@ def confirm_agentic_generation_final(
     """Best-effort application ACK that this generation ended the trajectory."""
 
     p_ready_dir = p_ready_dir or os.getenv("PD_P_READY_DIR", "")
-    if not lifecycle_enabled() or not p_ready_dir:
+    if not lifecycle_enabled() or not reverse_reuse_enabled() or not p_ready_dir:
         return False
     request_id = trajectory_metadata.get(REQUEST_ID_KEY)
     if request_id is None:
@@ -166,7 +175,7 @@ def confirm_agentic_generation_tool(
     """ACK that the application parser accepted this generation's tool call."""
 
     p_ready_dir = p_ready_dir or os.getenv("PD_P_READY_DIR", "")
-    if not lifecycle_enabled() or not p_ready_dir:
+    if not lifecycle_enabled() or not reverse_reuse_enabled() or not p_ready_dir:
         return False
     request_id = trajectory_metadata.get(REQUEST_ID_KEY)
     if request_id is None:
@@ -251,7 +260,7 @@ def add_agentic_kv_metadata(
             TERMINAL_MARKER_STRINGS_KEY: [str(marker) for marker in terminal_markers],
         }
     )
-    if generation > 0:
+    if generation > 0 and reverse_reuse_enabled():
         custom_params[PARENT_GENERATION_KEY] = generation - 1
     else:
         custom_params.pop(PARENT_GENERATION_KEY, None)

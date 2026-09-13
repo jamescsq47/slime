@@ -1,0 +1,20 @@
+schema_version: 1
+datasets:
+  - id: science
+    harness: sciagentgym
+    path: /homes/siqic/data/SciAgentGYM/dataset/refine_merged_single_questions.json
+    weight: 1
+    options:
+      upstream_dir: /homes/siqic/data/SciAgentGYM
+      case_ids: [1, 16, 20, 25, 26, 28, 31, 32, 35, 36]
+      max_tokens_per_turn: 8192
+      max_response_tokens: 32768
+      max_turns: 10
+      tool_timeout_seconds: 60
+sampling:
+  policy: random
+  seed: 2026
+  preserve_source_order: true
+  shuffle_algorithm: source_order
+  count_algorithm: largest_remainder_v1
+  pool_reuse_algorithm: cycle_as_needed_v1

@@ -411,6 +411,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self._d2p_host_ledger = (
             SharedHostStagingLedger(staging_path) if staging_path else None
         )
+        self._slow_congestion = None
+        if os.getenv("SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE", "0").lower() in {"1", "true"}:
+            from sglang.srt.disaggregation.agentic_slow_congestion import SlowRecoveryCongestion
+            lanes = max(1, _env_int("SGLANG_AGENTIC_KV_P_H2D_MAX_INFLIGHT", 2)) * len(self.prefill_urls)
+            self._slow_congestion = SlowRecoveryCongestion(
+                _env_int("SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH", 4 * lanes),
+                _env_int("SGLANG_AGENTIC_KV_SLOW_CONGESTION_LOW", lanes),
+            )
         # One logical request-generation may outlive an HTTP client's timeout.
         # Keep the actual P->D dispatch detached from that client and let every
         # retry await the same task.  Without this fence, a retry can select a
@@ -442,9 +450,20 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS"
         )
         self.global_decode = _env_bool("SGLANG_PD_LATE_BIND_GLOBAL_DECODE")
+        # Ablation-only classic P->D ordering: reserve and submit one Decode
+        # destination before Prefill starts.  The custom Router stays active,
+        # so D->P Direct/Slow routing and request-generation ownership are
+        # otherwise identical to the full method.
+        self.p2d_prebind_ablation = _env_bool(
+            "SGLANG_PD_ABLATION_P2D_PREBIND"
+        )
         self.p2d_host_staging = _env_bool(
             "SGLANG_AGENTIC_KV_P2D_HOST_STAGING"
         )
+        if self.p2d_prebind_ablation and self.p2d_host_staging:
+            raise ValueError(
+                "P->D pre-binding ablation requires P->D Host staging disabled"
+            )
         self.p2d_host_spill_delay = _env_float(
             "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS", 0.5
         )
@@ -774,11 +793,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         temporary.write_bytes(orjson.dumps(payload))
         os.replace(temporary, path)
 
-    def _prefill_arena_bytes(self) -> list[int]:
+    def _prefill_arena_bytes(self, recovery_parents=None):
         used = [0] * len(self.prefill_urls)
         ledger = self._d2p_host_ledger
         if ledger is None:
-            return used
+            return used if recovery_parents is None else (used, 0)
+        q = 0
+        if recovery_parents is not None:
+            from sglang.srt.disaggregation.agentic_slow_congestion import waiting_for_recovery
         live_states = {
             HostStageState.HOST_RESERVED.value,
             HostStageState.HOST_WRITING.value,
@@ -795,13 +817,17 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         # not.  Add the former only when this environment exposes it.
         if _HOST_STAGE_EVICTING is not None:
             live_states.add(_HOST_STAGE_EVICTING.value)
-        for entry in ledger.snapshot_entries().values():
+        for snapshot_id, entry in ledger.snapshot_entries().items():
+            # Same existing ledger read/iteration, unique generation IDs;
+            # never sum per-P caches or scan arrival marker directories.
+            if recovery_parents is not None and snapshot_id in recovery_parents:
+                q += int(waiting_for_recovery(entry))
             if entry.get("state") not in live_states:
                 continue
             domain = int(entry.get("arena_domain", -1))
             if 0 <= domain < len(used):
                 used[domain] += int(entry.get("byte_size", 0))
-        return used
+        return used if recovery_parents is None else (used, q)
 
     def _p2d_pressure_by_domain(
         self, ledger_entries: Optional[dict[str, dict[str, Any]]] = None
@@ -920,7 +946,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     ),
                     return_exceptions=True,
                 )
-                arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
+                policy = getattr(self, "_slow_congestion", None)
+                if policy is None:
+                    arena_used = await asyncio.to_thread(self._prefill_arena_bytes)
+                else:
+                    arena_used, q = await asyncio.to_thread(
+                        self._prefill_arena_bytes, frozenset(policy.parents)
+                    )
                 domains = []
                 for domain, result in enumerate(fetched):
                     if isinstance(result, BaseException):
@@ -941,6 +973,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     "published_at": time.time(),
                     "domains": domains,
                 }
+                if policy is not None:
+                    previous = policy.latest
+                    payload["slow_recovery"] = policy.sample(q)
+                    if policy.latest is not previous:
+                        logger.info("PD_SLOW_CONGESTION q=%d congested=%s high=%d low=%d",
+                                    q, policy.blocked, policy.high, policy.low)
                 # Publish the sample and its causal epoch together, without an
                 # intervening await.  A Direct terminal may therefore either
                 # keep its bridge credit or rely on this physical snapshot,
@@ -959,7 +997,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 await asyncio.sleep(self._prefill_pressure_interval)
 
     def _ensure_prefill_pressure_monitor(self) -> None:
-        if not getattr(self, "dynamic_prefill_domains", False):
+        if not getattr(self, "dynamic_prefill_domains", False) and getattr(
+            self, "_slow_congestion", None
+        ) is None:
             return
         if not hasattr(self, "_prefill_pressure_interval"):
             self._prefill_pressure_interval = 0.20
@@ -1666,7 +1706,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             continue
                         original_domain = reservation.domain
                         domain = await self._move_prefill_work_to_max_remaining_kv(
-                            reservation, self._request_input_tokens(request)
+                            reservation, self._request_input_tokens(request),
                         )
                         domain = await self._commit_slow_recovery_domain(
                             parent, route, domain
@@ -3996,6 +4036,285 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 else:
                     self._reservations.pop(reservation.reservation_id, None)
 
+    async def _wait_prebound_prefill_or_redirect(
+        self,
+        prefill_task: asyncio.Task,
+        decode_task: asyncio.Task,
+        route_task: Optional[asyncio.Task],
+    ) -> Any:
+        """Wait for native Prefill while keeping D->P rerouting responsive."""
+
+        deadline = time.monotonic() + self.ready_timeout
+        decode_checked = False
+        while True:
+            self._raise_prefill_redirect(route_task)
+            if prefill_task.done():
+                response = prefill_task.result()
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(
+                        "Pre-bound Prefill failed: "
+                        f"status={response.status} body={body}"
+                    )
+                self._raise_prefill_redirect(route_task)
+                return response
+            if decode_task.done() and not decode_checked:
+                response = decode_task.result()
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(
+                        "Pre-bound Decode failed before Prefill: "
+                        f"status={response.status} body={body}"
+                    )
+                decode_checked = True
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting "
+                    f"{self.ready_timeout}s for native pre-bound Prefill"
+                )
+            waits = {prefill_task}
+            if not decode_task.done():
+                waits.add(decode_task)
+            if route_task is not None and not route_task.done():
+                waits.add(route_task)
+            await asyncio.wait(
+                waits,
+                timeout=min(0.25, self.ready_poll_interval),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+    async def _prebound_dispatch_with_metadata(
+        self,
+        session: aiohttp.ClientSession,
+        modified_request: dict[str, Any],
+        prefill_server: str,
+        endpoint: str,
+        headers: dict[str, str],
+        metadata: Optional[AgenticRequestMetadata],
+    ):
+        """Run classic pre-bound P->D while preserving the D->P method.
+
+        The Router reserves one D before submitting either backend request.
+        Workers disable compute-ahead P-ready gating under the same global
+        ablation flag, so D performs native preallocation and P waits on its
+        normal bootstrap metadata.  No P->D Host owner can exist in this mode.
+        """
+
+        if getattr(self, "p2d_host_staging", False):
+            raise RuntimeError("pre-bound P->D cannot use P->D Host staging")
+        if modified_request.get("return_logprob", False):
+            raise RuntimeError(
+                "pre-bound P->D ablation does not support return_logprob"
+            )
+
+        rooms = self._rooms(modified_request)
+        parent_turn = metadata is not None and metadata.parent is not None
+        arrival_at: Optional[float] = time.time() if parent_turn else None
+        prefill_work: Optional[_PrefillWorkReservation] = None
+        if getattr(self, "dynamic_prefill_domains", False):
+            self._ensure_prefill_pressure_monitor()
+            arrival = self._publish_parent_arrival(modified_request)
+            if arrival is not None:
+                arrival_at = float(arrival["arrived_at"])
+            prefill_work = await self._resolve_dynamic_prefill_work(
+                modified_request, metadata, arrival_at
+            )
+            domain = prefill_work.domain
+        else:
+            domain = self._request_domain(metadata, rooms)
+
+        self._set_prefill_attempt_rid(modified_request, replace=False)
+        while True:
+            if getattr(self, "numa_domains", False):
+                prefill_server = self._bind_prefill_domain(
+                    modified_request, domain
+                )
+            rooms = self._rooms(modified_request)
+            self._activate_prefill_attempt(modified_request, rooms)
+            attempt_active = True
+            route_task: Optional[asyncio.Task] = None
+            reservation: Optional[DecodeReservation] = None
+            prefill_task: Optional[asyncio.Task] = None
+            decode_task: Optional[asyncio.Task] = None
+            p_gate: Optional[_PrefillAdmissionGate] = None
+            p_gate_held = False
+            keep_d_credit = False
+            keep_p_credit = False
+            try:
+                if parent_turn:
+                    self._publish_parent_arrival(
+                        modified_request,
+                        target_prefill_domain=(
+                            domain
+                            if getattr(self, "dynamic_prefill_domains", False)
+                            else None
+                        ),
+                        arrived_at=arrival_at,
+                    )
+                    if (
+                        prefill_work is not None
+                        and prefill_work.route_pending
+                        and metadata is not None
+                    ):
+                        route_task = asyncio.create_task(
+                            self._watch_dynamic_prefill_route(
+                                modified_request, metadata, prefill_work
+                            )
+                        )
+
+                reservation = await self._select_and_reserve_decode(
+                    session,
+                    modified_request,
+                    rooms,
+                    self._request_input_tokens(modified_request),
+                    domain,
+                )
+                if reservation is None:
+                    raise RuntimeError(
+                        "P->D pre-binding returned without a Decode reservation"
+                    )
+                logger.info(
+                    "PD_P2D_PREBIND rooms=%s P=%d D=%s admission_tokens=%d",
+                    rooms,
+                    domain,
+                    reservation.url,
+                    reservation.admission_tokens,
+                )
+                # D is posted first. Its native preallocation publishes the
+                # bootstrap metadata consumed by P. P is forced non-streaming
+                # so its HTTP completion is also the native P->D completion
+                # fence; the client-facing D request keeps its original mode.
+                decode_task = asyncio.create_task(
+                    session.post(
+                        f"{reservation.url}/{endpoint}",
+                        json=modified_request,
+                        headers=headers,
+                    )
+                )
+                p_gate = self._prefill_admission_for_domain(domain)
+                await p_gate.acquire(parent_turn=parent_turn)
+                p_gate_held = True
+                prefill_request = dict(modified_request)
+                prefill_request["stream"] = False
+                prefill_task = asyncio.create_task(
+                    session.post(
+                        f"{prefill_server}/{endpoint}",
+                        json=prefill_request,
+                        headers=headers,
+                    )
+                )
+                try:
+                    await self._wait_until_prefill_accepted(
+                        rooms, prefill_task, route_task
+                    )
+                finally:
+                    await p_gate.release()
+                    p_gate_held = False
+
+                prefill_response = await self._wait_prebound_prefill_or_redirect(
+                    prefill_task, decode_task, route_task
+                )
+                try:
+                    await prefill_response.read()
+                finally:
+                    prefill_response.release()
+                prefill_response = None
+                # The non-streaming native P response is the P->D transfer
+                # fence. Hand shadow credit to a causally newer D load sample.
+                async with self._selection_lock:
+                    self._admitted_reservation_at[
+                        reservation.reservation_id
+                    ] = time.monotonic()
+                keep_d_credit = True
+                await self._release_prefill_work(prefill_work)
+                if route_task is not None and not route_task.done():
+                    route_task.cancel()
+                    await asyncio.gather(route_task, return_exceptions=True)
+                decode_response = await decode_task
+                return prefill_response, decode_response
+            except _PrefillRedirect as redirect:
+                p_aborted = True
+                d_aborted = True
+                if prefill_task is not None:
+                    p_aborted = await self._abort_prefill_attempt(
+                        session,
+                        prefill_server,
+                        modified_request,
+                        prefill_task,
+                    )
+                    prefill_task = None
+                if decode_task is not None and reservation is not None:
+                    d_aborted = await self._abort_decode_attempt(
+                        session, reservation.url, modified_request
+                    )
+                    await self._dispose_response_task(decode_task)
+                    decode_task = None
+                if not p_aborted or not d_aborted:
+                    keep_p_credit = not p_aborted
+                    keep_d_credit = True
+                    raise RuntimeError(
+                        "Cannot safely redirect pre-bound P->D attempt: "
+                        f"P_abort={p_aborted} D_abort={d_aborted}"
+                    )
+                if reservation is not None:
+                    async with self._selection_lock:
+                        self._admitted_reservation_at[
+                            reservation.reservation_id
+                        ] = time.monotonic()
+                    reservation = None
+                for room in rooms:
+                    self._accepted_path(room).unlink(missing_ok=True)
+                    self._scheduled_path(room).unlink(missing_ok=True)
+                    self._ready_path(room).unlink(missing_ok=True)
+                self._deactivate_prefill_attempt(modified_request, rooms)
+                attempt_active = False
+                await self._move_prefill_work(prefill_work, redirect.domain)
+                domain = redirect.domain
+                self._replace_prefill_attempt_rooms(modified_request)
+                self._set_prefill_attempt_rid(modified_request, replace=True)
+                keep_p_credit = True
+                continue
+            except BaseException:
+                p_aborted = prefill_task is None
+                d_aborted = decode_task is None
+                if prefill_task is not None:
+                    p_aborted = await self._abort_prefill_attempt(
+                        session,
+                        prefill_server,
+                        modified_request,
+                        prefill_task,
+                    )
+                    prefill_task = None
+                if decode_task is not None and reservation is not None:
+                    d_aborted = await self._abort_decode_attempt(
+                        session, reservation.url, modified_request
+                    )
+                    await self._dispose_response_task(decode_task)
+                    decode_task = None
+                keep_p_credit = not p_aborted
+                keep_d_credit = reservation is not None
+                if d_aborted and reservation is not None:
+                    async with self._selection_lock:
+                        self._admitted_reservation_at[
+                            reservation.reservation_id
+                        ] = time.monotonic()
+                raise
+            finally:
+                if p_gate_held and p_gate is not None:
+                    await p_gate.release()
+                if route_task is not None and not route_task.done():
+                    route_task.cancel()
+                    await asyncio.gather(route_task, return_exceptions=True)
+                if reservation is not None and not keep_d_credit:
+                    async with self._selection_lock:
+                        self._reservations.pop(
+                            reservation.reservation_id, None
+                        )
+                if not keep_p_credit:
+                    await self._release_prefill_work(prefill_work)
+                if attempt_active:
+                    self._deactivate_prefill_attempt(modified_request, rooms)
+
     async def _late_dispatch(
         self,
         session: aiohttp.ClientSession,
@@ -4024,6 +4343,29 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     )
         except (TypeError, ValueError):
             metadata = None
+        policy = getattr(self, "_slow_congestion", None)
+        parent_id = metadata.parent.snapshot_id if metadata is not None and metadata.parent is not None else None
+        if policy is not None:
+            self._ensure_prefill_pressure_monitor()
+        if policy is not None and parent_id is not None:
+            policy.enter(parent_id)
+        try:
+            dispatch = (
+                self._prebound_dispatch_with_metadata
+                if getattr(self, "p2d_prebind_ablation", False)
+                else self._late_dispatch_with_metadata
+            )
+            return await dispatch(
+                session, modified_request, prefill_server, endpoint, headers, metadata
+            )
+        finally:
+            if policy is not None and parent_id is not None:
+                policy.leave(parent_id)
+
+    async def _late_dispatch_with_metadata(
+        self, session, modified_request, prefill_server, endpoint, headers, metadata
+    ):
+        rooms = self._rooms(modified_request)
         parent_turn = metadata is not None and metadata.parent is not None
         prefill_work: Optional[_PrefillWorkReservation] = None
         # Preserve the application-visible tool-return time independently of

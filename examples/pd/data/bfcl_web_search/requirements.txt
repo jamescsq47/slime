@@ -1,0 +1,4 @@
+ddgs==9.16.0
+html2text==2025.4.15
+aiohttp>=3.10,<4
+beautifulsoup4>=4.12,<5

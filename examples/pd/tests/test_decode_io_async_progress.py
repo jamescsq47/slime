@@ -17,7 +17,10 @@ from sglang.srt.disaggregation.agentic_kv_lifecycle import (
     AgenticRequestMetadata,
     SnapshotState,
 )
-from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.prefill import (
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+)
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 
 
@@ -30,6 +33,53 @@ class _CountingReceiver:
     def poll(self):
         self.poll_count += 1
         return KVPoll.Transferring
+
+
+def test_prebind_ablation_disables_both_sides_of_p_ready_gate():
+    prefill = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+    prefill.p_ready_dir = "/dev/shm/p-ready"
+    prefill.p2d_prebind_ablation = False
+    assert prefill._compute_ahead_enabled()
+    prefill.p2d_prebind_ablation = True
+    assert not prefill._compute_ahead_enabled()
+
+    decode = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    decode.p_ready_dir = "/dev/shm/p-ready"
+    decode.p2d_prebind_ablation = False
+    request = types.SimpleNamespace(
+        req=types.SimpleNamespace(bootstrap_host="127.0.0.1")
+    )
+    assert decode._requires_p_ready(request)
+    decode.p2d_prebind_ablation = True
+    assert not decode._requires_p_ready(request)
+
+
+def test_tp_prebind_admission_is_ready_without_filesystem_marker():
+    decode = DecodePreallocQueue.__new__(DecodePreallocQueue)
+    decode.tp_size = 2
+    decode.p_ready_dir = "/dev/shm/p-ready"
+    decode.p2d_prebind_ablation = True
+    published = []
+    decode.scheduler = types.SimpleNamespace(
+        agentic_tp_p2d_admission_mailbox=types.SimpleNamespace(
+            publish_local=lambda key, value: published.append((key, value))
+        )
+    )
+    decode.queue = [
+        types.SimpleNamespace(
+            waiting_for_input=True,
+            req=types.SimpleNamespace(
+                rid="tp-prebind",
+                bootstrap_room=17,
+                bootstrap_host="127.0.0.1",
+            ),
+        )
+    ]
+
+    decode._publish_tp_admission_readiness()
+
+    assert published
+    assert published[0][1] == int(KVPoll.Success)
 
 
 def test_transfer_poll_runs_only_in_background_progress():
@@ -674,6 +724,27 @@ def test_explicit_tool_continuation_can_publish_reverse_kv():
     tool = _finished_agentic_req('{"name":"code_interpreter"}</tool_call> ')
     assert manager._offload_agentic_finished_snapshot(tool, _agentic_metadata())
     assert len(published) == 1
+
+
+def test_pure_recompute_finished_request_never_starts_reverse_transfer():
+    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.agentic_disable_d2p_reuse = True
+    manager._publish_agentic_direct_candidate = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("pure recompute attempted D-to-P Direct")
+    )
+    manager._start_agentic_slow_snapshot = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("pure recompute attempted D-to-P Host staging")
+    )
+    tool = _finished_agentic_req('{"name":"code_interpreter"}</tool_call> ')
+    assert not manager._offload_agentic_finished_snapshot(tool, _agentic_metadata())
+
+
+def test_pure_recompute_does_not_release_unfinished_request():
+    manager = DecodeKVCacheOffloadManager.__new__(DecodeKVCacheOffloadManager)
+    manager.agentic_disable_d2p_reuse = True
+    running = _finished_agentic_req('{"name":"code_interpreter"}</tool_call> ')
+    running.finished = lambda: False
+    assert not manager._offload_agentic_finished_snapshot(running, _agentic_metadata())
 
 
 def test_unconfirmed_tool_candidate_preserves_parent_via_host_fallback():

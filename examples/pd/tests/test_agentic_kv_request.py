@@ -107,6 +107,51 @@ def test_add_agentic_metadata_preserves_existing_custom_params():
     assert custom["agentic_terminal_marker_strings"] == ["<answer>"]
 
 
+def test_pure_recompute_keeps_current_generation_but_omits_parent(monkeypatch):
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE", "true")
+    params, request_id = add_agentic_kv_metadata(
+        {},
+        trajectory_metadata={"agentic_request_id": "pure-recompute"},
+        generation=3,
+        tokenizer=FakeTokenizer(),
+        tool_type="search",
+        tool_suffix_markers=("</tool_call>",),
+    )
+    custom = params["custom_params"]
+    assert request_id == "pure-recompute"
+    assert custom["agentic_generation"] == 3
+    assert "agentic_parent_generation" not in custom
+    envelope = build_agentic_extra_key(request_id, params)
+    _, _, payload_raw = envelope.split(":", 2)
+    wire = json.loads(
+        base64.urlsafe_b64decode(payload_raw + "=" * (-len(payload_raw) % 4))
+    )
+    assert wire["agentic_generation"] == 3
+    assert "agentic_parent_generation" not in wire
+
+
+def test_pure_recompute_does_not_publish_application_ack(monkeypatch):
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as ready_dir:
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_LIFECYCLE", "true")
+        monkeypatch.setenv("SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE", "true")
+        monkeypatch.setenv("PD_P_READY_DIR", ready_dir)
+        trajectory = {"agentic_request_id": "pure-recompute"}
+        assert not confirm_agentic_generation_tool(
+            trajectory, 2, p_ready_dir=""
+        )
+        assert not confirm_agentic_generation_final(
+            trajectory, 2, p_ready_dir=""
+        )
+        store = AgenticEarlyClaimStore(f"{ready_dir}/early-claims")
+        generation = RequestGeneration("pure-recompute", 2)
+        assert store.read_tool(
+            generation, not_before=0.0, max_age_seconds=5.0
+        ) is None
+        assert store.read_final(
+            generation, not_before=0.0, max_age_seconds=5.0
+        ) is None
+
+
 def test_agentic_extra_key_is_router_safe_and_excludes_application_metadata():
     params = {
         "custom_params": {

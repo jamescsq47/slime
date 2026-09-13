@@ -4,15 +4,16 @@ The control contract follows the direct SWE-bench evaluator in Miles PR #51:
 
 ``reset -> {policy -> one shell action} -> capture patch -> hidden verifier``.
 
-Only transports are local adapters. Model calls go through the experiment's
-SGLang router and environment actions use the existing instrumented Docker or
-Daytona sandbox. Hidden verifier material is unavailable until the policy has
-irreversibly stopped.
+The ``miles_pr51`` command contract preserves the upstream fenced-shell policy.
+The optional ``openai_tools`` protocol is a LOCAL adaptation, not upstream
+OpenEnv. Model calls use the SGLang router; environment actions use Docker or
+Daytona. Hidden verifier material is unavailable until the policy has stopped.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -53,6 +54,28 @@ _GENERIC_FENCE = re.compile(
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _TASK_COMPLETE_LINE = re.compile(r"(?im)^\s*TASK_COMPLETE\s*$")
 _TASK_COMPLETE = "TASK_COMPLETE"
+_TOOL_MARKUP = re.compile(r"<\s*/?\s*(?:tool_call|function|parameter)\b", re.I)
+
+
+def extract_miles_command(message: dict[str, Any]) -> str:
+    """Solo evaluator contract from Miles PR51 e2e516603ad6 (_extract_command).
+
+    No structured tools, aliases, recovery prompt, or inferred submission.
+    REQUEST_REVIEW is handled separately: this adapter has no review gateway.
+    """
+    content = message.get("content")
+    if not isinstance(content, str):
+        return ""
+    stripped = content.strip()
+    if stripped.upper().startswith("TASK_COMPLETE"):
+        return "TASK_COMPLETE"
+    if stripped.upper().startswith("REQUEST_REVIEW"):
+        return "REQUEST_REVIEW"
+    match = _BASH_FENCE.search(content)
+    if match:
+        return match.group(1).strip()
+    match = _GENERIC_FENCE.search(_THINK.sub("", content))
+    return match.group(1).strip() if match else ""
 
 _SHELL_TOOL = {
     "type": "function",
@@ -170,17 +193,16 @@ def structured_terminal_reason(
 ) -> str | None:
     """Classify a tool-protocol response that does not request another action.
 
-    In OpenAI's tool-calling protocol, a non-empty assistant response without a
-    tool call is a valid final answer. ``TASK_COMPLETE`` remains a stronger,
-    explicit completion marker, but it may follow a short human-readable
-    summary. Only an empty response without a tool call is a protocol failure.
+    Never interpret incomplete tool markup or private reasoning as submission.
+    Ordinary visible summaries remain accepted for the legacy tools protocol.
     """
 
     if tool_calls:
         return None
     visible = reply.replace("<|im_end|>", "").strip()
-    reasoning = reasoning_content.replace("<|im_end|>", "").strip()
-    if _TASK_COMPLETE_LINE.search(visible) or _TASK_COMPLETE_LINE.search(reasoning):
+    if _TOOL_MARKUP.search(visible):
+        return "tool_format_error"
+    if _TASK_COMPLETE_LINE.search(visible):
         return "task_complete"
     if visible:
         return "final_answer"
@@ -243,6 +265,13 @@ def _render_prompt(
     enable_thinking: bool,
     tools: list[dict[str, Any]] | None = None,
 ) -> list[int]:
+    if tools is not None:
+        # Match this runtime's actual OpenAI schema, including version-specific
+        # defaults (e.g. Tool.defer_loading=None in pd_mamba). Handwritten
+        # schema defaults silently produced a six-token mismatch previously.
+        from sglang.srt.entrypoints.openai.protocol import Tool
+
+        tools = [Tool.model_validate(tool).model_dump() for tool in tools]
     # OpenAI history keeps function.arguments as a JSON string. Hugging Face
     # chat templates expect a mapping, so normalize only this local rendering
     # copy; the request sent through the Rust router remains protocol-valid.
@@ -372,6 +401,12 @@ async def _model_turn(
             "separate_reasoning": True,
             "stream": False,
         }
+        if options.get("command_contract") == "miles_pr51":
+            # Match the upstream ordinary Chat client: do not expose transport
+            # EOS tokens as assistant text. Slime's inference sampling defaults
+            # retain them; ```<|im_end|> then fails upstream's anchored fence.
+            payload["skip_special_tokens"] = True
+            payload["no_stop_trim"] = False
         if tools is not None:
             payload.update(
                 {
@@ -480,6 +515,9 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
         or "swe_bench_openenv"
     )
     options = dict(getattr(args, "workload_dataset_options", {}).get(dataset_id, {}))
+    command_contract = str(options.get("command_contract", "local_strict"))
+    if command_contract not in {"local_strict", "miles_pr51"}:
+        raise ValueError(f"unsupported command_contract {command_contract!r}")
     action_protocol = str(options.get("action_protocol", "fenced_shell")).strip().lower()
     if action_protocol == "openai_tools" and str(
         options.get("model_api", "generate")
@@ -514,11 +552,26 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
     status = Sample.Status.COMPLETED
     stop_reason = "max_turns"
     last_generation: int | None = None
+    completed_generation: int | None = None
     last_outcome: tuple[str, int, str] | None = None
     identical_outcomes = 0
     last_failing_command: str | None = None
     repeated_failing_commands = 0
     started_at = time.monotonic()
+    finalized_generations: set[int] = set()
+
+    def finalize_generation() -> None:
+        # Application terminal ACK only; physical DMA fences and ownership
+        # release remain the responsibility of the existing PD state machine.
+        # A failure before the next HTTP request was submitted must also close
+        # the previous completed generation, whose parent may still be held.
+        for generation in sorted({g for g in (completed_generation, last_generation)
+                                  if g is not None} - finalized_generations):
+            confirm_agentic_generation_final(
+                metadata, generation,
+                p_ready_dir=str(getattr(args, "pd_p_ready_dir", "") or ""),
+            )
+            finalized_generations.add(generation)
 
     try:
         await task.start()
@@ -543,8 +596,20 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
         identical_limit = int(options.get("max_identical_command_outcomes", 4))
         repeated_failure_limit = int(options.get("max_repeated_failing_commands", 0))
         command_timeout = float(options.get("command_timeout_seconds", 600))
+        total_budget = int(options.get("max_response_tokens", 0))
+        if total_budget < 0:
+            raise ValueError("max_response_tokens must be nonnegative (0 means unlimited)")
 
         for turn in range(max_turns):
+            turn_options = dict(options)
+            if total_budget:
+                remaining_budget = total_budget - completion_token_count
+                if remaining_budget <= 0:
+                    stop_reason = "max_response_tokens"
+                    break
+                turn_options["max_tokens_per_turn"] = min(
+                    int(options.get("max_tokens_per_turn", 8192)), remaining_budget
+                )
             last_generation = turn
             reply, output_ids, metric, request_messages = await _model_turn(
                 args=args,
@@ -553,9 +618,10 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
                 metadata=metadata,
                 messages=messages,
                 sampling_params=sampling_params,
-                options=options,
+                options=turn_options,
                 turn=turn,
             )
+            completed_generation = turn
             output_token_ids.extend(output_ids)
             completion_token_count += int(metric["output_tokens"])
             raw_replies.append(reply)
@@ -576,11 +642,18 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
                     "reasoning_content": metric.get("reasoning_content") or None,
                 }
                 if tool_calls:
-                    assistant_message["tool_calls"] = tool_calls
+                    history_calls = copy.deepcopy(tool_calls)
+                    if not structured_error:
+                        history_calls[0]["function"]["name"] = "shell"
+                    assistant_message["tool_calls"] = history_calls
                 messages.append(assistant_message)
             else:
-                messages.append({"role": "assistant", "content": reply})
-                command = extract_command(reply)
+                assistant_message = {"role": "assistant", "content": reply}
+                if metric.get("reasoning_content"):
+                    assistant_message["reasoning_content"] = metric["reasoning_content"]
+                messages.append(assistant_message)
+                command = (extract_miles_command(assistant_message)
+                           if command_contract == "miles_pr51" else extract_command(reply))
             event: dict[str, Any] = {
                 **metric,
                 "assistant": reply,
@@ -596,6 +669,17 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
             }
             turn_events.append(event)
 
+            # A parser may return a partial command even on a length stop.
+            # Never execute it (nor treat a truncated summary as submission).
+            if metric.get("finish_type") == "length":
+                event["action_rejected_reason"] = "generation_truncated"
+                stop_reason = ("max_response_tokens" if total_budget and
+                               completion_token_count >= total_budget else "max_tokens_per_turn")
+                break
+            if command_contract == "miles_pr51" and command.upper().startswith("REQUEST_REVIEW"):
+                stop_reason = "unsupported_review_request"
+                break
+
             if action_protocol == "openai_tools":
                 terminal_reason = structured_terminal_reason(
                     reply,
@@ -604,23 +688,16 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
                 )
             else:
                 terminal_reason = (
-                    "task_complete" if command == _TASK_COMPLETE else None
+                    "task_complete" if (
+                        command.upper().startswith(_TASK_COMPLETE)
+                        if command_contract == "miles_pr51" else command == _TASK_COMPLETE
+                    ) else None
                 )
             if terminal_reason is not None:
                 stop_reason = terminal_reason
-                confirm_agentic_generation_final(
-                    metadata,
-                    turn,
-                    p_ready_dir=str(getattr(args, "pd_p_ready_dir", "") or ""),
-                )
                 break
             if not command:
                 stop_reason = "no_command"
-                confirm_agentic_generation_final(
-                    metadata,
-                    turn,
-                    p_ready_dir=str(getattr(args, "pd_p_ready_dir", "") or ""),
-                )
                 break
 
             confirm_agentic_generation_tool(
@@ -694,17 +771,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
             if identical_limit and identical_outcomes >= identical_limit:
                 stop_reason = "repeated_command_outcome"
                 break
-        else:
-            # Reaching the configured turn budget is a normal OpenEnv episode
-            # terminal state. The resulting repository is still canonically
-            # graded, unlike mini-SWE-agent's submission-gated contract.
-            if last_generation is not None:
-                confirm_agentic_generation_final(
-                    metadata,
-                    last_generation,
-                    p_ready_dir=str(getattr(args, "pd_p_ready_dir", "") or ""),
-                )
-
+        finalize_generation()
         # PR #51 grades the durable repository state after the agent stops; it
         # does not require a harness-specific submission marker.
         final_patch = await capture_repository_patch(task, preserved_commit)
@@ -736,14 +803,11 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
         status = Sample.Status.FAILED
         stop_reason = f"environment_error:{type(exc).__name__}"
         metadata["environment_error"] = str(exc)
-        if last_generation is not None:
-            confirm_agentic_generation_final(
-                metadata,
-                last_generation,
-                p_ready_dir=str(getattr(args, "pd_p_ready_dir", "") or ""),
-            )
     finally:
-        await task.close()
+        try:
+            finalize_generation()
+        finally:
+            await task.close()
 
     sample.status = status
     sample.tokens = output_token_ids
@@ -770,6 +834,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict[str, Any]) -
             "agent_harness": "openenv-swebench-pr51",
             "model_api": str(options.get("model_api", "generate")).strip().lower(),
             "action_protocol": action_protocol,
+            "command_contract": command_contract,
             "openenv_episode_schema_version": 1,
             "openenv_trajectory": {
                 "system_prompt": messages[0]["content"],

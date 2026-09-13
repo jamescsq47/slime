@@ -232,6 +232,7 @@ for index in "${!p_gpu_groups[@]}"; do
     --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${p_ports[index]}"
     --context-length "${MODEL_CONTEXT_LENGTH}" --page-size "${PAGE_SIZE}"
     --mem-fraction-static "${p_mem_fraction_statics[index]}"
+    --skip-server-warmup
     --enable-metrics --uvicorn-access-log-exclude-prefixes /get_load /metrics /health
     --disaggregation-mode prefill --disaggregation-transfer-backend nixl
     --disaggregation-bootstrap-port "${p_bootstrap_ports[index]}"
@@ -274,6 +275,7 @@ for index in "${!d_gpu_groups[@]}"; do
     --model-path "${MODEL_PATH}" --host 0.0.0.0 --port "${d_ports[index]}"
     --context-length "${MODEL_CONTEXT_LENGTH}" --page-size "${PAGE_SIZE}"
     --mem-fraction-static "${d_mem_fraction_statics[index]}"
+    --skip-server-warmup
     --enable-metrics --uvicorn-access-log-exclude-prefixes /get_load /metrics /health
     --disaggregation-mode decode --disaggregation-transfer-backend nixl
     "${d_tp_args[@]}"
@@ -351,8 +353,12 @@ fi
 if [[ "${PRESERVE_SOURCE_ORDER}" == "true" ]]; then
   infer_args+=(--preserve-source-order)
 fi
-SLIME_HTTP_READ_TIMEOUT_SECONDS="${SLIME_HTTP_READ_TIMEOUT_SECONDS:-3600}" \
-"${PD_ENV_BIN}/python" inference.py "${infer_args[@]}" >"${RUN_DIR}/inference.log" 2>&1
+# An interruptible wait lets the launcher run its cleanup trap immediately.
+# A foreground Python command would defer SIGTERM handling until it exits.
+setsid env SLIME_HTTP_READ_TIMEOUT_SECONDS="${SLIME_HTTP_READ_TIMEOUT_SECONDS:-3600}" \
+"${PD_ENV_BIN}/python" inference.py "${infer_args[@]}" >"${RUN_DIR}/inference.log" 2>&1 &
+inference_pid=$!; pd_track_group "${inference_pid}"
+wait "${inference_pid}"
 case "${POST_ANALYZER}" in
   pd_offload)
     "${PD_ENV_BIN}/python" "${SCRIPT_DIR}/../tools/analyze_pd_offload.py" --run-dir "${RUN_DIR}"

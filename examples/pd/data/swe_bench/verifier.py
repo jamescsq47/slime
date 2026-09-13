@@ -361,7 +361,7 @@ async def run_inline_verifier(
         test_spec, script = build_eval_script(metadata)
         await sandbox.upload_bytes(script.encode("utf-8"), "/eval.sh")
         exit_code, output = await sandbox.execute(
-            "chmod +x /eval.sh && /bin/bash /eval.sh",
+            "/bin/bash /eval.sh",
             timeout=timeout_seconds,
             phase="verifier",
         )

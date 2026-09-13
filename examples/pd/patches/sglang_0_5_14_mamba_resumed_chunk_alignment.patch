@@ -1,0 +1,75 @@
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import math
+ from array import array
+ 
+ from sglang.srt.environ import envs
+@@ -719,6 +720,21 @@
+                     return req
+                 _rem_tokens = self.rem_chunk_tokens
+ 
++        if (
++            self.dllm_config is None
++            and self.is_hybrid_ssm_cache
++            and req.extend_input_len > _rem_tokens
++        ):
++            # A resumed middle chunk must end on a KV/SSM boundary too.
++            # Otherwise its unaligned tail becomes the next chunk's prefix,
++            # and prepare_for_extend tracks an unaligned Mamba checkpoint.
++            alignment = math.lcm(
++                self.page_size, get_global_server_args().mamba_cache_chunk_size
++            )
++            _rem_tokens = _rem_tokens // alignment * alignment
++            if _rem_tokens <= 0:
++                return req  # Keep ownership; no chunk was admitted this pass.
++
+         truncated = req.extend_input_len > _rem_tokens
+         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
+         req.fill_len = len(req.prefix_indices) + req.extend_input_len
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -2898,8 +2898,13 @@
+             assert self.chunked_req is None
+             self.chunked_req = adder.new_chunked_req
+ 
+-        if self.chunked_req is not None:
+-            self.chunked_req.inflight_middle_chunks += 1
++        # A capacity-parked chunk is not part of this forward. Do not count
++        # another request's batch as its in-flight chunk (including on abort).
++        batch_chunked_req = (
++            self.chunked_req if self.chunked_req in can_run_set else None
++        )
++        if batch_chunked_req is not None:
++            batch_chunked_req.inflight_middle_chunks += 1
+ 
+         set_time_batch(can_run_list, "set_forward_entry_time")
+ 
+@@ -2912,11 +2917,11 @@
+             self.model_config,
+             self.enable_overlap,
+             self.spec_algorithm,
+-            chunked_req=self.chunked_req,
++            chunked_req=batch_chunked_req,
+         )
+ 
+         new_batch.contains_last_prefill_chunk = (
+-            self.chunked_req is None or len(can_run_list) != 1
++            batch_chunked_req is None or len(can_run_list) != 1
+         )
+ 
+         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+@@ -2935,8 +2940,8 @@
+             self.enable_priority_scheduling,
+             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
+                 chunk_deduct=(
+-                    self.chunked_req.extend_input_len
+-                    if self.chunked_req is not None
++                    batch_chunked_req.extend_input_len
++                    if batch_chunked_req is not None
+                     else 0
+                 ),
+             ),
