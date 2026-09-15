@@ -16,10 +16,16 @@ export PYTHONPATH="${PD_DIR}:$(cd -- "${PD_DIR}/../.." && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
 export PD_DATA_ROOT=/tmp/pd-data
 export PD_INFERENCE_RETURN_LOGPROB=false SLIME_HTTP_READ_TIMEOUT_SECONDS=86400
+export PD_MODEL_HTTP_TRANSPORT="${PD_MODEL_HTTP_TRANSPORT:-aiohttp}"
 export MODEL_PATH=/homes/siqic/Qwen3.5-9B
 export WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-${PD_DIR}/configs/experiments/swe_bench_verified_miles_pr51_8k_t64.yaml}"
 export MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-qwen3}"
 export MAX_INFLIGHT="${MAX_INFLIGHT:-128}"
+export PD_COLOCATED_GPU_IDS="${PD_COLOCATED_GPU_IDS:-0,1,2,3,4,5,6,7}"
+# Optional override; unset preserves the baseline engine's native default.
+export PD_COLOCATED_MAMBA_RATIO="${PD_COLOCATED_MAMBA_RATIO:-}"
+[[ "${PD_COLOCATED_GPU_IDS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo 'Invalid GPU list' >&2; exit 2; }
+IFS=, read -r -a gpu_ids <<< "${PD_COLOCATED_GPU_IDS}"
 [[ "${MAX_INFLIGHT}" =~ ^[1-9][0-9]*$ ]] || { echo 'MAX_INFLIGHT must be a positive integer' >&2; exit 2; }
 export RUN_DIR="${RUN_DIR:-/tmp/pd-persist/baseline-qwen35-9b-tp1-swe-verified500-colocated-c${MAX_INFLIGHT}-$(date -u +%Y%m%dT%H%M%S)}"
 export RESULTS_DIR="${RESULTS_DIR:-${PD_DIR}/runs-host/baseline/$(basename -- "${RUN_DIR}")}"
@@ -69,13 +75,19 @@ for r in rows:
     if tag.removeprefix('docker.io/') not in images:
         missing.append(tag)
 assert not missing, f'Missing images: {missing[:8]}'
+gpu_ids = [int(value) for value in os.environ['PD_COLOCATED_GPU_IDS'].split(',')]
+assert len(gpu_ids) == len(set(gpu_ids)) and len(gpu_ids) <= 8, 'Expected 1-8 distinct GPUs'
+ratio = os.environ.get('PD_COLOCATED_MAMBA_RATIO')
+if ratio:
+    assert 0 < float(ratio) <= 1, 'Invalid Mamba ratio'
 record = dict(host=os.uname().nodename, dataset=str(dataset), tasks=len(ids),
               dataset_sha256=hashlib.sha256(dataset.read_bytes()).hexdigest(),
               local_images_present=len(ids), mode='native_colocated',
-              model=os.environ['MODEL_PATH'], tp=1, gpu_ids=list(range(8)),
+              model=os.environ['MODEL_PATH'], tp=1, gpu_ids=gpu_ids,
+              mamba_full_memory_ratio=float(ratio) if ratio else 'engine_default',
               max_inflight=int(os.environ['MAX_INFLIGHT']), mem_fraction_static=0.8, pd=False, hicache=False,
               mooncake=False, warmup_requests=0, full_dataset_evaluation=True,
-              gpu7_shared_with_existing_user_process=True)
+              gpu7_shared_with_existing_user_process=7 in gpu_ids)
 (root/'preflight.json').write_text(json.dumps(record, indent=2)+'\n')
 print(json.dumps(record, indent=2))
 PY
@@ -84,7 +96,7 @@ mkdir -p "${RUN_DIR}/source-snapshot"
 while IFS= read -r source_file; do
   cp --parents "${source_file}" "${RUN_DIR}/source-snapshot/"
 done < <(rg --files -g '*.py' data)
-cp inference.py agentic_kv_request.py pd_metrics.py "${RUN_DIR}/source-snapshot/"
+cp inference.py model_http_transport.py agentic_kv_request.py pd_metrics.py "${RUN_DIR}/source-snapshot/"
 cp --parents scripts/common/runtime.sh scripts/new_method/internal/inference_checkpointed.py \
   scripts/new_method/internal/analyze_mamba_swe_run.py scripts/tools/analyze_swe_bench_run.py \
   "${RUN_DIR}/source-snapshot/"
@@ -95,9 +107,14 @@ export WORKLOAD_CONFIG="${RUN_DIR}/workload.yaml"
 nvidia-smi --query-compute-apps=pid,gpu_uuid,used_gpu_memory --format=csv >"${RUN_DIR}/gpu-processes-before.csv"
 "${PD_ENV_BIN}/python" -m pip freeze >"${RUN_DIR}/packages.txt"
 
-ports=(33600 33601 33602 33603 33604 33605 33606 33607)
+ports=()
+for index in "${!gpu_ids[@]}"; do ports+=("$((33600 + index))"); done
+mamba_args=()
+if [[ -n "${PD_COLOCATED_MAMBA_RATIO}" ]]; then
+  mamba_args+=(--mamba-full-memory-ratio "${PD_COLOCATED_MAMBA_RATIO}")
+fi
 for index in "${!ports[@]}"; do
-  pd_check_gpu_idle "${index}"
+  pd_check_gpu_idle "${gpu_ids[index]}"
   pd_check_port_free "${ports[index]}"
 done
 pd_check_port_free 33610
@@ -108,10 +125,11 @@ for index in "${!ports[@]}"; do
   mkdir -p "${RUN_DIR}/raw-${index}"
   # Level3 JSON logging retains the raw pre-parser output without truncation.
   # Explicit input_ids remain authoritative; logging does not re-tokenize them.
-  setsid env CUDA_VISIBLE_DEVICES="${index}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
+  setsid env CUDA_VISIBLE_DEVICES="${gpu_ids[index]}" SGLANG_ENABLE_METRICS_DEVICE_TIMER=true \
     "${PD_ENV_BIN}/python" -m sglang.launch_server \
     --model-path "${MODEL_PATH}" --host 127.0.0.1 --port "${ports[index]}" \
     --tp-size 1 --context-length 131072 --page-size 64 --mamba-track-interval 64 \
+    "${mamba_args[@]}" \
     --mem-fraction-static 0.80 --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
     --enable-deterministic-inference --attention-backend triton --random-seed 2026 \
     --reasoning-parser "${MODEL_REASONING_PARSER}" --tool-call-parser qwen3_coder \

@@ -1069,11 +1069,18 @@ async def run_closed_loop(
 
 
 async def async_main(cli: argparse.Namespace) -> None:
+    from model_http_transport import http_client_scope
+
+    async with http_client_scope():
+        await _async_main(cli)
+
+
+async def _async_main(cli: argparse.Namespace) -> None:
     from data.config import legacy_workload, load_workload
     from data.dispatch import select_samples
     from data.loading import load_samples
     from slime.rollout.sglang_rollout import GenerateState
-    from slime.utils.http_utils import init_http_client
+    from model_http_transport import init_http_client, transport_config
     from slime.utils.types import Sample
 
     cli.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1145,6 +1152,7 @@ async def async_main(cli: argparse.Namespace) -> None:
         raise RuntimeError(f"requested {cli.warmup_requests + cli.requests} samples, got {len(samples)}")
 
     config = vars(cli) | {"output_dir": str(cli.output_dir)}
+    config["model_http_transport"] = transport_config(args)
     config["workload_config"] = str(cli.workload_config) if cli.workload_config else None
     config["schedule_file"] = str(cli.schedule_file) if cli.schedule_file else None
     # Persist the effective serving/data-plane settings next to every result.
