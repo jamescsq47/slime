@@ -672,6 +672,64 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(router._prefill_arena_bytes(), [1 + 3 + 5 + 7, 2 + 4 + 6 + 8])
 
+    def test_multinode_single_p_assigns_only_ready_requested_remote_host(self):
+        router = self.make_router(Path("/dev/shm/test-ready"))
+        router.prefill_urls = ["http://p0"]
+        router._multinode_static_recovery = True
+        router._multinode_recovery_parents = {"ready": 1, "writing": 1, "evicted": 1, "assigned": 1}
+        entries = {
+            key: {"source_host_node": "node-d", "state": state.value}
+            for key, state in (("ready", HostStageState.HOST_READY),
+                               ("tool_wait", HostStageState.HOST_READY),
+                               ("writing", HostStageState.HOST_WRITING),
+                               ("evicted", HostStageState.RECOMPUTE_REQUIRED),
+                               ("assigned", HostStageState.HOST_READY))
+        }
+        entries["assigned"]["recovery_domain"] = 0
+        assignments = []
+        router._d2p_host_ledger = types.SimpleNamespace(
+            snapshot_entries=lambda: entries,
+            assign_d2p_recovery_domain=lambda sid, domain: assignments.append((sid, domain)),
+        )
+        router._prefill_arena_bytes()
+        self.assertEqual(assignments, [("ready", 0)])
+        assignments.clear()
+        router._multinode_static_recovery = False
+        router._prefill_arena_bytes()
+        self.assertEqual(assignments, [])
+
+    def test_multinode_source_host_router_assignment_allows_foreign_tp_pin(self):
+        for tp in (1, 8):
+            with self.subTest(tp=tp), tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+                router = self.make_router(Path(directory) / "ready")
+                router.prefill_urls = ["http://p0"]
+                router._multinode_static_recovery = True
+                router._multinode_recovery_parents = {"source:g0": 1}
+                ledger = SharedHostStagingLedger(str(Path(directory) / "host.json"))
+                router._d2p_host_ledger = ledger
+
+                def seed(entries):
+                    entries["source:g0"] = {
+                        "snapshot_id": "source:g0", "state": HostStageState.HOST_READY.value,
+                        "p_owner": "d-host:decode-0", "tp_size": tp,
+                        "source_host_node": "node-d", "arena_domain": 0,
+                    }
+                    return True, True
+
+                ledger._mutate(seed, event_snapshot_id="source:g0")
+                kwargs = dict(tp_rank=0, tp_size=tp, claim_id="restore0", recovery_domain=0)
+                self.assertFalse(ledger.claim_d2p_recovery_rank("source:g0", "prefill-0", **kwargs))
+                router._prefill_arena_bytes()
+                self.assertEqual(ledger.get("source:g0")["recovery_domain"], 0)
+                for rank in range(tp):
+                    kwargs["tp_rank"] = rank
+                    self.assertTrue(ledger.claim_d2p_recovery_rank("source:g0", "prefill-0", **kwargs))
+                entry = ledger.get("source:g0")
+                self.assertEqual(entry["p_owner"], "d-host:decode-0")
+                self.assertEqual(entry["recovery_owner"], "prefill-0")
+                self.assertEqual(entry["remote_read_epoch"], 1)
+                self.assertEqual(len(entry["recovery_claims"]), tp)
+
     async def test_p2d_pressure_counts_offered_and_durable_owner_once(self):
         router = self.make_router(Path("/dev/shm/test-ready"))
         room = 73

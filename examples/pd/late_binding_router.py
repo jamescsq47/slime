@@ -411,6 +411,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         self._d2p_host_ledger = (
             SharedHostStagingLedger(staging_path) if staging_path else None
         )
+        self._multinode_static_recovery = _env_bool(
+            "SGLANG_AGENTIC_MULTINODE_ENABLED", False
+        )
+        if self._multinode_static_recovery and len(self.prefill_urls) != 1:
+            raise ValueError("multi-node V1 requires exactly one logical Prefill group")
+        self._multinode_recovery_parents: dict[str, int] = {}
         self._slow_congestion = None
         if os.getenv("SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE", "0").lower() in {"1", "true"}:
             from sglang.srt.disaggregation.agentic_slow_congestion import SlowRecoveryCongestion
@@ -818,6 +824,18 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         if _HOST_STAGE_EVICTING is not None:
             live_states.add(_HOST_STAGE_EVICTING.value)
         for snapshot_id, entry in ledger.snapshot_entries().items():
+            # Source-local D Host storage has a different physical owner from
+            # the only P group. Commit its recovery destination through the
+            # normal ledger CAS before P can import/pin it. Reuse this existing
+            # background scan; never wait for Host readiness in HTTP dispatch.
+            if (
+                getattr(self, "_multinode_static_recovery", False)
+                and snapshot_id in getattr(self, "_multinode_recovery_parents", {})
+                and entry.get("source_host_node")
+                and entry.get("recovery_domain") is None
+                and entry.get("state") == HostStageState.HOST_READY.value
+            ):
+                ledger.assign_d2p_recovery_domain(snapshot_id, 0)
             # Same existing ledger read/iteration, unique generation IDs;
             # never sum per-P caches or scan arrival marker directories.
             if recovery_parents is not None and snapshot_id in recovery_parents:
@@ -999,7 +1017,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     def _ensure_prefill_pressure_monitor(self) -> None:
         if not getattr(self, "dynamic_prefill_domains", False) and getattr(
             self, "_slow_congestion", None
-        ) is None:
+        ) is None and not getattr(self, "_multinode_static_recovery", False):
             return
         if not hasattr(self, "_prefill_pressure_interval"):
             self._prefill_pressure_interval = 0.20
@@ -4345,10 +4363,13 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             metadata = None
         policy = getattr(self, "_slow_congestion", None)
         parent_id = metadata.parent.snapshot_id if metadata is not None and metadata.parent is not None else None
-        if policy is not None:
+        if policy is not None or getattr(self, "_multinode_static_recovery", False):
             self._ensure_prefill_pressure_monitor()
         if policy is not None and parent_id is not None:
             policy.enter(parent_id)
+        remote_parents = getattr(self, "_multinode_recovery_parents", None)
+        if getattr(self, "_multinode_static_recovery", False) and parent_id is not None:
+            remote_parents[parent_id] = remote_parents.get(parent_id, 0) + 1
         try:
             dispatch = (
                 self._prebound_dispatch_with_metadata
@@ -4359,6 +4380,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 session, modified_request, prefill_server, endpoint, headers, metadata
             )
         finally:
+            if getattr(self, "_multinode_static_recovery", False) and parent_id is not None:
+                remaining = remote_parents[parent_id] - 1
+                if remaining:
+                    remote_parents[parent_id] = remaining
+                else:
+                    remote_parents.pop(parent_id, None)
             if policy is not None and parent_id is not None:
                 policy.leave(parent_id)
 
