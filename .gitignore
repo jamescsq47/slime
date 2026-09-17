@@ -217,3 +217,7 @@ req_timeline.png
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# DualPD remote evaluation outputs; keep its reproducible experiment config.
+/runs/dualpd/
+!/tools/dualpd/minimax_swe.json

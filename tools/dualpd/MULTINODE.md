@@ -9,8 +9,10 @@
 
 - 一台机器一个逻辑 P 或 D TP 组；TP=1/2/4/8，整组 GPU 必须同节点。
 - V1 一个逻辑 P TP 组，可有一个或多个逻辑 D TP 组。暂不接受多个 P 组，避免沿用
-  单节点 NUMA 分区逻辑错误地约束异节点路由。模型先限制 dense Qwen3；不允许
-  Mamba、MLA、MoE、DP attention、TP组跨主机等未经此版本验证的配置。
+  单节点 NUMA 分区逻辑错误地约束异节点路由。模型支持 dense Qwen3，以及显式
+  `model_family=minimax_m2` 的 MiniMax-M2.7 普通 GQA MoE（专家 EP=TP，组内通信）；
+  不允许 Mamba、MLA、其他未经适配的 MoE、DP attention、TP组跨主机。
+  MiniMax 的配置、CPU检查与远端 colocated SWE500 入口见 `MINIMAX_M27.md`；尚未GPU验收。
 - P、D 的 TP 一致，各 rank 必须采用相同的模型/revision/dtype/page layout。
 - 所有 engine ID 和 node ID 全局唯一。TP 决策和所有 shard 的 fence/ownership
   必须组级一致；不得把 TP rank 的 HBM 指针直接当作另一 rank 的地址。

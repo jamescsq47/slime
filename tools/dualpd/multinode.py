@@ -42,6 +42,8 @@ def absolute(value, field):
 
 def load_config(path):
     cfg = json.loads(Path(path).read_text())
+    if cfg.get("model_family", "qwen3") not in {"qwen3", "minimax_m2"}:
+        raise ValueError("multi-node supports ordinary Qwen3 or MiniMax M2 GQA only")
     for key in ("run_id",):
         if not NAME.fullmatch(cfg.get(key, "")):
             raise ValueError("invalid " + key)
@@ -210,6 +212,10 @@ def worker_plan(cfg, n):
     if n["role"] == "prefill":
         command += ["--chunked-prefill-size", str(cfg["chunked_prefill_size"]),
                     "--max-prefill-tokens", str(cfg["max_prefill_tokens"])]
+    if cfg.get("model_family") == "minimax_m2":
+        command += ["--trust-remote-code", "--reasoning-parser", "minimax-append-think",
+                    "--tool-call-parser", "minimax-m2", "--kv-cache-dtype", "bfloat16",
+                    "--ep-size", str(cfg["tp_size"])]
     if n.get("numa_nodes"):
         command += ["--numa-node"] + list(map(str, n["numa_nodes"]))
     if n.get("ib_device"):
@@ -447,11 +453,36 @@ def start_component(cfg, p, *, is_worker=False):
     check_listen_ports(cfg, p, is_worker)
     if is_worker:
         model = json.loads((Path(cfg["model_path"]) / "config.json").read_text())
-        if model.get("model_type") != "qwen3":
-            raise ValueError("multi-node V1 launcher supports dense Qwen3 only; Mamba/MLA/MoE are not validated")
+        validate_launch_model(cfg, model)
     save_launch(cfg, p)
     print("Starting {} on {}; log={}".format(p["engine_id"], p["node_id"], Path(p["local_run_dir"]) / "service.log"), flush=True)
     return supervise(p["command"], env, p["local_run_dir"], process_identity(cfg, p["engine_id"]))
+
+
+def validate_launch_model(cfg, model):
+    """Only ordinary GQA layouts: MoE weights do not add recurrent KV state."""
+    family = cfg.get("model_family", "qwen3")
+    if model.get("model_type") != family:
+        raise ValueError("model config disagrees with explicit model_family")
+    if family == "qwen3":
+        return
+    if family != "minimax_m2" or model.get("architectures") != ["MiniMaxM2ForCausalLM"]:
+        raise ValueError("unsupported model architecture")
+    layers = model.get("num_hidden_layers")
+    if type(layers) is not int or layers <= 0 or model.get("attn_type_list") != [1] * layers:
+        raise ValueError("MiniMax adapter requires full Attention in every layer")
+    tp = cfg["tp_size"]
+    for field in ("num_attention_heads", "num_key_value_heads", "num_local_experts"):
+        value = model.get(field)
+        if type(value) is not int or value <= 0 or value % tp:
+            raise ValueError("MiniMax {} must partition evenly across TP".format(field))
+    if model.get("quantization_config", {}).get("quant_method") != "fp8":
+        raise ValueError("MiniMax-M2.7 entry point expects the official FP8 checkpoint")
+    block = model["quantization_config"].get("weight_block_size")
+    # EP=TP: each rank holds whole experts, so MoE TP=1, not 1536/8=192.
+    if block != [128, 128] or any(type(model.get(k)) is not int or model[k] <= 0
+                                or model[k] % 128 for k in ("intermediate_size", "hidden_size")):
+        raise ValueError("MiniMax FP8 expert dimensions must align to 128x128 blocks")
 
 
 def start_worker(cfg, n):
