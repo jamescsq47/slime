@@ -28,14 +28,30 @@ DEFAULT_CONFIG = Path(__file__).with_name("minimax_swe.json")
 
 def read_config(path):
     cfg = json.loads(Path(path).read_text())
-    if (cfg["tp_size"], cfg["ep_size"], cfg["mem_fraction_static"], cfg["max_inflight"]) != (8, 8, 0.8, 64):
-        raise ValueError("this acceptance configuration is TP8/EP8, memory .8, c64")
+    if tuple(cfg.get(k) for k in ("temperature", "top_p", "top_k")) != (0.6, 0.95, 20):
+        raise ValueError("SWE-bench requires temperature=0.6, top_p=0.95, top_k=20")
+    family = cfg.get("model_family", "minimax_m2")
+    if family not in ("minimax_m2", "qwen35_moe"):
+        raise ValueError("unsupported colocated model family")
+    ep = 1 if family == "qwen35_moe" else 8
+    if (cfg["tp_size"], cfg["ep_size"], cfg["mem_fraction_static"], cfg["max_inflight"]) != (8, ep, 0.8, 64):
+        raise ValueError(f"this acceptance configuration is TP8/EP{ep}, memory .8, c64")
     if len(cfg["gpus"]) != 8 or len(set(cfg["gpus"])) != 8 or any(type(g) is not int or g < 0 for g in cfg["gpus"]):
         raise ValueError("exactly eight distinct physical GPUs required")
     if cfg["requests"] != 500:
         raise ValueError("full Verified evaluation requires 500 unique instances")
     if not 1024 <= cfg["port"] <= 65535:
         raise ValueError("invalid port")
+    if family == "qwen35_moe":
+        # Match the actual 27B c64 experiment, not historical prose defaults.
+        aligned = {"context_length": 131072, "page_size": 64,
+                   "chunked_prefill_size": 8192, "max_prefill_tokens": 8192,
+                   "max_response_length": 81920, "mamba_full_memory_ratio": 0.9,
+                   "seed": 2026, "log_requests": True}
+        if any(cfg.get(k) != v for k, v in aligned.items()):
+            raise ValueError("Qwen SWE settings differ from the aligned 27B experiment")
+        if sha(ROOT / cfg["workload_config"]) != cfg.get("workload_sha256"):
+            raise ValueError("Qwen SWE workload differs from the pinned 27B snapshot")
     return cfg
 
 
@@ -44,7 +60,8 @@ def environment(run, data_root, cfg):
     # library configuration, but never inherit another source overlay.
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("SGLANG_", "PD_")) and k not in {"PYTHONPATH", "HOST_IP"}}
-    env.update(PYTHONPATH=f"{ENGINE / 'python'}:{PD}:{ROOT}",
+    env.update(PATH=str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", ""),
+               PYTHONPATH=f"{ENGINE / 'python'}:{PD}:{ROOT}",
                PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES=",".join(map(str, cfg["gpus"])),
                SGLANG_ENABLE_METRICS_DEVICE_TIMER="true",
                PD_DATA_ROOT=str(data_root), PD_INFERENCE_RETURN_LOGPROB="false",
@@ -55,15 +72,26 @@ def environment(run, data_root, cfg):
 
 def commands(cfg, model, run, workload):
     py, port = sys.executable, str(cfg["port"])
+    qwen = cfg.get("model_family") == "qwen35_moe"
     server = [py, "-m", "sglang.launch_server", "--model-path", str(model),
               "--trust-remote-code", "--host", "127.0.0.1", "--port", port,
-              "--tp-size", "8", "--ep-size", "8", "--mem-fraction-static", "0.8",
+              "--tp-size", "8", "--ep-size", str(cfg["ep_size"]), "--mem-fraction-static", "0.8",
               "--dtype", "bfloat16", "--kv-cache-dtype", "bfloat16",
               "--context-length", str(cfg["context_length"]), "--page-size", str(cfg["page_size"]),
               "--chunked-prefill-size", str(cfg["chunked_prefill_size"]),
               "--max-prefill-tokens", str(cfg["max_prefill_tokens"]),
-              "--reasoning-parser", "minimax-append-think", "--tool-call-parser", "minimax-m2",
+              "--reasoning-parser", "glm45" if qwen else "minimax-append-think",
+              "--tool-call-parser", "qwen3_coder" if qwen else "minimax-m2",
               "--random-seed", str(cfg["seed"]), "--enable-metrics", "--skip-server-warmup"]
+    if qwen:
+        server += ["--attention-backend", "triton", "--linear-attn-backend", "triton",
+                   "--moe-runner-backend", "triton", "--sampling-backend", "flashinfer",
+                   "--mamba-scheduler-strategy", "extra_buffer", "--mamba-track-interval", "64",
+                   "--mamba-full-memory-ratio", str(cfg["mamba_full_memory_ratio"])]
+    if cfg.get("log_requests", False):
+        server += ["--log-requests", "--log-requests-level", "3",
+                   "--log-requests-format", "json", "--log-requests-target", str(run / "raw"),
+                   "--uvicorn-access-log-exclude-prefixes", "/get_load", "/metrics", "/health"]
     infer = [py, str(PD / "scripts/new_method/internal/inference_checkpointed.py"),
              "--model", str(model), "--workload-config", str(workload),
              "--router-port", port, "--prefill-port", port, "--decode-port", port,
@@ -73,7 +101,8 @@ def commands(cfg, model, run, workload):
              "--metrics-interval", "2", "--seed", str(cfg["seed"]),
              "--temperature", str(cfg["temperature"]), "--top-p", str(cfg["top_p"]),
              "--top-k", str(cfg["top_k"]), "--max-context-length", str(cfg["context_length"]),
-             "--max-response-length", "524288", "--output-dir", str(run)]
+             "--max-response-length", str(cfg.get("max_response_length", 524288)),
+             "--output-dir", str(run)]
     return {"model": server, "inference": infer}
 
 
@@ -82,21 +111,38 @@ def sha(path):
 
 
 def check_model(cfg, model, *, weights=False):
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        if not (model / name).is_file():
+            raise ValueError("model metadata download incomplete: " + name)
     raw = json.loads((model / "config.json").read_text())
-    validate_launch_model({"model_family": "minimax_m2", "tp_size": 8}, raw)
-    if cfg["context_length"] > raw["max_position_embeddings"]:
+    qwen = cfg.get("model_family") == "qwen35_moe"
+    if qwen:
+        from qwen35_swe import validate_model
+        validate_model(raw)
+    else:
+        validate_launch_model({"model_family": "minimax_m2", "tp_size": 8}, raw)
+    text_cfg = raw.get("text_config", raw)
+    if cfg["context_length"] > text_cfg["max_position_embeddings"]:
         raise ValueError("context exceeds model configuration")
     # Model code is native SGLang; only pinned HF configuration code is trusted.
-    from sglang.srt.utils.hf_transformers_utils import get_config, get_tokenizer, get_rope_config
+    from sglang.srt.utils.hf_transformers_utils import get_config, get_tokenizer, get_rope_config, get_hf_text_config
     from sglang.srt.parser.reasoning_parser import ReasoningParser
     model_cfg = get_config(str(model), trust_remote_code=True)
-    rope = get_rope_config(model_cfg)
+    rope = get_rope_config(get_hf_text_config(model_cfg))
+    if qwen:
+        text = get_hf_text_config(model_cfg)
+        if type(text).__name__ != "Qwen3_5MoeTextConfig" or not text.norm_topk_prob:
+            raise ValueError("native Qwen3.5 MoE config lost its typed defaults")
+        if len(text.linear_layer_ids) != 36 or model_cfg.vision_config.depth != 27:
+            raise ValueError("native Qwen3.5 hybrid/vision layout mismatch")
     tok = get_tokenizer(str(model), trust_remote_code=True)
-    ReasoningParser(model_type="minimax-append-think", stream_reasoning=False)
+    ReasoningParser(model_type="glm45" if qwen else "minimax-append-think", stream_reasoning=False)
     messages = [{"role": "user", "content": "Return one fenced bash command: echo hello"}]
     rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if not tok.encode(rendered, add_special_tokens=False):
+        raise ValueError("tokenizer produced an empty prompt; checkpoint is incomplete")
     if not rendered.rstrip().endswith("<think>"):
-        raise ValueError("MiniMax thinking opener changed; audit reasoning parser before running")
+        raise ValueError("thinking opener changed; audit reasoning parser before running")
     # Check actual unchanged harness rendering and three-turn history on CPU.
     from data.swe_bench_openenv.harness import _render_prompt
     histories = [messages, messages + [
@@ -110,6 +156,18 @@ def check_model(cfg, model, *, weights=False):
                               add_special_tokens=False)
         if ids != expected:
             raise ValueError("harness/tokenizer prompt mismatch")
+        lengths.append(len(ids))
+    if qwen:
+        from data.swe_bench_openenv.harness import _SHELL_TOOL, _TOOL_SYSTEM_PROMPT
+        structured = [{"role": "system", "content": _TOOL_SYSTEM_PROMPT},
+                      {"role": "user", "content": "Inspect the repository."},
+                      {"role": "assistant", "content": None, "reasoning_content": "Inspect it.",
+                       "tool_calls": [{"id": "check1", "type": "function", "function": {
+                           "name": "shell", "arguments": '{"command":"pwd"}'}}]},
+                      {"role": "tool", "tool_call_id": "check1", "name": "shell", "content": "/testbed"}]
+        ids = _render_prompt(tok, structured, enable_thinking=True, tools=[_SHELL_TOOL])
+        if not ids or not tok.decode(ids).rstrip().endswith("<think>"):
+            raise ValueError("structured tool history failed tokenizer preflight")
         lengths.append(len(ids))
     if weights:
         index = json.loads((model / "model.safetensors.index.json").read_text())
@@ -134,7 +192,7 @@ def download(cfg, model):
     # No model Python implementation needed: use native SGLang, but AutoConfig
     # needs the official configuration module. Keep its revision immutable.
     files = {f.rfilename: f.size for f in info.siblings if f.rfilename.endswith(
-        (".safetensors", ".json", ".jinja")) or f.rfilename == "configuration_minimax_m2.py"}
+        (".safetensors", ".json", ".jinja")) or f.rfilename in ("configuration_minimax_m2.py", "merges.txt")}
     snapshot_download(cfg["model_repo"], revision=cfg["model_revision"], local_dir=str(model),
                       allow_patterns=list(files), max_workers=4)
     for name, size in files.items():
@@ -175,6 +233,9 @@ def preflight(cfg, model, data_root, run):
     if len(rows) != 500 or len({r["instance_id"] for r in rows}) != 500:
         raise ValueError("expected full Verified 500, not a repeated subset")
     result.update(dataset_sha256=sha(dataset), instance_ids=[r["instance_id"] for r in rows])
+    if cfg.get("dataset_sha256") and result["dataset_sha256"] != cfg["dataset_sha256"]:
+        raise ValueError("SWE dataset or source order differs from the reference experiment")
+    result["workload_sha256"] = sha(ROOT / cfg["workload_config"])
     listing = subprocess.check_output(["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
                                      text=True, timeout=60).splitlines()
     images = set(listing)
@@ -185,8 +246,11 @@ def preflight(cfg, model, data_root, run):
     for gpu in cfg["gpus"]:
         owners = subprocess.check_output(["nvidia-smi", "-i", str(gpu), "--query-compute-apps=pid",
                                           "--format=csv,noheader,nounits"], text=True, timeout=15).strip()
-        if owners:
-            raise RuntimeError(f"GPU {gpu} already has compute processes; refusing overlap: {owners}")
+        permitted = set(cfg.get("allow_gpu_pids", {}).get(str(gpu), []))
+        actual = {int(pid) for pid in owners.splitlines() if pid.strip()}
+        if actual - permitted:
+            raise RuntimeError(f"GPU {gpu} has unapproved compute processes: {actual - permitted}")
+        result.setdefault("shared_gpu_processes", {})[str(gpu)] = sorted(actual)
     result["gpus"] = subprocess.check_output(["nvidia-smi", "--query-gpu=index,name,memory.total",
                     "--format=csv"], text=True, timeout=15)
     with socket.socket() as probe:
@@ -228,6 +292,8 @@ def run_evaluation(cfg, model, data_root, run):
     # Preflight runs in this interpreter with the same source paths as workers.
     result = preflight(cfg, model, data_root, run)
     run.mkdir(parents=True, exist_ok=False)
+    if cfg.get("log_requests", False):
+        (run / "raw").mkdir()
     workload = run / "workload.yaml"
     workload.write_bytes((ROOT / cfg["workload_config"]).read_bytes())
     (run / "dataset.jsonl").write_bytes((data_root / "swe-bench-verified/test.jsonl").read_bytes())
@@ -237,7 +303,7 @@ def run_evaluation(cfg, model, data_root, run):
     staged_data.mkdir(parents=True)
     (staged_data / "test.jsonl").hardlink_to(run / "dataset.jsonl")
     env["PD_DATA_ROOT"] = str(run / "data")
-    env["PD_SWE_RUN_ID"] = "dualpd-minimax-" + uuid.uuid4().hex
+    env["PD_SWE_RUN_ID"] = "dualpd-swe-" + uuid.uuid4().hex
     plan = {"config": cfg, "commands": commands(cfg, model, run, workload), "env": env,
             "identity": uuid.uuid4().hex, "preflight": result}
     # Do not persist the whole inherited environment: it can contain secrets.
@@ -248,6 +314,12 @@ def run_evaluation(cfg, model, data_root, run):
     for root, name in ((ROOT, "slime"), (ENGINE, "sglang")):
         result[name + "_commit"] = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
         (run / (name + ".diff")).write_bytes(subprocess.check_output(["git", "-C", str(root), "diff", "HEAD"]))
+    # New/untracked entry points are not included by git diff.
+    source = run / "runner-source"
+    source.mkdir()
+    for path in Path(__file__).parent.iterdir():
+        if path.suffix in {".py", ".json", ".sh"} and path.is_file():
+            (source / path.name).write_bytes(path.read_bytes())
     atomic_record(run / "preflight.json", result)
     children = {}
     old_handlers = {}
@@ -276,6 +348,19 @@ def run_evaluation(cfg, model, data_root, run):
                 if time.monotonic() > deadline:
                     raise TimeoutError("model readiness timeout")
                 time.sleep(2)
+        # Exercise actual TP kernels and the same HTTP/parser path as SWE before
+        # creating 64 Docker episodes. This is not a measured dataset sample.
+        payload = json.dumps({"model": str(model), "messages": [
+            {"role": "user", "content": "Reply with one word: OK"}],
+            "max_tokens": 32, "temperature": cfg["temperature"],
+            "top_p": cfg["top_p"], "top_k": cfg["top_k"]}).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
+                    data=payload, headers={"Content-Type": "application/json"})
+        with opener.open(request, timeout=600) as response:
+            smoke = json.load(response)
+        if not smoke.get("choices") or smoke.get("usage", {}).get("completion_tokens", 0) < 1:
+            raise RuntimeError("model generation smoke failed")
+        atomic_record(run / "generation_smoke.json", smoke)
         inference = start("inference")
         while inference.poll() is None:
             if server.poll() is not None:
@@ -297,18 +382,25 @@ def run_evaluation(cfg, model, data_root, run):
                 signal.signal(sig, handler)
 
 
-def main():
+def main(*, default_config=DEFAULT_CONFIG, default_model="MiniMax-M2.7", run_prefix="minimax-m27"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["plan", "download", "prepare-data", "check-model", "preflight", "run", "_component"])
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--model", type=Path, default=ROOT / "downloads/MiniMax-M2.7")
+    parser.add_argument("--config", type=Path, default=default_config)
+    parser.add_argument("--model", type=Path, default=ROOT / "downloads" / default_model)
     parser.add_argument("--data-root", type=Path, default=ROOT / "downloads/pd-data")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--component", choices=["model", "inference"])
+    parser.add_argument("--allow-gpu-process", action="append", default=[], metavar="GPU:PID",
+                        help="Explicitly allow sharing with this existing process; never terminates it")
     args = parser.parse_args()
     cfg = read_config(args.config)
+    for entry in args.allow_gpu_process:
+        gpu, pid = map(int, entry.split(":"))
+        if gpu not in cfg["gpus"] or pid <= 0:
+            raise ValueError("invalid approved GPU process")
+        cfg.setdefault("allow_gpu_pids", {}).setdefault(str(gpu), []).append(pid)
     model, data_root = args.model.resolve(), args.data_root.resolve()
-    run = args.run_dir.resolve() if args.run_dir else ROOT / "runs/dualpd" / ("minimax-m27-swe-tp8-c64-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6])
+    run = args.run_dir.resolve() if args.run_dir else ROOT / "runs/dualpd" / (run_prefix + "-swe-tp8-c64-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6])
     if args.action == "_component":
         plan = json.loads((run / "plan.json").read_text())
         env = environment(run, data_root, plan["config"])

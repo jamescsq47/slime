@@ -80,7 +80,8 @@ class MiniMaxTests(unittest.TestCase):
 
     def test_acceptance_settings_cannot_silently_drift(self):
         cfg = m.read_config(m.DEFAULT_CONFIG)
-        for key, value in [('max_inflight', 128), ('mem_fraction_static', .85), ('ep_size', 1)]:
+        for key, value in [('max_inflight', 128), ('mem_fraction_static', .85), ('ep_size', 1),
+                           ('temperature', 0), ('top_p', 1), ('top_k', -1)]:
             changed = copy.deepcopy(cfg)
             changed[key] = value
             with tempfile.TemporaryDirectory() as tmp:

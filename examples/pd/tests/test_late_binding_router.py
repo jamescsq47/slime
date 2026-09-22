@@ -2379,6 +2379,92 @@ class LateBindingRouterTest(unittest.IsolatedAsyncioTestCase):
             prefill_response, _ = await asyncio.wait_for(task, timeout=1)
             self.assertIsNone(prefill_response)
 
+    async def test_decode_failure_aborts_both_engines_without_waiting_for_prefill(self):
+        for failure in ("disconnect", "http_error"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                router = self.make_router(Path(directory))
+                router.numa_domains = False
+                router.early_claim_store = None
+                router.max_prefill_inflight = 4
+                router._prefill_admission = _PrefillAdmissionGate(4)
+                router._wait_until_prefill_accepted = AsyncMock()
+                router._wait_until_prefill_scheduled = AsyncMock()
+                router._wait_until_prefill_ready = AsyncMock(return_value=1024)
+                router._p_ready_sequence = lambda rooms: 1
+                router._select_and_reserve_decode = AsyncMock(
+                    return_value=DecodeReservation(
+                        reservation_id="failed-destination", url="http://d0",
+                        prompt_tokens=1024, admission_tokens=1536,
+                        request_count=1, rooms=(7,), created_at=time.monotonic(),
+                    )
+                )
+                router._release_reservation_when_admitted = AsyncMock()
+                prefill_cancelled = asyncio.Event()
+                calls = []
+
+                class Response:
+                    status = 200
+
+                    def release(self):
+                        pass
+
+                class Session:
+                    async def post(self, url, **kwargs):
+                        calls.append(url)
+                        if url.endswith("/abort_request"):
+                            return Response()
+                        if url == "http://d0/generate":
+                            if failure == "disconnect":
+                                raise late_binding_router_module.aiohttp.ServerDisconnectedError()
+                            response = Response()
+                            response.status = 503
+                            return response
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            prefill_cancelled.set()
+
+                with self.assertRaisesRegex(RuntimeError, "Decode failed before Prefill"):
+                    await asyncio.wait_for(router._late_dispatch(
+                        Session(), {"bootstrap_room": 7, "sampling_params": {},
+                                    "return_logprob": False},
+                        "http://p0", "generate", {},
+                    ), timeout=1)
+                self.assertTrue(prefill_cancelled.is_set())
+                self.assertEqual(
+                    [url for url in calls if url.endswith("/abort_request")],
+                    ["http://d0/abort_request", "http://p0/abort_request"],
+                )
+                self.assertFalse(router._reservations)
+                await router.close()
+
+    async def test_decode_headers_do_not_consume_stream_while_waiting_for_prefill(self):
+        loop = asyncio.get_running_loop()
+        prefill = loop.create_future()
+        decode = loop.create_future()
+        response = types.SimpleNamespace(status=200, read=AsyncMock(), json=AsyncMock())
+        decode.set_result(response)
+        waiter = asyncio.create_task(
+            LateBindingMiniLoadBalancer._await_prefill_response_with_decode(prefill, decode)
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+        prefill_response = types.SimpleNamespace(status=200)
+        prefill.set_result(prefill_response)
+        self.assertIs(await waiter, prefill_response)
+        response.read.assert_not_called()
+        response.json.assert_not_called()
+        self.assertIs(decode.result(), response)
+
+    async def test_cancelled_decode_is_reported_without_cancelling_prefill(self):
+        loop = asyncio.get_running_loop()
+        prefill, decode = loop.create_future(), loop.create_future()
+        decode.cancel()
+        with self.assertRaisesRegex(RuntimeError, "Decode cancelled"):
+            await LateBindingMiniLoadBalancer._await_prefill_response_with_decode(prefill, decode)
+        self.assertFalse(prefill.done())
+        prefill.cancel()
+
     async def test_prefill_read_failure_releases_p_and_cancels_d(self):
         with tempfile.TemporaryDirectory() as directory:
             router = self.make_router(Path(directory))

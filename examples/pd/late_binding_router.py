@@ -50,6 +50,10 @@ from sglang_router.mini_lb import (
 
 logger = logging.getLogger(__name__)
 
+
+class _DecodeBeforePrefillError(RuntimeError):
+    """D failed before P could finish the transfer-dependent HTTP response."""
+
 # Complete-snapshot Host eviction is optional.  The Router must also run
 # against environments that implement the core staging lifecycle but predate
 # the EVICTING/RECOMPUTE_REQUIRED extension.
@@ -246,7 +250,11 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 "Late-binding requires SGLANG_PD_P_READY_DIR on router, P and D"
             )
         self.p_ready_dir = Path(ready_dir)
-        self.p_ready_dir.mkdir(parents=True, exist_ok=True)
+        from sglang.srt.disaggregation.agentic_control_store import ReadySignals, control_enabled
+        self.ready_signals = ReadySignals(ready_dir) if control_enabled() else None
+        self._signal_changed = asyncio.Event()
+        if self.ready_signals is None:
+            self.p_ready_dir.mkdir(parents=True, exist_ok=True)
         self.ready_timeout = _env_float("SGLANG_PD_LATE_BIND_READY_TIMEOUT_S", 600.0)
         self.ready_poll_interval = _env_float(
             "SGLANG_PD_LATE_BIND_POLL_INTERVAL_S", 0.02
@@ -564,6 +572,38 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
     def _accepted_path(self, room: int) -> Path:
         return self.p_ready_dir / f"{room}.accepted"
 
+    def _read_signal(self, path: Path):
+        signals = getattr(self, "ready_signals", None)
+        if signals is None:
+            return orjson.loads(path.read_bytes())
+        value = signals.records.get(path.name)
+        if value is None:
+            raise FileNotFoundError(str(path))
+        return value
+
+    def _has_signal(self, path: Path):
+        signals = getattr(self, "ready_signals", None)
+        return path.exists() if signals is None else signals.records.get(path.name) is not None
+
+    def _remove_signal(self, path: Path, expected=None):
+        signals = getattr(self, "ready_signals", None)
+        if signals is None:
+            path.unlink(missing_ok=True)
+        else:
+            signals.records.notify("remove", path.name, expected)
+
+    async def _wait_signal_change(self):
+        if getattr(self, "ready_signals", None) is None:
+            await asyncio.sleep(self.ready_poll_interval)
+            return
+        self._ensure_p_ready_monitor()
+        # Other futures (HTTP errors/cancellation) retain their bounded checks;
+        # successful signals wake immediately without reading any file/RPC.
+        try:
+            await asyncio.wait_for(self._signal_changed.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+
     def _request_domain(self, metadata, rooms: tuple[int, ...]) -> int:
         if not getattr(self, "numa_domains", False):
             return 0
@@ -794,6 +834,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
 
     @staticmethod
     def _write_prefill_pressure(path: Path, payload: dict[str, Any]) -> None:
+        from sglang.srt.disaggregation.agentic_control_store import control_enabled, control_kv
+        if control_enabled():
+            control_kv("prefill-pressure", str(path)).call("upsert", "latest", payload)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}")
         temporary.write_bytes(orjson.dumps(payload))
@@ -1446,12 +1490,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 _HOST_STAGE_RECOMPUTE_REQUIRED is not None
                 and state == _HOST_STAGE_RECOMPUTE_REQUIRED.value
             ):
-                self.early_claim_store.publish_route(
+                await self._early_claim_write(self.early_claim_store.publish_route,
                     parent,
                     route="recompute",
                     prefill_domain=int(route.get("prefill_domain", domain)),
                 )
-                self.early_claim_store.remove_arrival(parent)
+                await self._early_claim_write(self.early_claim_store.remove_arrival, parent)
                 logger.info(
                     "PD_SLOW_RECOVERY_ROUTE snapshot=%s state=%s "
                     "action=full_recompute",
@@ -1466,7 +1510,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         host_domain = route.get("arena_domain")
         if host_domain is None and entry is not None:
             host_domain = entry.get("arena_domain")
-        self.early_claim_store.publish_route(
+        await self._early_claim_write(self.early_claim_store.publish_route,
             parent,
             route="host_ready",
             prefill_domain=domain,
@@ -1482,6 +1526,35 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             domain,
         )
         return domain
+
+    async def _read_parent_host_route(self, parent, route):
+        """Host eviction is authoritative even before any route was published.
+
+        Socket mode reads the existing pushed mirror, not another network
+        query. A terminal receipt survives Host detail pruning, so late tools
+        and already-submitted P requests can both discover explicit recompute.
+        Only a fenced RECOMPUTE_REQUIRED permits this route change.
+        """
+        ledger = getattr(self, "_d2p_host_ledger", None)
+        if ledger is None:
+            return route, None
+        entry = (
+            ledger.get(parent.snapshot_id)
+            if getattr(ledger, "is_event_control", False)
+            else await asyncio.to_thread(ledger.get, parent.snapshot_id)
+        )
+        if entry is None or entry.get("state") != HostStageState.RECOMPUTE_REQUIRED.value:
+            return route, entry
+        if route is None or route.get("route") != "recompute":
+            domain = int((route or {}).get("prefill_domain", 0))
+            await self._early_claim_write(
+                self.early_claim_store.publish_route, parent,
+                route="recompute", prefill_domain=domain,
+            )
+            logger.info("PD_SLOW_RECOVERY_ROUTE snapshot=%s state=recompute_required "
+                        "action=full_recompute", parent.snapshot_id)
+            route = {"route": "recompute", "prefill_domain": domain}
+        return dict(route, recompute_reason="host_evicted"), entry
 
     async def _resolve_dynamic_prefill_work(
         self,
@@ -1515,6 +1588,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         getattr(self, "generation_result_ttl", 3600.0),
                     ),
                 )
+                route, host_entry = await self._read_parent_host_route(parent, route)
                 if route is not None:
                     mode = route.get("route")
                     snapshot_tokens = route.get("snapshot_tokens")
@@ -1540,14 +1614,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         return reservation
                     elif mode in {"direct_complete", "host_writing", "host_ready"}:
                         if mode in {"host_writing", "host_ready"}:
-                            host_ledger = getattr(self, "_d2p_host_ledger", None)
-                            host_entry = (
-                                None
-                                if host_ledger is None
-                                else await asyncio.to_thread(
-                                    host_ledger.get, parent.snapshot_id
-                                )
-                            )
                             host_state = (
                                 None if host_entry is None else host_entry.get("state")
                             )
@@ -1557,21 +1623,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             ):
                                 await asyncio.sleep(self.ready_poll_interval)
                                 continue
-                            if (
-                                _HOST_STAGE_RECOMPUTE_REQUIRED is not None
-                                and host_state
-                                == _HOST_STAGE_RECOMPUTE_REQUIRED.value
-                            ):
-                                store.publish_route(
-                                    parent,
-                                    route="recompute",
-                                    prefill_domain=int(route["prefill_domain"]),
-                                )
-                                store.remove_arrival(parent)
-                                await self._release_prefill_work(reservation)
-                                return await self._reserve_prefill_work(
-                                    self._request_input_tokens(request)
-                                )
                             # Host placement is complete before selecting the
                             # independent H2D/Prefill P. Do not bind recovery
                             # to the arena owner while D2H is still running.
@@ -1636,7 +1687,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             reservation.route_pending = True
                         return reservation
                     elif mode == "recompute":
-                        store.remove_arrival(parent)
+                        await self._early_claim_write(store.remove_arrival, parent)
                         await self._release_prefill_work(reservation)
                         return await self._reserve_prefill_work(
                             self._request_input_tokens(request)
@@ -1644,7 +1695,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 if store.read_final(
                     parent, not_before=0.0, max_age_seconds=self.ready_timeout
                 ) is not None:
-                    store.remove_arrival(parent)
+                    await self._early_claim_write(store.remove_arrival, parent)
                     await self._release_prefill_work(reservation)
                     return await self._reserve_prefill_work(
                         self._request_input_tokens(request)
@@ -1679,18 +1730,11 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     getattr(self, "generation_result_ttl", 3600.0),
                 ),
             )
+            route, host_entry = await self._read_parent_host_route(parent, route)
             if route is not None:
                 mode = route.get("route")
                 if mode in {"direct_complete", "host_writing", "host_ready"}:
                     if mode in {"host_writing", "host_ready"}:
-                        host_ledger = getattr(self, "_d2p_host_ledger", None)
-                        host_entry = (
-                            None
-                            if host_ledger is None
-                            else await asyncio.to_thread(
-                                host_ledger.get, parent.snapshot_id
-                            )
-                        )
                         host_state = (
                             None if host_entry is None else host_entry.get("state")
                         )
@@ -1700,22 +1744,6 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         ):
                             await asyncio.sleep(self.ready_poll_interval)
                             continue
-                        if (
-                            _HOST_STAGE_RECOMPUTE_REQUIRED is not None
-                            and host_state
-                            == _HOST_STAGE_RECOMPUTE_REQUIRED.value
-                        ):
-                            store.publish_route(
-                                parent,
-                                route="recompute",
-                                prefill_domain=int(route["prefill_domain"]),
-                            )
-                            store.remove_arrival(parent)
-                            await self._settle_direct_workset(reservation)
-                            await self._resize_prefill_work(
-                                reservation, self._request_input_tokens(request)
-                            )
-                            return {"action": "recompute", "route": "host_evicted"}
                         if (
                             mode == "host_writing"
                             or host_state != HostStageState.HOST_READY.value
@@ -1804,16 +1832,16 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         }
                     return {"action": "settled", "route": mode, "domain": domain}
                 if mode == "recompute":
-                    store.remove_arrival(parent)
+                    await self._early_claim_write(store.remove_arrival, parent)
                     await self._settle_direct_workset(reservation)
                     await self._resize_prefill_work(
                         reservation, self._request_input_tokens(request)
                     )
-                    return {"action": "recompute", "route": mode}
+                    return {"action": "recompute", "route": route.get("recompute_reason", mode)}
             if store.read_final(
                 parent, not_before=0.0, max_age_seconds=self.ready_timeout
             ) is not None:
-                store.remove_arrival(parent)
+                await self._early_claim_write(store.remove_arrival, parent)
                 await self._settle_direct_workset(reservation)
                 await self._resize_prefill_work(
                     reservation, self._request_input_tokens(request)
@@ -1999,6 +2027,35 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         return aborted
 
     @staticmethod
+    async def _await_prefill_response_with_decode(
+        prefill_task: asyncio.Task, decode_task: asyncio.Task
+    ) -> Any:
+        """Observe D failure while P waits for its destination to accept KV.
+
+        Only observe response headers here: streaming and body ownership stay
+        with the caller. Never cancel either task here; dispatch cleanup first
+        sends the existing engine aborts, which own the physical DMA fences.
+        """
+
+        done, _ = await asyncio.wait(
+            (prefill_task, decode_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if decode_task in done:
+            if decode_task.cancelled():
+                raise _DecodeBeforePrefillError("Decode cancelled before Prefill completed")
+            try:
+                response = decode_task.result()
+            except Exception as exc:
+                raise _DecodeBeforePrefillError(
+                    f"Decode failed before Prefill completed: {type(exc).__name__}: {exc}"
+                ) from exc
+            if response.status >= 400:
+                raise _DecodeBeforePrefillError(
+                    f"Decode failed before Prefill completed: status={response.status}"
+                )
+        return await prefill_task
+
+    @staticmethod
     async def _dispose_response_task(task: Optional[asyncio.Task]) -> None:
         """Cancel an HTTP task or return its completed response to the pool."""
 
@@ -2042,9 +2099,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         while True:
             self._raise_prefill_redirect(route_task)
             paths = [self._accepted_path(room) for room in rooms]
-            if all(path.exists() for path in paths):
+            if all(self._has_signal(path) for path in paths):
                 for path in paths:
-                    path.unlink(missing_ok=True)
+                    self._remove_signal(path)
                 return
             if prefill_task.done():
                 response = prefill_task.result()
@@ -2055,12 +2112,12 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         f"status={response.status} body={body}"
                     )
             if time.monotonic() >= deadline:
-                missing = [room for room, path in zip(rooms, paths) if not path.exists()]
+                missing = [room for room, path in zip(rooms, paths) if not self._has_signal(path)]
                 raise TimeoutError(
                     "Timed out waiting "
                     f"{self.prefill_accept_timeout}s for P-accepted rooms {missing}"
                 )
-            await asyncio.sleep(self.ready_poll_interval)
+            await self._wait_signal_change()
 
     async def _wait_until_prefill_scheduled(
         self,
@@ -2072,9 +2129,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         while True:
             self._raise_prefill_redirect(route_task)
             paths = [self._scheduled_path(room) for room in rooms]
-            if all(path.exists() for path in paths):
+            if all(self._has_signal(path) for path in paths):
                 for path in paths:
-                    path.unlink(missing_ok=True)
+                    self._remove_signal(path)
                 return
             if prefill_task.done():
                 response = prefill_task.result()
@@ -2085,12 +2142,35 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         f"status={response.status} body={body}"
                     )
             if time.monotonic() >= deadline:
-                missing = [room for room, path in zip(rooms, paths) if not path.exists()]
+                missing = [room for room, path in zip(rooms, paths) if not self._has_signal(path)]
                 raise TimeoutError(
                     "Timed out waiting "
                     f"{self.prefill_queue_timeout}s in P queue for rooms {missing}"
                 )
-            await asyncio.sleep(self.ready_poll_interval)
+            await self._wait_signal_change()
+
+    async def _early_claim_write(self, operation, *args, **kwargs):
+        """Await publication ACK without blocking other requests or load polls.
+
+        Route/arrival ordering is unchanged: this is not fire-and-forget. Only
+        the TCP adapter needs an IO worker; preserve legacy local semantics.
+        """
+        if getattr(self.early_claim_store, "_records", None) is not None:
+            task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+            cancelled = None
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    # A cancelled waiter cannot cancel a server transaction.
+                    # Drain that exact write before outer dispatch cleanup or
+                    # rerouting; repeated cancellation cannot detach it.
+                    cancelled = exc
+            result = task.result()
+            if cancelled is not None:
+                raise cancelled
+            return result
+        return operation(*args, **kwargs)
 
     def _publish_parent_arrival(
         self,
@@ -2392,7 +2472,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         prefill_task: asyncio.Task,
         route_task: Optional[asyncio.Task] = None,
     ) -> int:
-        if getattr(self, "dynamic_prefill_domains", False):
+        if getattr(self, "dynamic_prefill_domains", False) or getattr(self, "ready_signals", None) is not None:
             return await self._wait_until_prefill_ready_shared(
                 rooms, prefill_task, route_task
             )
@@ -2436,6 +2516,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
 
     def _scan_p_ready_markers(self) -> dict[int, dict[str, Any]]:
         snapshot: dict[int, dict[str, Any]] = {}
+        signals = getattr(self, "ready_signals", None)
+        if signals is not None:
+            for key, payload in signals.snapshot().items():
+                if key.endswith(".ready") and isinstance(payload, dict):
+                    snapshot[int(key.removesuffix(".ready"))] = {
+                        **payload, "_path": self.p_ready_dir / key,
+                    }
+            return snapshot
         for path in self.p_ready_dir.glob("*.ready"):
             try:
                 room = int(path.stem)
@@ -2452,6 +2540,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         return snapshot
 
     async def _p_ready_monitor_loop(self) -> None:
+        signals = getattr(self, "ready_signals", None)
+        if signals is not None:
+            await self._p_ready_event_loop(signals)
+            return
         try:
             while True:
                 snapshot = await asyncio.to_thread(self._scan_p_ready_markers)
@@ -2474,6 +2566,50 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         except Exception:
             logger.exception("Shared P-ready watcher failed")
             raise
+
+    async def _p_ready_event_loop(self, signals):
+        import queue
+
+        client = signals.records.client
+        events = client.watch(signals.records.namespace)
+        try:
+            await asyncio.wrap_future(events.ready)
+            initial = events.initial_snapshot
+            pending = [{"key": key, "value": value} for key, value in initial.items()]
+            self._p_ready_snapshot = {}
+            while True:
+                events.changed.clear()
+                while True:
+                    try:
+                        pending.append(events.get_nowait())
+                    except queue.Empty:
+                        break
+                client.check_health()
+                for change in pending:
+                    key, payload = change["key"], change["value"]
+                    if not key.endswith(".ready"):
+                        continue
+                    room = int(key.removesuffix(".ready"))
+                    if payload is None:
+                        self._p_ready_snapshot.pop(room, None)
+                        continue
+                    payload = {**payload, "_path": self.p_ready_dir / key}
+                    self._p_ready_snapshot[room] = payload
+                    for future in tuple(self._p_ready_waiters.get(room, ())):
+                        if not future.done():
+                            future.set_result(payload)
+                if pending:
+                    self._signal_changed.set()
+                    self._signal_changed = asyncio.Event()
+                    for event in getattr(self, "_p_ready_fifo_events", {}).values():
+                        event.set()
+                    broker_event = getattr(self, "_p_ready_broker_event", None)
+                    if broker_event is not None:
+                        broker_event.set()
+                pending = []
+                await asyncio.to_thread(events.changed.wait, 1.0)
+        finally:
+            events.close()
 
     def _ensure_p_ready_monitor(self) -> None:
         task = self._p_ready_monitor_task
@@ -2548,7 +2684,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             try:
                 payload = getattr(self, "_p_ready_snapshot", {}).get(room)
                 if payload is None:
-                    payload = orjson.loads(path.read_bytes())
+                    payload = self._read_signal(path)
                 sequence = payload.get("ready_sequence")
                 if sequence is not None:
                     sequences.append(int(sequence))
@@ -2557,12 +2693,14 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                 pass
             # Compatibility with markers produced before ready_sequence was
             # added.  Dedicated run directories make mtime a stable fallback.
+            if getattr(self, "ready_signals", None) is not None:
+                raise RuntimeError("socket P-ready requires ready_sequence")
             sequences.append(path.stat().st_mtime_ns)
         return min(sequences)
 
     def _oldest_p_ready_sequence(self, domain: int = 0) -> Optional[int]:
         sequences: list[int] = []
-        if getattr(self, "dynamic_prefill_domains", False):
+        if getattr(self, "dynamic_prefill_domains", False) or getattr(self, "ready_signals", None) is not None:
             markers = tuple(getattr(self, "_p_ready_snapshot", {}).values())
         else:
             markers = tuple(self.p_ready_dir.glob("*.ready"))
@@ -2573,7 +2711,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     path = payload.get("_path")
                 else:
                     path = marker
-                    payload = orjson.loads(path.read_bytes())
+                    payload = self._read_signal(path)
                 # SGLang startup probes use the reserved bootstrap room 0.
                 # Some probe variants carry a random rid instead of the
                 # HEALTH_CHECK_ prefix, so filtering only by rid can leave
@@ -2594,7 +2732,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         self._p_ready_snapshot.pop(room, None)
                         continue
                     try:
-                        current = orjson.loads(path.read_bytes())
+                        current = self._read_signal(path)
                     except (OSError, orjson.JSONDecodeError, TypeError):
                         self._p_ready_snapshot.pop(room, None)
                         continue
@@ -2603,7 +2741,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         # the monitor snapshot may predate an atomic marker
                         # replacement for a newly active attempt.
                         try:
-                            latest = orjson.loads(path.read_bytes())
+                            latest = self._read_signal(path)
                         except (OSError, orjson.JSONDecodeError, TypeError):
                             latest = None
                         if latest is not None and self._p_ready_marker_is_owned(
@@ -2613,7 +2751,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                             payload["_path"] = path
                             self._p_ready_snapshot[room] = payload
                         else:
-                            path.unlink(missing_ok=True)
+                            self._remove_signal(path, expected=latest)
                             self._p_ready_snapshot.pop(room, None)
                             continue
                     else:
@@ -4034,7 +4172,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         try:
             while time.monotonic() < deadline:
                 # D removes P-ready only after it has allocated destination KV.
-                if all(not self._ready_path(room).exists() for room in reservation.rooms):
+                if all(not self._has_signal(self._ready_path(room)) for room in reservation.rooms):
                     admitted = True
                     return
                 await asyncio.sleep(self.ready_poll_interval)
@@ -4131,7 +4269,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
         prefill_work: Optional[_PrefillWorkReservation] = None
         if getattr(self, "dynamic_prefill_domains", False):
             self._ensure_prefill_pressure_monitor()
-            arrival = self._publish_parent_arrival(modified_request)
+            arrival = await self._early_claim_write(self._publish_parent_arrival, modified_request)
             if arrival is not None:
                 arrival_at = float(arrival["arrived_at"])
             prefill_work = await self._resolve_dynamic_prefill_work(
@@ -4160,7 +4298,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             keep_p_credit = False
             try:
                 if parent_turn:
-                    self._publish_parent_arrival(
+                    await self._early_claim_write(self._publish_parent_arrival,
                         modified_request,
                         target_prefill_domain=(
                             domain
@@ -4281,9 +4419,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                         ] = time.monotonic()
                     reservation = None
                 for room in rooms:
-                    self._accepted_path(room).unlink(missing_ok=True)
-                    self._scheduled_path(room).unlink(missing_ok=True)
-                    self._ready_path(room).unlink(missing_ok=True)
+                    self._remove_signal(self._accepted_path(room))
+                    self._remove_signal(self._scheduled_path(room))
+                    self._remove_signal(self._ready_path(room))
                 self._deactivate_prefill_attempt(modified_request, rooms)
                 attempt_active = False
                 await self._move_prefill_work(prefill_work, redirect.domain)
@@ -4408,7 +4546,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             # marker starts untargeted; Router then charges its local shadow
             # queues and targets the lighter P for Direct.  A failed Direct is
             # moved to the D worker's NUMA-local P when host_ready appears.
-            arrival = self._publish_parent_arrival(modified_request)
+            arrival = await self._early_claim_write(self._publish_parent_arrival, modified_request)
             if arrival is not None:
                 arrival_at = float(arrival["arrived_at"])
             prefill_work = await self._resolve_dynamic_prefill_work(
@@ -4458,7 +4596,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     # atomically leasing the complete parent+suffix workset.
                     # If that lease is unavailable, P leaves the manifest
                     # untouched and D takes the ordinary timeout-to-Slow path.
-                    self._publish_parent_arrival(
+                    await self._early_claim_write(self._publish_parent_arrival,
                         modified_request,
                         target_prefill_domain=(
                             domain
@@ -4586,9 +4724,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     # remains idempotent for failures before acceptance.
                     await release_parent_admission()
                     for room in old_rooms:
-                        self._accepted_path(room).unlink(missing_ok=True)
-                        self._scheduled_path(room).unlink(missing_ok=True)
-                        self._ready_path(room).unlink(missing_ok=True)
+                        self._remove_signal(self._accepted_path(room))
+                        self._remove_signal(self._scheduled_path(room))
+                        self._remove_signal(self._ready_path(room))
                         self._p_ready_snapshot.pop(room, None)
                     await self._move_prefill_work(prefill_work, redirect.domain)
                     domain = redirect.domain
@@ -4710,7 +4848,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             # instead of pinning one P socket for the entire Decode lifetime.
             # ``decode_task`` is already running, so this does not serialize P
             # and D execution.
-            prefill_response = await prefill_task
+            prefill_response = await self._await_prefill_response_with_decode(
+                prefill_task, decode_task
+            )
             if not modified_request.get("return_logprob", False):
                 try:
                     read = getattr(prefill_response, "read", None)
@@ -4724,7 +4864,7 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             decode_response = await decode_task
             await admission_task
             return prefill_response, decode_response
-        except BaseException:
+        except BaseException as exc:
             await self._release_prefill_work(prefill_work)
             if pressure_handoff_task is not None:
                 await asyncio.gather(
@@ -4742,6 +4882,10 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
             if reservation is not None and decode_task is not None:
                 await self._abort_decode_attempt(
                     session, reservation.url, modified_request
+                )
+            if isinstance(exc, _DecodeBeforePrefillError):
+                await self._abort_prefill_attempt(
+                    session, prefill_server, modified_request, prefill_task
                 )
             await self._dispose_response_task(prefill_task)
             await self._dispose_response_task(decode_task)
@@ -4766,9 +4910,9 @@ class LateBindingMiniLoadBalancer(MiniLoadBalancer):
                     )
             for room in rooms:
                 try:
-                    self._accepted_path(room).unlink(missing_ok=True)
-                    self._scheduled_path(room).unlink(missing_ok=True)
-                    self._ready_path(room).unlink(missing_ok=True)
+                    self._remove_signal(self._accepted_path(room))
+                    self._remove_signal(self._scheduled_path(room))
+                    self._remove_signal(self._ready_path(room))
                 except OSError:
                     pass
             await release_parent_admission()

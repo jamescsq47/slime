@@ -8,6 +8,7 @@ not merely a shared pathname. Existing single-node launchers are untouched.
 import argparse
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import math
@@ -42,14 +43,17 @@ def absolute(value, field):
 
 def load_config(path):
     cfg = json.loads(Path(path).read_text())
-    if cfg.get("model_family", "qwen3") not in {"qwen3", "minimax_m2"}:
-        raise ValueError("multi-node supports ordinary Qwen3 or MiniMax M2 GQA only")
+    if cfg.get("model_family", "qwen3") not in {"qwen3", "minimax_m2", "qwen35_moe"}:
+        raise ValueError("unsupported multi-node model family")
     for key in ("run_id",):
         if not NAME.fullmatch(cfg.get(key, "")):
             raise ValueError("invalid " + key)
     for key in ("control_root", "local_root", "sglang_root", "slime_root", "model_path", "python"):
         absolute(cfg.get(key), key)
-    if cfg["control_root"].startswith(("/dev/shm/", "/tmp/")):
+    if cfg.get("control_backend", "files") not in {"files", "tcp"}:
+        raise ValueError("control_backend must be files or tcp")
+    event_control = cfg.get("control_backend") == "tcp"
+    if not event_control and cfg["control_root"].startswith(("/dev/shm/", "/tmp/")):
         raise ValueError("control_root must name the explicitly shared POSIX mount")
     if cfg["local_root"] == cfg["control_root"]:
         raise ValueError("Host data/local process state must not use the shared control directory")
@@ -94,8 +98,33 @@ def load_config(path):
     for key in ("fast_tool_seconds", "direct_admission_seconds"):
         if type(cfg.get(key)) not in (float, int) or not math.isfinite(cfg[key]) or cfg[key] <= 0:
             raise ValueError("positive " + key + " required")
-    if type(cfg.get("slow_congestion_recompute", True)) is not bool:
+    transfer_limit = cfg.get("pd_max_transfer_inflight", 0)
+    if type(transfer_limit) is not int or transfer_limit < 0:
+        raise ValueError("pd_max_transfer_inflight must be a nonnegative integer")
+    if type(cfg.get("slow_congestion_recompute", False)) is not bool:
         raise ValueError("slow_congestion_recompute must be boolean")
+    if type(cfg.get("d2p_host_staging", True)) is not bool:
+        raise ValueError("d2p_host_staging must be boolean")
+    if type(cfg.get("d2p_direct_wait_only", False)) is not bool:
+        raise ValueError("d2p_direct_wait_only must be boolean")
+    if cfg.get("d2p_direct_wait_only", False) and (
+        cfg.get("d2p_host_staging", True) or cfg.get("slow_congestion_recompute", False)
+        or not event_control
+    ):
+        raise ValueError("d2p_direct_wait_only requires socket control, no D->P Host and no recompute")
+    if type(cfg.get("tp_host_async_prepare", False)) is not bool:
+        raise ValueError("tp_host_async_prepare must be boolean")
+    if type(cfg.get("p_workset_controller", False)) is not bool:
+        raise ValueError("p_workset_controller must be boolean")
+    if cfg.get("p_workset_controller", False) and not event_control:
+        raise ValueError("p_workset_controller requires socket control")
+    if type(cfg.get("local_triton_cache", False)) is not bool:
+        raise ValueError("local_triton_cache must be boolean")
+    if type(cfg.get("router_profile_imports", False)) is not bool:
+        raise ValueError("router_profile_imports must be boolean")
+    timeout = cfg.get("router_startup_timeout_seconds", 1800)
+    if type(timeout) not in (float, int) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("router_startup_timeout_seconds must be positive and finite")
     high, low = cfg.get("slow_congestion_high", 32), cfg.get("slow_congestion_low", 8)
     if type(high) is not int or type(low) is not int or not 0 <= low < high:
         raise ValueError("Slow congestion thresholds require integer 0 <= low < high")
@@ -111,6 +140,19 @@ def load_config(path):
         if type(port) is not int or not 1024 <= port <= 65535 or port in occupied:
             raise ValueError("router port invalid or collides with a local listener")
         occupied.add(port)
+    if event_control:
+        control = cfg.get("control", {})
+        if control.get("node_id") != router["node_id"]:
+            raise ValueError("control broker must be on the Router node")
+        if not isinstance(control.get("token"), str) or len(control["token"]) < 32:
+            raise ValueError("control requires a unique run-scoped token of at least 32 characters")
+        if sum(n["role"] == "decode" for n in nodes) != 1:
+            raise ValueError("socket receipt mapping currently requires one logical D TP group")
+        for key in ("port", "tp_port"):
+            value = control.get(key)
+            if type(value) is not int or not 1024 <= value <= 65535 or value in occupied:
+                raise ValueError("control port invalid or collides with another listener")
+            occupied.add(value)
     workload = cfg.get("workload_command", [])
     if not isinstance(workload, list) or any(not isinstance(x, str) or not x for x in workload):
         raise ValueError("workload_command must be an argv list, not a shell string")
@@ -131,7 +173,7 @@ def fingerprint(cfg):
 
 def common_env(cfg):
     root = control_dir(cfg)
-    return {
+    env = {
         "SGLANG_AGENTIC_MULTINODE_ENABLED": "1",
         "SGLANG_AGENTIC_MULTINODE_RUN_ID": cfg["run_id"],
         "SGLANG_AGENTIC_MULTINODE_CONTROL_ROOT": cfg["control_root"],
@@ -142,6 +184,10 @@ def common_env(cfg):
         "SGLANG_PD_P_READY_DIR": str(root),
         "PD_P_READY_DIR": str(root),
         "PD_INFERENCE_RETURN_LOGPROB": "false",
+        # Router retains backend idle sockets for 30s. Match the existing
+        # single-node launcher: SGLang's 5s default can close a reused POST
+        # connection before the Router's pool retires it.
+        "SGLANG_TIMEOUT_KEEP_ALIVE": "120",
         "SGLANG_AGENTIC_KV_LEDGER_PATH": str(root / "lifecycle.json"),
         "SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH": str(root / "d2p.json"),
         "SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH": str(root / "p2d.json"),
@@ -149,22 +195,34 @@ def common_env(cfg):
         "SGLANG_AGENTIC_KV_METADATA_DIR": str(root / "snapshot-metadata"),
         "SGLANG_AGENTIC_KV_PREFILL_LOAD_PATH": str(root / "early-claims/prefill-loads.json"),
         "SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR": str(root / "host-register-prewarm"),
+        "SGLANG_AGENTIC_KV_REGISTER_STARTUP_BARRIER": "1",
+        "SGLANG_AGENTIC_KV_REGISTER_EAGER_ARENA": "1",
+        # One new chunk per progress visit, with the existing four DMA lanes.
+        # Keep single-node defaults unchanged.
+        "SGLANG_AGENTIC_KV_D2H_CHUNK_TOKENS": "1024",
+        "SGLANG_AGENTIC_KV_D2H_INFLIGHT": "4",
         "SGLANG_AGENTIC_KV_LIFECYCLE": "true",
         "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY": "true",
         "SGLANG_AGENTIC_KV_D_HOSTLESS": "true",
-        "SGLANG_AGENTIC_KV_HOST_STAGING": "true",
+        "SGLANG_AGENTIC_KV_HOST_STAGING": str(cfg.get("d2p_host_staging", True)).lower(),
+        "SGLANG_AGENTIC_KV_DIRECT_WAIT_ONLY": str(cfg.get("d2p_direct_wait_only", False)).lower(),
         "SGLANG_AGENTIC_KV_P2D_HOST_STAGING": "true",
         "SGLANG_AGENTIC_KV_EARLY_CLAIM": "1",
         "SGLANG_AGENTIC_KV_RELAY_ENABLED": "false",
         "SGLANG_PD_DECODE_ENABLE_RADIX_CACHE": "true",
         "SGLANG_PD_P_READY_BACKPRESSURE_MODE": "disabled",
         "SGLANG_PD_P_READY_REQUEST_CAP": "0",
+        # Zero removes the unrelated eight-request default in Decode. The
+        # Decode page/metadata/Mamba admission checks still bound real usage.
+        "SGLANG_PD_MAX_TRANSFER_INFLIGHT": str(cfg.get("pd_max_transfer_inflight", 0)),
         "SGLANG_PD_LATE_BIND_FORCE_LEGACY_LOADS": "1",
         "SGLANG_AGENTIC_KV_P2D_SPILL_DELAY_SECONDS": "0.5",
         "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "true",
         "SGLANG_AGENTIC_MULTINODE_D2P_HOST_GIB": str(cfg["d2p_host_gib_per_rank"]),
         "SGLANG_AGENTIC_MULTINODE_P2D_HOST_GIB": str(cfg["p2d_host_gib_per_rank"]),
         "SGLANG_AGENTIC_KV_TP_SIZE": str(cfg["tp_size"]),
+        "SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE": str(cfg.get("tp_host_async_prepare", False)).lower(),
+        "SGLANG_AGENTIC_P_WORKSET_CONTROLLER": str(cfg.get("p_workset_controller", False)).lower(),
         "SGLANG_AGENTIC_KV_PREFILL_DOMAIN_COUNT": str(sum(n["role"] == "prefill" for n in cfg["nodes"])),
         "SGLANG_PD_LATE_BIND_NUMA_DOMAINS": "0",
         "SGLANG_PD_LATE_BIND_DYNAMIC_PREFILL_DOMAINS": "0",
@@ -172,16 +230,46 @@ def common_env(cfg):
         "SGLANG_PD_LATE_BIND_TARGET_KV_FRACTION": "1.0",
         "SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD": str(cfg["fast_tool_seconds"]),
         "SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT": str(cfg["direct_admission_seconds"]),
-        "SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE": str(cfg.get("slow_congestion_recompute", True)).lower(),
+        "SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE": str(cfg.get("slow_congestion_recompute", False)).lower(),
+        "SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE": "false",
+        "SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE": "false",
         "SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH": str(cfg.get("slow_congestion_high", 32)),
         "SGLANG_AGENTIC_KV_SLOW_CONGESTION_LOW": str(cfg.get("slow_congestion_low", 8)),
         "PYTHONPATH": str(Path(cfg["sglang_root"]) / "python") + ":" + cfg["slime_root"],
     }
+    if cfg.get("model_family") == "qwen35_moe":
+        env.update({"SGLANG_AGENTIC_MULTINODE_QWEN35_HYBRID": "1",
+                    "SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT": "true",
+                    "SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED": "true",
+                    "SGLANG_AGENTIC_KV_APP_OWNS_TERMINATION": "true"})
+    if cfg.get("cuda_home"):
+        env["CUDA_HOME"] = absolute(cfg["cuda_home"], "cuda_home")
+    if cfg.get("debug_kv_digest", False):
+        env["SGLANG_AGENTIC_KV_DEBUG_DIGEST"] = "1"
+    if cfg.get("control_backend") == "tcp":
+        broker = cfg["control"]
+        host = node_for(cfg, broker["node_id"])["host_ip"]
+        env.update({
+            "SGLANG_AGENTIC_CONTROL_ENDPOINT": f'{host}:{broker["port"]}',
+            "SGLANG_AGENTIC_TP_EVENT_ENDPOINT": f'{host}:{broker["tp_port"]}',
+            "SGLANG_AGENTIC_CONTROL_RUN_ID": cfg["run_id"],
+            "SGLANG_AGENTIC_CONTROL_TOKEN": broker["token"],
+            "SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE": "true",
+            "SGLANG_AGENTIC_KV_P_ASYNC_CONTROL": "1",
+        })
+    return env
 
 
 def worker_plan(cfg, n):
     env = common_env(cfg)
     local = Path(cfg["local_root"]) / cfg["run_id"] / n["engine_id"]
+    if cfg.get("local_triton_cache", False):
+        # Runtime compilation must not write to the default NFS home cache.
+        # Keep content-addressed kernels across runs, separately per engine;
+        # this is compiler data, never a lifecycle/TP coordination channel.
+        env["TRITON_CACHE_DIR"] = str(
+            Path(cfg["local_root"]) / "compiler-cache" / n["engine_id"] / "triton"
+        )
     env.update({
         "CUDA_VISIBLE_DEVICES": ",".join(map(str, n["gpus"])),
         "SGLANG_HOST_IP": n["host_ip"],
@@ -198,6 +286,21 @@ def worker_plan(cfg, n):
         "SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_GIB": str(cfg["d2p_host_gib_per_rank"]),
         "SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_GIB": str(cfg["p2d_host_gib_per_rank"]),
     })
+    if cfg.get("control_backend") == "tcp":
+        env["SGLANG_AGENTIC_CONTROL_GROUP_ID"] = n["engine_id"]
+        env["SGLANG_AGENTIC_TP_RECEIPT_SOURCE_GROUP"] = next(
+            node["engine_id"] for node in cfg["nodes"] if node["role"] == "decode"
+        )
+    elif cfg["tp_size"] > 1:
+        # V1 keeps each whole TP group on one host. Internal rank reports use
+        # run/engine-scoped tmpfs; cross-engine receipts and ownership ledgers
+        # remain shared. The engine enforces the namespace allowlist.
+        scope = hashlib.sha256(str(control_dir(cfg)).encode()).hexdigest()[:16]
+        env["SGLANG_AGENTIC_KV_TP_CONTROL_DIR"] = str(
+            Path("/dev/shm/dualpd-tp") / scope / n["engine_id"]
+        )
+        if n["role"] == "decode":
+            env["SGLANG_AGENTIC_KV_D_TP_CONTROL_DIR"] = env["SGLANG_AGENTIC_KV_TP_CONTROL_DIR"]
     if n.get("numa_nodes"):
         env["SGLANG_AGENTIC_KV_TP_NUMA_NODES"] = ",".join(map(str, n["numa_nodes"]))
     ps = [x for x in cfg["nodes"] if x["role"] == "prefill"]
@@ -212,18 +315,33 @@ def worker_plan(cfg, n):
     if n["role"] == "prefill":
         command += ["--chunked-prefill-size", str(cfg["chunked_prefill_size"]),
                     "--max-prefill-tokens", str(cfg["max_prefill_tokens"])]
+    if cfg.get("p2d_host_probe") and n["role"] == "decode":
+        # Engineering-only capacity test: one 8k request fits, two do not.
+        # No fake load samples or changes to the production router/state machine.
+        command += ["--max-total-tokens", "12288"]
     if cfg.get("model_family") == "minimax_m2":
         command += ["--trust-remote-code", "--reasoning-parser", "minimax-append-think",
                     "--tool-call-parser", "minimax-m2", "--kv-cache-dtype", "bfloat16",
                     "--ep-size", str(cfg["tp_size"])]
+    if cfg.get("model_family") == "qwen35_moe":
+        command += ["--trust-remote-code", "--dtype", "bfloat16",
+                    "--kv-cache-dtype", "bfloat16", "--ep-size", "1",
+                    "--reasoning-parser", "glm45", "--tool-call-parser", "qwen3_coder",
+                    "--attention-backend", "triton", "--linear-attn-backend", "triton",
+                    "--moe-runner-backend", "triton", "--sampling-backend", "flashinfer",
+                    "--mamba-scheduler-strategy", "extra_buffer", "--mamba-track-interval", "64",
+                    "--mamba-full-memory-ratio", str(cfg.get("mamba_full_memory_ratio", 0.5)),
+                    "--random-seed", str(cfg.get("seed", 2026))]
     if n.get("numa_nodes"):
         command += ["--numa-node"] + list(map(str, n["numa_nodes"]))
     if n.get("ib_device"):
         command += ["--disaggregation-ib-device", n["ib_device"]]
+    if n.get("ucx_net_devices"):
+        env["UCX_NET_DEVICES"] = n["ucx_net_devices"]
     return {"node_id": n["node_id"], "engine_id": n["engine_id"], "environment": env,
             "command": command, "local_run_dir": str(local),
             "host_capacity_gib_per_direction": {
-                "d2p_source": cfg["d2p_host_gib_per_rank"] * cfg["tp_size"] if n["role"] == "decode" else 0,
+                "d2p_source": cfg["d2p_host_gib_per_rank"] * cfg["tp_size"] if n["role"] == "decode" and cfg.get("d2p_host_staging", True) else 0,
                 "p2d_source": cfg["p2d_host_gib_per_rank"] * cfg["tp_size"] if n["role"] == "prefill" else 0}}
 
 
@@ -240,7 +358,10 @@ def router_plan(cfg):
         "SGLANG_AGENTIC_KV_ENGINE_ID": router["engine_id"],
         "CUDA_VISIBLE_DEVICES": "",
     })
-    command = [cfg["python"], str(Path(cfg["slime_root"]) / "examples/pd/launch_late_binding_router.py"),
+    command = [cfg["python"], "-u"]
+    if cfg.get("router_profile_imports", False):
+        command += ["-X", "importtime"]
+    command += [str(Path(cfg["slime_root"]) / "examples/pd/launch_late_binding_router.py"),
                "--pd-disaggregation", "--policy", "random", "--host", "0.0.0.0",
                "--port", str(router["port"]), "--prometheus-port", str(router["metrics_port"]),
                "--health-check-timeout-secs", "60", "--health-failure-threshold", "10"]
@@ -254,12 +375,51 @@ def router_plan(cfg):
             "command": command, "local_run_dir": str(Path(cfg["local_root"]) / cfg["run_id"] / router["engine_id"])}
 
 
+def control_plan(cfg):
+    if cfg.get("control_backend") != "tcp":
+        raise ValueError("start-control requires control_backend=tcp")
+    broker = cfg["control"]
+    host = node_for(cfg, broker["node_id"])["host_ip"]
+    env = common_env(cfg)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    command = [cfg["python"], "-m", "sglang.srt.disaggregation.agentic_control_server",
+               "--listen", host, "--port", str(broker["port"]),
+               "--tp-port", str(broker["tp_port"]), "--run-id", cfg["run_id"]]
+    for node in cfg["nodes"]:
+        command += ["--" + node["role"] + "-group", node["engine_id"]]
+    return {"node_id": broker["node_id"], "engine_id": "control-broker", "environment": env,
+            "command": command,
+            "local_run_dir": str(Path(cfg["local_root"]) / cfg["run_id"] / "control-broker")}
+
+
+_control_clients = {}
+_prewarm_controls = {}
+
+
+def control_client(cfg):
+    """Launcher-only persistent client; startup/readiness never touches NFS."""
+    key = fingerprint(cfg)
+    if key not in _control_clients:
+        sys.path.insert(0, str(Path(cfg["sglang_root"]) / "python"))
+        from sglang.srt.disaggregation.agentic_control_rpc import ControlRPCClient
+        broker = cfg["control"]
+        client = ControlRPCClient(
+            (node_for(cfg, broker["node_id"])["host_ip"], broker["port"]),
+            run_id=cfg["run_id"], token=broker["token"],
+        )
+        client.wait_ready()
+        _control_clients[key] = client
+    return _control_clients[key]
+
+
 def plan(cfg):
     return {"status": "DEVELOPMENT_PLAN_NOT_RUNTIME_ACCEPTANCE", "config_sha256": fingerprint(cfg),
             "workers": [worker_plan(cfg, n) for n in cfg["nodes"]],
             "router": router_plan(cfg),
             "requirements": ["same model/revision/dtype/page layout on all ranks",
-                "shared POSIX metadata, coherent hardlink/rename/O_EXCL/distributed flock",
+                ("persistent TCP control broker; no NFS or TP mailbox files"
+                 if cfg.get("control_backend") == "tcp"
+                 else "shared POSIX metadata, coherent hardlink/rename/O_EXCL/distributed flock"),
                 "source-local DRAM extents exported by remote RDMA Host backend",
                 "no NFS KV payloads; registered Host owner stays alive until remote fence",
                 "TP groups must stay within a node; equal TP across P and D",
@@ -270,7 +430,8 @@ def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name("." + path.name + "." + uuid.uuid4().hex)
     try:
-        with tmp.open("x") as out:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as out:
             json.dump(value, out, indent=2)
             out.flush()
             os.fsync(out.fileno())
@@ -282,11 +443,16 @@ def atomic_json(path, value):
 
 def fs_publish(cfg, n):
     # A tiny artifact only, no GPU initialization and no capacity-sized allocation.
-    root = control_dir(cfg) / "preflight"
+    event_control = cfg.get("control_backend") == "tcp"
+    root = ((Path(cfg["local_root"]) / cfg["run_id"]) if event_control else control_dir(cfg)) / "preflight"
     root.mkdir(parents=True, exist_ok=True)
     record = {"node_id": n["node_id"], "config_sha256": fingerprint(cfg),
               "hostname": socket.gethostname(), "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
               "nonce": uuid.uuid4().hex, "time": time.time()}
+    if event_control:
+        # Node-local launcher identity, not TP/control communication.
+        atomic_json(root / (n["node_id"] + ".json"), record)
+        return record
     probe = root / (n["node_id"] + ".exclusive")
     fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(fd, "w") as out:
@@ -299,6 +465,8 @@ def fs_publish(cfg, n):
 
 
 def fs_verify(cfg):
+    if cfg.get("control_backend") == "tcp":
+        raise ValueError("TCP mode never performs a shared-filesystem verification")
     records = [json.loads((control_dir(cfg) / "preflight" / (n["node_id"] + ".json")).read_text())
                for n in cfg["nodes"]]
     if any(r["config_sha256"] != fingerprint(cfg) for r in records):
@@ -330,6 +498,8 @@ def fs_verify(cfg):
 
 
 def lock_check(cfg, hold):
+    if cfg.get("control_backend") == "tcp":
+        raise ValueError("TCP mode has no distributed file locks")
     path = control_dir(cfg) / "preflight/distributed.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as f:
@@ -354,6 +524,8 @@ def capability_check(cfg, env):
     if result.returncode:
         raise RuntimeError("Multi-node runtime gate unavailable; no GPU launched. " + result.stderr[-2000:])
     caps = json.loads(result.stdout)
+    if cfg.get("control_backend") == "tcp" and not caps.get("socket_control_engine", False):
+        raise RuntimeError("Socket control engine integration/audit is incomplete; no GPU launched")
     missing = sorted(REQUIRED_CAPABILITIES - set(caps.get("features", [])))
     if not caps.get("integrated") or missing:
         raise RuntimeError("Multi-node engine not integrated/audited; no GPU launched. Missing: " + repr(missing))
@@ -365,6 +537,9 @@ def runtime_env(p):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("SGLANG_", "PD_")) and k != "HOST_IP"}
     env.update(p["environment"])
+    # SSH does not activate Conda. The correct interpreter alone is not enough:
+    # FlashInfer launches ninja and other subprocesses by executable name.
+    env["PATH"] = str(Path(p["command"][0]).parent) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -373,7 +548,9 @@ def process_identity(cfg, component):
 
 
 def local_node_check(cfg, node_id):
-    manifest = json.loads((control_dir(cfg) / "preflight" / (node_id + ".json")).read_text())
+    root = (Path(cfg["local_root"]) / cfg["run_id"] if cfg.get("control_backend") == "tcp"
+            else control_dir(cfg))
+    manifest = json.loads((root / "preflight" / (node_id + ".json")).read_text())
     current_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     if manifest["boot_id"] != current_boot or manifest["config_sha256"] != fingerprint(cfg):
         raise RuntimeError("wrong node/configuration or host rebooted; republish under a new run ID")
@@ -415,13 +592,75 @@ def wait_ready(cfg, timeout=1800):
                     json.loads(response.read())
                 del pending[engine]
                 errors.pop(engine, None)
-            except (OSError, ValueError, RuntimeError) as exc:
+            except (OSError, ValueError, RuntimeError, http.client.HTTPException) as exc:
                 errors[engine] = str(exc)
         if pending:
             time.sleep(1)
     if pending:
         raise RuntimeError("model_info barrier timed out: " + repr(errors))
     return {"workers_ready": True, "note": "HTTP/model readiness, not KV transfer correctness or throughput acceptance"}
+
+
+def host_prewarm_status(cfg):
+    """Start/wait the existing rank-local CUDA registration barrier, no KV I/O."""
+    root = control_dir(cfg) / "host-register-prewarm"
+    controls = None
+    if cfg.get("control_backend") == "tcp":
+        key = fingerprint(cfg)
+        if key not in _prewarm_controls:
+            client = control_client(cfg)
+            from sglang.srt.disaggregation.agentic_control_store import ControlKV, record_namespace
+            controls = ControlKV(record_namespace("prewarm", str(root)), client=client)
+            controls.call("put", "start", {"run_id": cfg["run_id"]})
+            _prewarm_controls[key] = controls
+        controls = _prewarm_controls[key]
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "start").touch(exist_ok=True)
+    expected = {
+        f'{n["role"]}-{n["engine_id"]}-rank-{rank}'
+        for n in cfg["nodes"] for rank in range(cfg["tp_size"])
+    }
+    completed = set()
+    def valid_record(record, participant):
+        identity = f'{record["role"]}-{record["engine_id"]}-rank-{record["tp_rank"]}'
+        no_source = record['role'] == 'decode' and not cfg.get('d2p_host_staging', True)
+        size_ok = (record['registered_bytes'] == 0 and record.get('arena_count') == 0
+                   if no_source else record['registered_bytes'] > 0)
+        return identity == participant and size_ok
+    for participant in expected:
+        if controls is not None:
+            failure = controls.get("failed/" + participant + ".json")
+            if failure is not None:
+                raise RuntimeError("Host prewarm failed: " + repr(failure))
+            record = controls.get("complete/" + participant + ".json")
+            if record is not None:
+                if not valid_record(record, participant):
+                    raise RuntimeError("invalid Host prewarm completion: " + participant)
+                completed.add(participant)
+            continue
+        failure = root / "failed" / (participant + ".json")
+        if failure.exists():
+            raise RuntimeError("Host prewarm failed: " + failure.read_text())
+        path = root / "complete" / (participant + ".json")
+        if path.exists():
+            record = json.loads(path.read_text())
+            if not valid_record(record, participant):
+                raise RuntimeError("invalid Host prewarm completion: " + str(path))
+            completed.add(participant)
+    return {"ready": completed == expected, "completed": len(completed),
+            "expected": len(expected), "pending": sorted(expected - completed)}
+
+
+def wait_host_prewarm(cfg, timeout=1800):
+    deadline = time.monotonic() + timeout
+    while True:
+        status = host_prewarm_status(cfg)
+        if status["ready"]:
+            return status
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Host prewarm timed out: " + repr(status))
+        time.sleep(1)
 
 
 def check_listen_ports(cfg, p, is_worker):
@@ -435,6 +674,8 @@ def check_listen_ports(cfg, p, is_worker):
         ports = [n["port"], n["bootstrap_port"], n["reverse_bootstrap_port"]]
     elif p["engine_id"] == cfg["router"]["engine_id"]:
         ports = [cfg["router"]["port"], cfg["router"]["metrics_port"]]
+    elif p["engine_id"] == "control-broker":
+        ports = [cfg["control"]["port"], cfg["control"]["tp_port"]]
     else:
         return
     for port in ports:
@@ -447,8 +688,12 @@ def check_listen_ports(cfg, p, is_worker):
 
 def start_component(cfg, p, *, is_worker=False):
     env = runtime_env(p)
-    capability_check(cfg, env)
-    fs_verify(cfg)
+    if p["engine_id"] != "control-broker":
+        capability_check(cfg, env)
+        if cfg.get("control_backend") == "tcp":
+            control_client(cfg).call("system", "describe")
+        else:
+            fs_verify(cfg)
     local_node_check(cfg, p["node_id"])
     check_listen_ports(cfg, p, is_worker)
     if is_worker:
@@ -460,8 +705,12 @@ def start_component(cfg, p, *, is_worker=False):
 
 
 def validate_launch_model(cfg, model):
-    """Only ordinary GQA layouts: MoE weights do not add recurrent KV state."""
+    """Explicit model layout validation; hybrid transfer is separately gated."""
     family = cfg.get("model_family", "qwen3")
+    if family == "qwen35_moe":
+        from qwen35_swe import validate_model
+        validate_model(model)
+        return
     if model.get("model_type") != family:
         raise ValueError("model config disagrees with explicit model_family")
     if family == "qwen3":
@@ -496,6 +745,12 @@ def workload_plan(cfg):
     p["engine_id"] = "workload"
     p["command"] = cfg["workload_command"]
     p["local_run_dir"] = str(Path(cfg["local_root"]) / cfg["run_id"] / "workload")
+    allowed = {"PD_DATA_ROOT", "PD_SWE_RUN_ID", "PD_SWE_PROGRESS_FILE",
+               "PD_MODEL_HTTP_TRANSPORT", "SLIME_HTTP_READ_TIMEOUT_SECONDS", "MIN_P"}
+    for key, value in cfg.get("workload_environment", {}).items():
+        if key not in allowed or not isinstance(value, str):
+            raise ValueError("unsupported workload environment setting: " + key)
+        p["environment"][key] = value
     return p
 
 
@@ -511,10 +766,10 @@ def smoke_plan(cfg, config_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "fs-publish", "fs-verify", "fs-lock-hold", "fs-lock-probe",
-                                         "start-worker", "start-router", "run-workload", "smoke", "wait-ready", "stop", "status"))
+                                         "start-control", "start-worker", "start-router", "run-workload", "smoke", "wait-ready", "stop", "status"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--node-id")
-    parser.add_argument("--component", choices=("worker", "router", "workload", "smoke"), default="worker")
+    parser.add_argument("--component", choices=("worker", "router", "workload", "smoke", "control"), default="worker")
     parser.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -532,22 +787,27 @@ def main():
         result = lock_check(cfg, args.action == "fs-lock-hold")
     elif args.action == "start-worker":
         return start_worker(cfg, n)
+    elif args.action == "start-control":
+        return start_component(cfg, control_plan(cfg))
     elif args.action == "start-router":
         capability_check(cfg, runtime_env(router_plan(cfg)))
         wait_ready(cfg, args.timeout)
+        wait_host_prewarm(cfg, args.timeout)
         return start_component(cfg, router_plan(cfg))
     elif args.action == "run-workload":
         capability_check(cfg, runtime_env(workload_plan(cfg)))
         wait_ready(cfg, args.timeout)
+        wait_host_prewarm(cfg, args.timeout)
         return start_component(cfg, workload_plan(cfg))
     elif args.action == "smoke":
         capability_check(cfg, runtime_env(smoke_plan(cfg, args.config)))
         wait_ready(cfg, args.timeout)
+        wait_host_prewarm(cfg, args.timeout)
         return start_component(cfg, smoke_plan(cfg, args.config))
     elif args.action == "wait-ready":
         result = wait_ready(cfg, args.timeout)
     elif args.action in {"stop", "status"}:
-        p = worker_plan(cfg, n) if args.component == "worker" else router_plan(cfg) if args.component == "router" else smoke_plan(cfg, args.config) if args.component == "smoke" else workload_plan(cfg)
+        p = control_plan(cfg) if args.component == "control" else worker_plan(cfg, n) if args.component == "worker" else router_plan(cfg) if args.component == "router" else smoke_plan(cfg, args.config) if args.component == "smoke" else workload_plan(cfg)
         local_node_check(cfg, p["node_id"])
         result = process_control(p["local_run_dir"], process_identity(cfg, p["engine_id"]), args.action)
     print(json.dumps(result, indent=2))

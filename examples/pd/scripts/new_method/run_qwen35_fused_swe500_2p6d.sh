@@ -8,8 +8,9 @@ PD_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PD_DIR}"
 source "${SCRIPT_DIR}/../common/runtime.sh"
 export PD_ENV_BIN="${PD_FUSED_ENV_BIN:-/homes/siqic/anaconda3/envs/pd/bin}"
-export SGLANG_OVERLAY_ROOT=/homes/siqic/sglang-qwen35-integration/python
-export PD_RUN_QWEN_SCRIPT=/homes/siqic/sglang-qwen35-integration/validation/run_pd_servers.sh
+export SGLANG_OVERLAY_ROOT="${SGLANG_OVERLAY_ROOT:-/homes/siqic/sglang-qwen35-integration/python}"
+export PD_RUN_QWEN_SCRIPT="${PD_RUN_QWEN_SCRIPT:-/homes/siqic/sglang-qwen35-integration/validation/run_pd_servers.sh}"
+export PD_SCRIPT_INTERNAL_DIR="${SCRIPT_DIR}/internal"
 export PATH="${PD_ENV_BIN}:${PATH}" PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${SGLANG_OVERLAY_ROOT}:${PD_DIR}:${PD_DIR}/../.."
 # Avoid accidentally inheriting an ablation or the old Mamba router.
@@ -17,9 +18,9 @@ while IFS= read -r variable; do unset "${variable}"; done < <(compgen -v SGLANG_
 while IFS= read -r variable; do unset "${variable}"; done < <(compgen -v SGLANG_PD_)
 unset SCHEDULE_FILE EXPERIMENT_CONFIG LOCAL_GPUS LOCAL_PORTS LOCAL_ROUTER_PORT MEASUREMENT_DURATION_SECONDS
 export PD_LATE_BIND_ROUTER_ENTRY="${PD_DIR}/launch_late_binding_router.py"
-export MODEL_PATH=/homes/siqic/Qwen3.5-9B PD_DATA_ROOT=/tmp/pd-data
-export WORKLOAD_CONFIG="${PD_DIR}/configs/experiments/swe_bench_verified_miles_pr51_8k_t64.yaml"
-export MODEL_REASONING_PARSER=qwen3 MODEL_TOOL_CALL_PARSER=qwen3_coder
+export MODEL_PATH="${MODEL_PATH:-/homes/siqic/Qwen3.5-9B}" PD_DATA_ROOT="${PD_DATA_ROOT:-/tmp/pd-data}"
+export WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-${PD_DIR}/configs/experiments/swe_bench_verified_miles_pr51_8k_t64.yaml}"
+export MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-qwen3}" MODEL_TOOL_CALL_PARSER=qwen3_coder
 export PREFILL_GPU_GROUPS='0;4' DECODE_GPU_GROUPS='1;2;3;5;6;7'
 export PREFILL_GPUS='0 4' DECODE_GPUS='1 2 3 5 6 7'
 export PREFILL_TP_SIZE=1 DECODE_TP_SIZE=1
@@ -140,9 +141,11 @@ for gpu in ${PREFILL_GPUS} ${DECODE_GPUS}; do pd_check_gpu_idle "${gpu}"; done
 for port in ${PREFILL_PORTS} ${DECODE_PORTS} ${BOOTSTRAP_PORTS} 23750 23751 23900 23901 23902 23903 23904 23905 23910 23911 23912 23913 23914 23915 23916 23917; do pd_check_port_free "${port}"; done
 "${PD_ENV_BIN}/python" "${SCRIPT_DIR}/../tools/check_environments.py" --expect modified --output "${RUN_DIR}/environment.json"
 "${PD_ENV_BIN}/python" - <<'PY'
-import hashlib, json, os, subprocess
+import hashlib, json, os, subprocess, sys
 from pathlib import Path
 import sglang
+sys.path.insert(0, str(Path('scripts/tools').resolve()))
+from swe_prompt_reference import matches_reference
 root = Path(os.environ['RUN_DIR'])
 assert str(Path(sglang.__file__).resolve()).startswith(os.environ['SGLANG_OVERLAY_ROOT'] + '/')
 source = Path(os.environ['SGLANG_OVERLAY_ROOT']).parent
@@ -158,12 +161,13 @@ assert 0 < int(os.environ['REQUESTS']) <= 500
 images = set(subprocess.check_output(['docker','image','ls','--format','{{.Repository}}:{{.Tag}}'],text=True,timeout=90).splitlines())
 missing = [row['instance_id'] for row in rows if (row.get('image_name') or 'swebench/sweb.eval.x86_64.'+row['instance_id'].lower().replace('__','_1776_')+':latest').removeprefix('docker.io/') not in images]
 assert not missing, missing[:8]
-baseline = Path('/tmp/pd-persist/baseline-qwen35-9b-tp1-swe-verified500-colocated-c256-20260910-r2')
+baseline = Path(os.environ.get('PD_HARNESS_REFERENCE_RUN', '/tmp/pd-persist/baseline-qwen35-9b-tp1-swe-verified500-colocated-c256-20260910-r2'))
 harness_hashes = {}
 for old in sorted((baseline/'source-snapshot/data/swe_bench_openenv').rglob('*.py')):
     relative = old.relative_to(baseline/'source-snapshot')
     current = Path(relative)
-    assert old.read_bytes() == current.read_bytes(), f'Baseline harness changed: {relative}'
+    assert matches_reference(old.read_bytes(), current.read_bytes(), old.name,
+        os.environ.get('PD_HARNESS_PROMPT_VERSION', '')), f'Baseline harness changed: {relative}'
     harness_hashes[str(relative)] = hashlib.sha256(current.read_bytes()).hexdigest()
 assert harness_hashes, 'Missing baseline harness snapshot'
 assert (baseline/'workload.yaml').read_bytes() == Path(os.environ['WORKLOAD_CONFIG']).read_bytes()
@@ -223,6 +227,10 @@ export SGLANG_AGENTIC_KV_LEDGER_PATH="${CONTROL_DIR}/ledger.json"
 export SGLANG_AGENTIC_KV_STAGING_LEDGER_PATH="${CONTROL_DIR}/host.json"
 export SGLANG_AGENTIC_KV_P2D_STAGING_LEDGER_PATH="${CONTROL_DIR}/p2d-host.json"
 export SGLANG_AGENTIC_KV_METADATA_DIR="${PD_P_READY_DIR}/snapshot-metadata"
+if [[ -n "${PD_MATRIX_HOST_CONTROL:-}" ]]; then
+  export SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR="${PD_MATRIX_HOST_CONTROL}/d2p"
+  export SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR="${PD_MATRIX_HOST_CONTROL}/p2d"
+fi
 export SGLANG_AGENTIC_KV_REGISTER_PREWARM_DIR="${CONTROL_DIR}/host-register-prewarm"
 env | rg '^(PD_|SGLANG_|PREFILL_|DECODE_|MODEL_|MAX_|MAMBA_|REQUESTS=|TEMPERATURE=|TOP_|MIN_P=|SEED=|WORKLOAD_|CLOSED_LOOP=|ARRIVAL_|DISPATCH_|PRESERVE_|MEM_FRACTION_|PYTHONPATH=)' | LC_ALL=C sort >"${RUN_DIR}/launch-environment.txt"
 nvidia-smi --query-compute-apps=pid,gpu_uuid,used_gpu_memory --format=csv >"${RUN_DIR}/gpu-processes-before.csv"

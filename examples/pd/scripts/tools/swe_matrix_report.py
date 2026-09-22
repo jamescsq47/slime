@@ -185,7 +185,7 @@ def summarize(run,case):
             for key,needle in [('http_retry','Retrying'),('oom','CUDA out of memory'),('scheduler','Scheduler hit an exception')]:
                 errors[key]+=line.count(needle)
     ends=sorted(t['finished_ts'] for t in tasks);normal=sorted(t['finished_ts'] for t in tasks if t['status']=='completed')
-    ideal=aligned=0;valid=case['model']=='9b'
+    ideal=aligned=0;valid=case['model']=='9b' and case.get('ideal_prefix_reference', True)
     for t in tasks:
         previous=0
         for e in events(t):
@@ -200,7 +200,8 @@ def summarize(run,case):
         initial=dist([events(t)[0]['prompt_tokens'] for t in tasks if events(t)]),
         prompt_dist=dist([e['prompt_tokens'] for e in ev]),decode_dist=dist([e['output_tokens'] for e in ev]),
         ideal=ideal if valid else None,aligned=aligned if valid else None,
-        ideal_note='仅9B未压缩稳定Prompt的L-2/page64反事实；非精确token-LCP物理下界，超额未全部归因',
+        ideal_note=('openai_tools不沿用旧fenced-shell的L-2公式；需精确token-LCP和checkpoint记录' if not case.get('ideal_prefix_reference', True) else
+                    '仅9B未压缩稳定Prompt的L-2/page64反事实；非精确token-LCP物理下界，超额未全部归因'),
         observations=sum(e.get('observation_tokens',0) for e in ev),shell=dist(shell),shell_max=max(shell,default=None),
         shell_task=dist([sum(e.get('command_seconds',0) for e in events(t) if e.get('command')) for t in tasks]),
         tool_bins=[sum(f(s) for s in shell) for f in [lambda s:s<=1,lambda s:1<s<=2,lambda s:2<s<=10,lambda s:s>10]],
@@ -245,7 +246,7 @@ def value_for(section,label,r):
             return fmt(v/(n*tp) if '/ 卡' in label and v is not None and n else v,' token/s')
         if '完整轨迹输出' in label:return fmt(r['decode']/wall,' token/s')
         if '成功模型调用未命中' in label:return fmt(actual/wall if actual is not None else None,' token/s')
-        if 'Forward时间' in label:
+        if 'Forward时间' in label and '非Forward' not in label:
             v=p['p_forward'] if label.startswith(('P ','Prefill')) else d['d_forward']
             return fmt(v*sec if v is not None else None,' s')+' / '+fmt(v*100 if v is not None else None,'%')
         if '非Forward' in label:

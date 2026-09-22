@@ -33,6 +33,21 @@
 - 同一数据配置c384/c576需重测；其他TP/模型不能自动沿用本次性能验收。
   32/8是已验证可运行的参数，不宣称最优。
 
+### 多节点严格 Direct 等待消融（2026-09-21）
+
+- `SGLANG_AGENTIC_KV_DIRECT_WAIT_ONLY=true` 为独立、默认关闭的实验开关。
+  D→P Host、固定失败重算、拥堵重算及禁用反向复用必须关闭；P→D不变。
+- 工具尚未返回、P没有完整workset、Direct建链尚未完成时，D保留父KV并继续
+  原有异步progress。内部等待/arrival有效期不设丢弃期限；配置仍记录原2s/1s，
+  但明确被本消融覆盖，不能将其报告成相同期限的性能比较。
+- 只有全TP真实完成并由P接管后才能释放D父KV；不是靠超时假定DMA完成。
+  真实传输失败保留源KV并输出`strict_direct_failed`，停止实验排查，不能静默
+  Slow或完整重算，也不重用旧room/attempt绕过取消fence。
+- 应用final/cancel、终止后格式纠错、混合模型稳定checkpoint/尾页语义不变；
+  本开关禁止的是传输/拥堵策略丢弃父KV，不改变harness正确性定义。
+- 容量反压可能形成D HBM滞留甚至资源循环；这是本消融要观测的结果，不能为
+  跑完实验暗中启用重算。HTTP/实验级故障期限仍保留，发生时不计作通过。
+
 ### 纯重算消融
 
 - `SGLANG_AGENTIC_KV_DISABLE_D2P_REUSE=true` 只用于纯重算消融，默认关闭。
@@ -74,6 +89,22 @@ KV cache 以 **request-generation snapshot** 为基本管理单位。
 - 承载搜索服务或其他额外进程的 GPU 必须沿用 colocated 中该卡的较低比例；TP 组内仍须采用该组所有 rank 都能安全支持的统一比例。
 - 当前 A100 + Qwen3-8B/BrowseComp 标准配置为：普通 GPU `0.80`，承载搜索服务的 GPU 7 为 `0.60`；4P:4D 时四张 P 均为 `0.80`，四张 D 为 `0.80/0.80/0.80/0.60`。
 - 启动脚本和结果文档必须记录最终生效值。历史 PD 运行若使用普通 P/D `0.85`，只能作为历史诊断数据，必须用对齐比例重跑后才能纳入最终横向比较。
+
+### 1.2 SWE-bench 采样约定（2026-09-17）
+
+- 2026-09-21起，本工作区新实验的工具等待阈值默认1秒（含Qwen3.5多节点入口）；
+  Direct建链阈值仍为1秒。SWE双节点长测关闭拥堵重算及固定Direct失败重算，
+  失败Direct转Slow；保留终止纠错、显式Host驱逐等原有正确性处理并单独统计，
+  不以“未claim”推断缺内存后重算。
+
+- 本工作区后续所有 SWE-bench 实验（collocated/PD、各模型）固定
+  `temperature=0.6, top_p=0.95, top_k=20`；启动脚本、配置和结果记录均须明确。
+- `inference.py` 对 SWE workload 检查上述参数，错误配置直接拒绝启动评测，
+  不静默覆盖；其他数据集不受影响。独立 launcher 也必须遵守此约定。
+- 2026-09-18起122B改为复用27B实际运行的 `openai_tools` workload，
+  单轮8192、64轮、累计81920、上下文131072；不新增纠错重试或终止规则。
+  之前仅改采样的fenced-shell运行不属于此次对齐结果。历史结果保留真实参数。
+- 本修改不涉及 snapshot 所有权、调度、传输或 TP 状态机。
 
 ## 2. KV cache 循环流水线
 
@@ -166,7 +197,7 @@ Direct 与 Slow 必须有独立 I/O 队列，并与计算进度解耦。
 
 - D→P Direct、Slow与重算发布完全解耦。快工具Direct失败按全局恢复拥堵模式选择出口；
   Slow和显式重算均不能阻塞后续Direct，慢工具仍独立进入Slow。
-- Slow 不做全量 candidate 扫描：每个 D rank 维护 sticky active window，并用 round-robin progress budget 推进。配置上限默认 active window=8、每轮 budget=8，但物理上限按 DMA group 数裁剪；默认 4 个 DMA group，因此同时只让 4 个 snapshot 取得 D2H pipeline，窗口外 snapshot 继续由 D HBM 完整持有，不会取得部分 Host ownership。一次 progress visit 对一个 snapshot 最多推进一个物理阶段，不能把整个 snapshot 的 chunk 全部排入 CUDA 队列。
+- Slow 不做全量 candidate 扫描：每个 D rank 维护 sticky active window，并用 round-robin progress budget 推进。配置上限默认 active window=8、每轮 budget=8，但物理上限按 DMA group 数裁剪；默认 4 个 DMA group，因此同时只让 4 个 snapshot 取得 D2H pipeline，窗口外 snapshot 继续由 D HBM 完整持有，不会取得部分 Host ownership。一次 progress visit 可以回收已完成块、提交CPU收尾并启动最多一个新chunk，不能把整个 snapshot 的 chunk 全部排入 CUDA 队列。取得不可变Host grant后，所有rank按本地CUDA event/CPU future推进，完整复制后才通过共享ledger完成全TP durable提交；取消和失败仍受原fence/CAS保护，不能提前释放D源。
 - D→P D2H 使用独立低优先级 CUDA stream。传输 worker 从进程内有界 registered-window cache 取得最终 request extent 所覆盖的窗口，并在后台生成一次 CPU token-index mirror；CUDA 13 `cuMemcpyBatchAsync` 把相邻 allocator tokens 合并为 page/run 后批量提交 `HBM→registered final extent`，不再启动占用 SM 的 gather kernel。完成 event 同时是该 chunk 的物理完成与 Host durable fence，不再有 CPU commit memcpy。默认 batch 为 4096 tokens；窗口默认 8 GiB、通用 cache 默认 64 GiB。全局路由下一个进程可能访问 4 个 P domain，正式 Qwen3-8B 4P:4D 配置因此使用 1280 GiB 上限（`4 * (256+64) GiB`）；首次发现 arena 时只启动后台预注册线程，线程逐个 8 GiB 窗口 acquire/release，不能在传输 progress 线程内同步注册完整个 256 GiB arena。只能淘汰 refcount=0 的窗口，snapshot close 先释放窗口引用，不能逐请求 unregister。注册或 batch API 在任何 CUDA 提交前不可用时，才安全回退到原 gather→pinned-bounce/CPU-commit 路径。每条 lane、每个 snapshot 同时最多一个在途 CUDA batch；正式配置只使用两条经 Forward 隔离测试验证的 lane。
 - Host durable 或 Direct 成功后，及时删除 D 上该 request-generation 的 KV，不做无必要的保守保留。
 - P→D 接收、D→P Direct、D→P D2H、控制面推进均不得阻塞 Decode Forward。
@@ -186,6 +217,29 @@ Direct 与 Slow 必须有独立 I/O 队列，并与计算进度解耦。
 - 上述解耦同时适用于 TP=1 和 TP>1。
 - TP rank 0 维护唯一逻辑请求队列、状态机和路由决定；其他 rank 只执行广播的 shard 命令。
 - 一个逻辑 snapshot 的所有 rank 必须一起 claim、一起选择路径、一起提交、一起释放；禁止部分 rank Direct、部分 rank Slow。
+
+#### 多节点控制面迁移约束（2026-09-20，已通过限定 TP8 功能验证）
+
+- 新的多节点实现禁止运行时通过 NFS ledger、marker、目录扫描或文件锁协调
+  P/D 与 TP ranks；也不再用 `/dev/shm` 文件充当 TP 状态 mailbox。
+  Host Arena 的 CPU DRAM 数据面与这些小型控制记录是不同概念。
+- rank0 是唯一决策者，followers 只执行带 run/group/generation/attempt 身份的
+  命令，并报告本 rank 的实际完成或错误；收到命令不等于完成 DMA。
+- 状态变化经持久消息连接通知；scheduler 只读内存镜像、消费完成事件，
+  不能把原文件阻塞替换为每轮同步网络 RPC 或全量查询。
+- follower 状态只提交给 rank0；只有组级命令与决定需要下发给 followers，
+  不进行全 ranks 间的重复广播。新阶段不能覆盖尚未被全组执行确认的命令。
+- 断线、队列溢出及旧 attempt 消息不能被解释为传输完成；源 KV/目标 lease
+  的释放仍要求原有真实物理 fence。控制服务不能空状态重启后复用旧 run 的资源。
+- CPU/两节点协议测试不等于模型流水线或性能已经通过验收。Router、Host
+  生命周期、remote Host receipt 和 P-ready 的入口全部接入并通过独立审核前，
+  不得以旧的共享文件配置启动“无 NFS”多节点验收实验。
+- 当前 TCP 模式已完成上述入口接入与独立审核；a10=P/a11=D、每组 TP8、
+  Qwen3.5-122B-A10B 的限定功能验证通过 Direct、D→Host→P 和受容量反压触发的
+  P→Host→D，输出与参考逐 token 一致。Slow 最终交接必须在所有 rank 的异步
+  handed ACK 就绪后，由 rank0 统一 admit，不能按本地 ACK 提前进入 Prefill。
+  本次没有进行 c128 负载测试或全量 SWE 评测，不能据此声称长期无阻塞或吞吐达标。
+  详细证据与尚待验证项见本工作区 SGLang 的 `validation/TP_EVENT_CONTROL_PLAN.md`。
 
 ## 4. 物理所有权状态
 

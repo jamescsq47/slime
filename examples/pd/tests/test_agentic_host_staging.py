@@ -1096,10 +1096,16 @@ def test_d_waits_for_local_dma_before_acknowledging_abort():
     client._d2h_lanes = [
         {"snapshot_id": "req:0", "phase": "dma"}
     ]
-    assert client.progress(candidate, []) == "waiting"
+    # Physical cleanup must retain an in-flight write. Normal progress now
+    # finishes the immutable local write before consulting the shared abort;
+    # this minimal fixture tests its cleanup fence, not the full DMA pipeline.
+    assert client._cleanup_write(candidate) is False
     assert trace == ["event_query"]
     assert "arena_write" in candidate
     event.ready = True
+    assert client._cleanup_write(candidate) is True
+    assert trace == ["event_query", "event_query", "mapping_close"]
+    # Only after the physical fence may ABORTING acknowledge this writer.
     assert client.progress(candidate, []) == "waiting"
     assert trace == [
         "event_query",

@@ -1,6 +1,9 @@
 # MiniMax-M2.7：TP8 多节点适配与 colocated SWE500 验证
 
-当前只是代码/CPU 验证；没有在本机或远端运行 GPU，不提供虚构吞吐/正确率。
+当前没有完成模型级GPU评测，不提供吞吐/正确率。
+2026-09-17按用户要求在本机A100做了最小原生FP8 MoE算子检查，因SM80
+不支持该路径的`fp8e4nv`而失败，尚未启动500题；见
+`MINIMAX_M27_A100_PREFLIGHT.md`。下文早期CPU验证记录保留其当时范围。
 先运行单节点 colocated，再使用 `multinode.sh` 验证跨节点 Direct/Slow。
 
 ## 固定设置
@@ -14,7 +17,8 @@ EP=8 不改变 KV 的 TP8 切分。纯专家 TP8 的 intermediate1536/8=192
 - 一组8卡 collocated；所有 rank `mem_fraction_static=0.8`；c64。
 - 原 SWE-bench Verified 500题，source-order，各执行一次；不是64题。
 - 现有 Miles fenced-shell harness + Docker + inline 隐藏 verifier；不修改提示词或评分器。
-- 8192 tokens/turn、最多64轮、context131072；temperature0、top_p1、top_k=-1、seed2026。
+- 8192 tokens/turn、最多64轮、context131072；temperature=0.6、top_p=0.95、top_k=20、seed2026。
+  所有后续SWE-bench实验统一此采样配置；入口校验拒绝旧参数，不改变工具协议。
 - 每容器2CPU/4GiB；工具600秒；verifier2400秒/并发16。
 - finite evaluation，无300+1200秒稳态窗口，不称为正式吞吐对比；保留全程吞吐/轮次/长度/评分。
 - 没有 custom PD、HiCache、Mooncake、Mamba 开关；原生 Radix 正常使用。

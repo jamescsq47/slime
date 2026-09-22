@@ -399,7 +399,7 @@ def test_tp_host_load_failure_does_not_count_unfenced_peer_as_drained():
             pass
 
 
-def test_p2d_source_ready_failure_quarantines_without_publishing_terminal():
+def test_p2d_source_ready_failure_quarantines_without_publishing_terminal(monkeypatch):
     """An unprovable Prefill producer fence must retain P-HBM ownership."""
 
     snapshot_id = "p2d:source-ready-failure"
@@ -434,7 +434,8 @@ def test_p2d_source_ready_failure_quarantines_without_publishing_terminal():
         transition=lambda *args, **kwargs: transitions.append((args, kwargs))
     )
 
-    producer._worker(0, object(), object(), ())
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    producer._worker(0, SimpleNamespace(device=torch.device("cuda:0")), object(), ())
 
     assert transitions == []
     assert producer._active[snapshot_id] is record

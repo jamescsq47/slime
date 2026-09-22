@@ -15,7 +15,7 @@
   "p2d_host_gib_per_rank": 4,
   "fast_tool_seconds": 1,
   "direct_admission_seconds": 1,
-  "slow_congestion_recompute": true,
+  "slow_congestion_recompute": false,
   "slow_congestion_high": 32,
   "slow_congestion_low": 8,
   "router": {"node_id": "node-p", "engine_id": "router-0", "port": 30002, "metrics_port": 29000},

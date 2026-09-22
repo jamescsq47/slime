@@ -221,3 +221,4 @@ req_timeline.png
 # DualPD remote evaluation outputs; keep its reproducible experiment config.
 /runs/dualpd/
 !/tools/dualpd/minimax_swe.json
+!/tools/dualpd/qwen35_swe.json

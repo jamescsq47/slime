@@ -63,6 +63,10 @@ HISTOGRAMS = {
 
 
 def make_runtime_args(cli: argparse.Namespace, workload: Any | None = None) -> Namespace:
+    # Experiment policy, not a change to the harness or model defaults for other datasets.
+    if workload is not None and any(d.harness.startswith("swe_bench") for d in workload.datasets):
+        if (cli.temperature, cli.top_p, cli.top_k) != (0.6, 0.95, 20):
+            raise ValueError("SWE-bench requires --temperature 0.6 --top-p 0.95 --top-k 20")
     return Namespace(
         # Existing slime-compatible data/generation interface.
         hf_checkpoint=cli.model,

@@ -14,10 +14,10 @@ unset SGLANG_OVERLAY_ROOT
 export PATH="${PD_ENV_BIN}:${PATH}"
 export PYTHONPATH="${PD_DIR}:$(cd -- "${PD_DIR}/../.." && pwd)"
 export PYTHONDONTWRITEBYTECODE=1
-export PD_DATA_ROOT=/tmp/pd-data
+export PD_DATA_ROOT="${PD_DATA_ROOT:-/tmp/pd-data}"
 export PD_INFERENCE_RETURN_LOGPROB=false SLIME_HTTP_READ_TIMEOUT_SECONDS=86400
 export PD_MODEL_HTTP_TRANSPORT="${PD_MODEL_HTTP_TRANSPORT:-aiohttp}"
-export MODEL_PATH=/homes/siqic/Qwen3.5-9B
+export MODEL_PATH="${MODEL_PATH:-/homes/siqic/Qwen3.5-9B}"
 export WORKLOAD_CONFIG="${WORKLOAD_CONFIG:-${PD_DIR}/configs/experiments/swe_bench_verified_miles_pr51_8k_t64.yaml}"
 export MODEL_REASONING_PARSER="${MODEL_REASONING_PARSER:-qwen3}"
 export MAX_INFLIGHT="${MAX_INFLIGHT:-128}"

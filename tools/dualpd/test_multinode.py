@@ -31,6 +31,105 @@ class MultiNodePlanTests(unittest.TestCase):
         self.assertEqual(p["workers"][1]["environment"]["CUDA_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
         self.assertEqual(p["workers"][1]["host_capacity_gib_per_direction"]["d2p_source"], 64)
 
+    def test_workset_controller_is_opt_in_and_requires_socket_control(self):
+        for node in self.cfg["nodes"]:
+            self.assertEqual(m.worker_plan(self.cfg, node)["environment"][
+                "SGLANG_AGENTIC_P_WORKSET_CONTROLLER"], "false")
+        cfg = dict(self.cfg, p_workset_controller=True)
+        with self.assertRaisesRegex(ValueError, "requires socket control"):
+            self.validate(cfg)
+        cfg.update(control_backend="tcp", control={"node_id": self.cfg["nodes"][0]["node_id"],
+                   "port": 23904, "tp_port": 23905, "token": "test-token-for-controller-32-characters"})
+        self.validate(cfg)
+        for node in cfg["nodes"]:
+            self.assertEqual(m.worker_plan(cfg, node)["environment"][
+                "SGLANG_AGENTIC_P_WORKSET_CONTROLLER"], "true")
+
+    def test_model_info_retries_transient_http_protocol_error(self):
+        from unittest.mock import MagicMock
+        response = MagicMock(status=200)
+        response.__enter__.return_value = response
+        response.read.return_value = b'{}'
+        opener = MagicMock()
+        opener.open.side_effect = [m.http.client.BadStatusLine('GET /model_info HTTP/1.1'), response, response]
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener), patch.object(m.time, 'sleep'):
+            self.assertTrue(m.wait_ready(self.cfg, timeout=10)['workers_ready'])
+        self.assertEqual(opener.open.call_count, 3)
+
+    def test_model_info_protocol_error_still_obeys_deadline(self):
+        from unittest.mock import MagicMock
+        opener = MagicMock()
+        opener.open.side_effect = m.http.client.BadStatusLine('invalid')
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener), patch.object(m.time, 'sleep'), patch.object(m.time, 'monotonic', side_effect=[0, 0, 2]):
+            with self.assertRaisesRegex(RuntimeError, 'model_info barrier timed out'):
+                m.wait_ready(self.cfg, timeout=1)
+
+    def test_prewarm_barrier_requires_all_ranks_and_rejects_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = dict(self.cfg, control_root=directory)
+            status = m.host_prewarm_status(cfg)
+            self.assertFalse(status["ready"])
+            root = m.control_dir(cfg) / "host-register-prewarm"
+            self.assertTrue((root / "start").exists())
+            for node in cfg["nodes"]:
+                for rank in range(cfg["tp_size"]):
+                    participant = f'{node["role"]}-{node["engine_id"]}-rank-{rank}'
+                    m.atomic_json(root / "complete" / (participant + ".json"), {
+                        "role": node["role"], "engine_id": node["engine_id"],
+                        "tp_rank": rank, "registered_bytes": 1024,
+                    })
+            self.assertTrue(m.host_prewarm_status(cfg)["ready"])
+            m.atomic_json(root / "failed" / (participant + ".json"), {"error": "injected"})
+            with self.assertRaisesRegex(RuntimeError, "Host prewarm failed"):
+                m.host_prewarm_status(cfg)
+
+    def test_direct_only_prewarm_accepts_zero_only_for_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = dict(self.cfg, control_root=directory, d2p_host_staging=False)
+            m.host_prewarm_status(cfg)
+            root = m.control_dir(cfg) / "host-register-prewarm"
+            for node in cfg['nodes']:
+                for rank in range(cfg['tp_size']):
+                    participant = f'{node["role"]}-{node["engine_id"]}-rank-{rank}'
+                    record = dict(role=node['role'], engine_id=node['engine_id'], tp_rank=rank,
+                                  registered_bytes=0 if node['role'] == 'decode' else 1024,
+                                  arena_count=0 if node['role'] == 'decode' else 1)
+                    m.atomic_json(root / 'complete' / (participant + '.json'), record)
+            self.assertTrue(m.host_prewarm_status(cfg)['ready'])
+            with self.assertRaisesRegex(RuntimeError, 'invalid Host prewarm completion'):
+                m.host_prewarm_status(dict(cfg, d2p_host_staging=True))
+
+    def test_decode_abort_mailbox_is_local_and_run_engine_scoped(self):
+        key = "SGLANG_AGENTIC_KV_D_TP_CONTROL_DIR"
+        p, d = self.cfg["nodes"]
+        env = m.worker_plan(self.cfg, d)["environment"]
+        location = env[key]
+        self.assertTrue(location.startswith("/dev/shm/dualpd-tp/"))
+        self.assertEqual(Path(location).name, d["engine_id"])
+        self.assertEqual(env["SGLANG_PD_P_READY_DIR"], str(m.control_dir(self.cfg)))
+        self.assertNotIn(key, m.worker_plan(self.cfg, p)["environment"])
+        changed = copy.deepcopy(self.cfg)
+        changed["run_id"] += "-next"
+        self.assertNotEqual(location, m.worker_plan(changed, d)["environment"][key])
+        other_d = dict(d, engine_id="decode-other")
+        self.assertNotEqual(location, m.worker_plan(self.cfg, other_d)["environment"][key])
+        changed["tp_size"] = 1
+        self.assertNotIn(key, m.worker_plan(changed, d)["environment"])
+
+    def test_group_local_mailbox_scope_preserves_shared_control(self):
+        key = "SGLANG_AGENTIC_KV_TP_CONTROL_DIR"
+        p, d = self.cfg["nodes"]
+        pe = m.worker_plan(self.cfg, p)["environment"]
+        de = m.worker_plan(self.cfg, d)["environment"]
+        self.assertNotEqual(pe[key], de[key])
+        self.assertTrue(pe[key].startswith("/dev/shm/dualpd-tp/"))
+        self.assertEqual(pe["SGLANG_PD_P_READY_DIR"], de["SGLANG_PD_P_READY_DIR"])
+        changed = copy.deepcopy(self.cfg)
+        changed["run_id"] += "-next"
+        self.assertNotEqual(pe[key], m.worker_plan(changed, p)["environment"][key])
+        changed["tp_size"] = 1
+        self.assertNotIn(key, m.worker_plan(changed, p)["environment"])
+
     def test_refuse_other_experiment_listening_port(self):
         cfg = copy.deepcopy(self.cfg)
         with socket.socket() as occupied:
@@ -122,6 +221,21 @@ class MultiNodePlanTests(unittest.TestCase):
         self.assertEqual(env["SGLANG_AGENTIC_MULTINODE_CONTROL_ROOT"], self.cfg["control_root"])
         self.assertEqual(env["SGLANG_PD_P_READY_DIR"], str(m.control_dir(self.cfg)))
 
+    def test_backend_keepalive_outlasts_router_pool(self):
+        for node in self.cfg["nodes"]:
+            env = m.runtime_env(m.worker_plan(self.cfg, node))
+            self.assertEqual(env["SGLANG_TIMEOUT_KEEP_ALIVE"], "120")
+
+    def test_p2d_transfer_limit_reaches_decode_workers(self):
+        for node in self.cfg["nodes"]:
+            env = m.runtime_env(m.worker_plan(self.cfg, node))
+            self.assertEqual(env["SGLANG_PD_MAX_TRANSFER_INFLIGHT"], "0")
+        self.cfg["pd_max_transfer_inflight"] = 16
+        self.assertEqual(m.common_env(self.cfg)["SGLANG_PD_MAX_TRANSFER_INFLIGHT"], "16")
+        self.cfg["pd_max_transfer_inflight"] = -1
+        with self.assertRaisesRegex(ValueError, "pd_max_transfer_inflight"):
+            self.validate(self.cfg)
+
     def test_plans_match_engine_multinode_contract(self):
         import sys
         engine_path = ROOT.parents[2] / "sglang/python/sglang/srt/disaggregation/agentic_multinode.py"
@@ -205,12 +319,63 @@ class MultiNodePlanTests(unittest.TestCase):
         self.assertNotIn("HOST_IP", env)
         self.assertNotEqual(env["SGLANG_AGENTIC_KV_LEDGER_PATH"], "/old/ledger")
 
-    def test_full_method_congestion_defaults_and_optout(self):
+    def test_full_method_congestion_defaults_and_optin(self):
         env = m.common_env(self.cfg)
-        self.assertEqual(env["SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE"], "true")
+        self.assertEqual(env["SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE"], "false")
         self.assertEqual(env["SGLANG_AGENTIC_KV_SLOW_CONGESTION_HIGH"], "32")
-        self.cfg["slow_congestion_recompute"] = False
+        self.cfg.pop("slow_congestion_recompute")
         self.assertEqual(m.common_env(self.cfg)["SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE"], "false")
+        self.cfg["slow_congestion_recompute"] = True
+        self.assertEqual(m.common_env(self.cfg)["SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE"], "true")
+
+    def test_qwen35_new_method_memory_defaults(self):
+        self.cfg["model_family"] = "qwen35_moe"
+        for node in self.cfg["nodes"]:
+            command = m.worker_plan(self.cfg, node)["command"]
+            self.assertEqual(command[command.index("--mamba-full-memory-ratio") + 1], "0.5")
+        self.cfg["mamba_full_memory_ratio"] = 0.9
+        command = m.worker_plan(self.cfg, self.cfg["nodes"][0])["command"]
+        self.assertEqual(command[command.index("--mamba-full-memory-ratio") + 1], "0.9")
+
+    def test_tp_host_prepare_optin(self):
+        key = "SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE"
+        self.assertEqual(m.common_env(self.cfg)[key], "false")
+        self.cfg["tp_host_async_prepare"] = True
+        self.assertEqual(m.common_env(self.cfg)[key], "true")
+
+    def tcp_config(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["control_backend"] = "tcp"
+        cfg["control_root"] = "/run/dualpd-control"
+        cfg["control"] = {"node_id": cfg["router"]["node_id"],
+                          "port": 23904, "tp_port": 23905, "token": "x" * 48}
+        return self.validate(cfg)
+
+    def test_tcp_plan_uses_message_endpoints_not_tp_files(self):
+        cfg = self.tcp_config()
+        for node in cfg["nodes"]:
+            env = m.worker_plan(cfg, node)["environment"]
+            self.assertIn("SGLANG_AGENTIC_CONTROL_ENDPOINT", env)
+            self.assertEqual(env["SGLANG_AGENTIC_CONTROL_GROUP_ID"], node["engine_id"])
+            self.assertNotIn("SGLANG_AGENTIC_KV_TP_CONTROL_DIR", env)
+            self.assertNotIn("SGLANG_AGENTIC_KV_D_TP_CONTROL_DIR", env)
+            self.assertEqual(env["SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE"], "true")
+        broker = m.control_plan(cfg)
+        self.assertEqual(broker["environment"]["CUDA_VISIBLE_DEVICES"], "")
+        self.assertNotIn(cfg["control"]["token"], broker["command"])
+
+    def test_tcp_refuses_distributed_filesystem_checks(self):
+        cfg = self.tcp_config()
+        with self.assertRaisesRegex(ValueError, "shared-filesystem"):
+            m.fs_verify(cfg)
+        with self.assertRaisesRegex(ValueError, "file locks"):
+            m.lock_check(cfg, False)
+
+    def test_tcp_broker_ports_are_disjoint(self):
+        cfg = self.tcp_config()
+        cfg["control"]["port"] = cfg["router"]["port"]
+        with self.assertRaisesRegex(ValueError, "collides"):
+            self.validate(cfg)
 
 
 if __name__ == "__main__":

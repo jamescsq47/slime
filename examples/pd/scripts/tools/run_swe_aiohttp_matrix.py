@@ -19,6 +19,7 @@ import uuid
 PD = Path(__file__).resolve().parents[2]
 PY = '/homes/siqic/anaconda3/envs/pd_mamba_baseline/bin/python'
 ENGINE = Path('/homes/siqic/sglang-qwen35-integration')
+APPROVED_GPU_PROCESSES = None
 FATAL = ('Scheduler hit an exception', 'CUDA out of memory', 'CUDA error:',
          'Fatal Python error', 'Agentic CUDA worker failed',
          'Unable to fence NIXL sender handle', 'TP P->D shard submission failed',
@@ -134,11 +135,11 @@ def clean_owned(marker,label):
 
 def source_fingerprint():
     files=set(PD.glob('*.py'))
-    for directory in [PD/'data',PD/'scripts',PD/'configs/experiments',ENGINE/'python/sglang',ENGINE/'validation']:
-        files.update(p for p in directory.rglob('*') if p.is_file() and p.suffix in {'.py','.sh','.yaml'})
+    for directory in [PD/'data',PD/'scripts',PD/'configs/experiments',PD.parents[1]/'tools/dualpd',ENGINE/'python/sglang',ENGINE/'validation']:
+        files.update(p for p in directory.rglob('*') if p.is_file() and p.suffix in {'.py','.sh','.yaml','.json'})
     files.add(PD.parents[1]/'slime/utils/http_utils.py')
     # Include baseline admission/model code, not mutable caches or results.
-    baseline=Path(PY).parent.parent/'lib/python3.12/site-packages/sglang/srt'
+    baseline=Path('/homes/siqic/anaconda3/envs/pd_mamba_baseline/lib/python3.12/site-packages/sglang/srt')
     files.update(baseline/'managers'/n for n in ['scheduler.py','schedule_policy.py','schedule_batch.py'])
     files.add(baseline/'models/qwen3_5.py')
     files.add(Path('/tmp/pd-data/swe-bench-verified/test.jsonl'))
@@ -153,6 +154,9 @@ def check_sources(expected):
 
 
 def resources_available():
+    if APPROVED_GPU_PROCESSES is not None:
+        from swe9b_structured_matrix import gpu_processes_available
+        if not gpu_processes_available(APPROVED_GPU_PROCESSES):return False
     output=subprocess.check_output(['nvidia-smi','--query-gpu=memory.used','--format=csv,noheader,nounits'],text=True,timeout=15)
     mem=[int(x) for x in output.split()]
     disk=os.statvfs('/tmp/pd-persist')
@@ -209,7 +213,7 @@ def account_ownership(case,item,run):
     item['protocol_acceptance']='pending ownership audit'
 
 
-def run_matrix(root):
+def run_matrix(root, selected=None, strict=False):
     root.mkdir(parents=True,exist_ok=True)
     with (root/'controller.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -226,7 +230,7 @@ def run_matrix(root):
         signal.signal(signal.SIGTERM,cancel);signal.signal(signal.SIGINT,cancel)
         def save():state['checked_at']=time.time();atomic_json(status,state)
         save()
-        for i,case in enumerate(cases(),1):
+        for i,case in enumerate(selected if selected is not None else cases(),1):
             if stop:break
             run=root/f'{root.name}-{i:02d}-{case["name"]}'
             run.mkdir(exist_ok=False)
@@ -242,11 +246,22 @@ def run_matrix(root):
                     if stop:break
                     time.sleep(30)
                 if stop:break
+                if strict:
+                    disk=os.statvfs(root)
+                    if disk.f_bavail*disk.f_frsize < 100*2**30:
+                        raise RuntimeError('Output filesystem has less than 100 GiB free')
                 # Avoid inherited experimental toggles; preserve basic OS env.
                 allowed={'PATH','HOME','USER','LOGNAME','SHELL','LANG','LC_ALL','TZ','TMPDIR',
                          'SSH_AUTH_SOCK','DOCKER_HOST','DOCKER_CONTEXT','DOCKER_CONFIG'}
                 env={k:v for k,v in os.environ.items() if k in allowed}
                 env.update(case['env'],RUN_DIR=str(run),RESULTS_DIR=str(root/'archives'/run.name),PD_MATRIX_CASE_ID=marker)
+                if strict:
+                    # Retain Host backing/control after abnormal shutdown until
+                    # exact owned-process cleanup proves all DMA users exited.
+                    for key, suffix in [('SGLANG_AGENTIC_KV_SHARED_HOST_ARENA_DIR','d2p'),
+                                        ('SGLANG_AGENTIC_KV_P2D_SHARED_HOST_ARENA_DIR','p2d')]:
+                        env[key]=str(root/'host-control'/run.name/suffix)
+                    env['PD_MATRIX_HOST_CONTROL']=str(root/'host-control'/run.name)
                 assert not subprocess.check_output(['docker','ps','-aq','--filter',f'label=pd.swe.run_id={label}'],text=True,timeout=20).strip(), 'pre-existing run label'
                 atomic_json(run/'queue_case.json',dict(case,env=case['env'],marker=marker,label=label))
                 (run/'model_http_transport.py').write_bytes((PD/'model_http_transport.py').read_bytes())
@@ -287,6 +302,9 @@ def run_matrix(root):
                 config=read_json(run/'config.json',{})
                 if item['state']=='finished' and config.get('model_http_transport',{}).get('backend')!='aiohttp':
                     item.update(state='failed',health_failure='effective HTTP transport is not aiohttp')
+                if strict and item['state']=='finished':
+                    from swe9b_structured_matrix import validate_completed
+                    validate_completed(run, case)
                 atomic_json(run/'monitor.json',item);save()
                 # Each case is independently reported; a parser failure must
                 # not stop the remaining experiments or fabricate missing data.
@@ -323,7 +341,10 @@ def run_matrix(root):
             finally:
                 item['checked_at']=time.time();atomic_json(run/'monitor.json',item);save()
                 child=None
-        state.update(state='cancelled' if stop else 'finished',ended_at=time.time());save()
+            if strict and item['state']!='finished':
+                break
+        complete=all(c['state']=='finished' for c in state['cases']) and len(state['cases'])==len(selected if selected is not None else cases())
+        state.update(state='cancelled' if stop else ('finished' if complete else 'blocked'),ended_at=time.time());save()
 
 
 if __name__=='__main__':

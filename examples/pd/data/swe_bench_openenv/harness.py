@@ -122,7 +122,18 @@ Commands always start in /testbed, but shell state such as `cd` does not persist
 between turns. Do not merely describe a patch: edit the files in the repository.
 When the fix is complete, reply TASK_COMPLETE without calling a tool. The
 benchmark verifier is unavailable during your work and must not be searched for
-or modified."""
+or modified.
+
+The only tool name is shell; its required argument is command. Commands such as
+cat, grep, and python belong inside command, not in the tool name. Example:
+<tool_call>
+<function=shell>
+<parameter=command>
+cat /testbed/example.py
+</parameter>
+</function>
+</tool_call>
+When calling a tool, replace only the command text, keeping this outer structure."""
 
 _CONDA_PREFIX = (
     "if test -f /opt/miniconda3/bin/activate; then "
