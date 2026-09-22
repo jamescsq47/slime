@@ -35,8 +35,8 @@
 `ib_device` 可按各节点真实 NIC 显式填写，不从管理 IP 猜测 RDMA NIC。
 `numa_nodes` 按每个 GPU 所属 NUMA 填写，留空不强行错误绑定。
 
-示例 Host 容量是保守工程 smoke 值：每 rank D→P 8 GiB、P→D 4 GiB。
-TP8 总量分别64/32 GiB，正式实验应依据实际 DRAM预算统一修改并记录。
+默认 Host 容量为每 rank D→P 32 GiB、P→D 16 GiB；TP=8 时分别合计256 GiB和128 GiB。历史实验仍按其保存的配置解释。
+TP8 总量分别256/128 GiB；如实验显式覆盖容量，必须在结果中记录实际值。
 所有 rank 使用组内统一的 `mem_fraction_static`；若有搜索等共驻服务，需降到该组最紧张
 GPU可承受的值并与 baseline 对齐。不要自动启动搜索占满8张模型卡的某一张。
 

@@ -29,7 +29,7 @@ class MultiNodePlanTests(unittest.TestCase):
         p = m.plan(cfg)
         self.assertEqual(len(p["workers"]), 2)
         self.assertEqual(p["workers"][1]["environment"]["CUDA_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
-        self.assertEqual(p["workers"][1]["host_capacity_gib_per_direction"]["d2p_source"], 64)
+        self.assertEqual(p["workers"][1]["host_capacity_gib_per_direction"]["d2p_source"], 256)
 
     def test_workset_controller_is_opt_in_and_requires_socket_control(self):
         for node in self.cfg["nodes"]:

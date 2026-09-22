@@ -17,7 +17,7 @@
 - `openai_tools`、temperature=0.6、top_p=0.95、top_k=20；单轮8192、64轮、累计81920。
 - c64、SWE-bench Verified500 source-order 各一次，inline verifier；不是300+1200吞吐验收。
 - 快工具阈值2秒、Direct建链1秒；拥堵重算关闭（历史r10及以前曾启用Q32/8）。原生HiCache/Mooncake关闭。
-- D→P Host仅在D源节点：16GiB/rank，共128GiB；P→D Host仅在P源节点：8GiB/rank，共64GiB。
+- D→P Host仅在D源节点：默认32GiB/rank，共256GiB；P→D Host仅在P源节点：默认16GiB/rank，共128GiB。历史实验按各自保存的配置解释，不追溯改写。
 - IB接口10.0.1.170/171，mlx5_1:1，报告200Gb/s；尚不能把链路速率当成实测带宽/GDR证明。
 - 数据面为NIXL GPU→GPU / 本地GPU→DRAM→远端GPU。NFS只存控制元数据和结果，不存KV payload。
 

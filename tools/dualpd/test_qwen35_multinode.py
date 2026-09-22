@@ -28,8 +28,8 @@ class QwenMultinodeTests(unittest.TestCase):
             self.assertEqual(p['environment']['UCX_NET_DEVICES'], 'mlx5_1:1')
             self.assertNotIn('--enable-hierarchical-cache', argv)
             self.assertEqual(p['environment']['SGLANG_AGENTIC_KV_TP_HOST_ASYNC_PREPARE'], 'true')
-        self.assertEqual(workers[0]['host_capacity_gib_per_direction']['p2d_source'], 64)
-        self.assertEqual(workers[1]['host_capacity_gib_per_direction']['d2p_source'], 128)
+        self.assertEqual(workers[0]['host_capacity_gib_per_direction']['p2d_source'], 128)
+        self.assertEqual(workers[1]['host_capacity_gib_per_direction']['d2p_source'], 256)
         for worker in workers:
             env = worker['environment']
             self.assertEqual(env['SGLANG_AGENTIC_KV_FAST_TOOL_THRESHOLD'], '1')
@@ -80,7 +80,7 @@ class QwenMultinodeTests(unittest.TestCase):
             self.assertEqual(after['host_capacity_gib_per_direction']['d2p_source'], 0)
         self.assertEqual(m.workload_plan(self.cfg)['command'],
                          m.workload_plan(dict(self.cfg, d2p_host_staging=True))['command'])
-        self.assertEqual(ablation['workers'][0]['host_capacity_gib_per_direction']['p2d_source'], 64)
+        self.assertEqual(ablation['workers'][0]['host_capacity_gib_per_direction']['p2d_source'], 128)
 
     def test_reverse_host_flag_must_be_boolean(self):
         self.cfg['d2p_host_staging'] = 'false'

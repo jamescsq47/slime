@@ -50,7 +50,7 @@ def config(run, concurrency=None):
                tp_host_async_prepare=True,
                router_startup_timeout_seconds=1800,
                router_profile_imports=True,
-               d2p_host_gib_per_rank=16, p2d_host_gib_per_rank=8)
+               d2p_host_gib_per_rank=32, p2d_host_gib_per_rank=16)
     for n, node, ip in zip(cfg["nodes"], ["a10", "a11"], ["10.0.1.170", "10.0.1.171"]):
         # Keep listeners outside both nodes' ephemeral range (32768-60999).
         n.update(node_id=node, host_ip=ip, port=23900,
