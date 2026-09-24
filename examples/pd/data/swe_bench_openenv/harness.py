@@ -425,7 +425,14 @@ async def _model_turn(
             # token list precedence over this hint.
             params["custom_params"]["agentic_prompt_token_count"] = len(input_ids)
             payload["custom_params"] = params["custom_params"]
-            payload["extra_key"] = build_agentic_extra_key(request_id, params)
+            envelope = build_agentic_extra_key(request_id, params)
+            payload["extra_key"] = envelope
+            # The native Rust PD router keeps standard OpenAI Chat fields but
+            # drops backend-only extensions.  Mirror the opaque, validated
+            # envelope in ``user``; SGLang restores it only when extra_key was
+            # absent after routing.  No lifecycle state or payload touches a
+            # shared filesystem.
+            payload["user"] = envelope
         payload = {key: value for key, value in payload.items() if value is not None}
         url = (
             f"http://{args.sglang_router_ip}:{args.sglang_router_port}"

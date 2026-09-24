@@ -352,6 +352,7 @@ def test_openenv_chat_completions_carries_agentic_lifecycle_metadata(monkeypatch
     assert custom["agentic_prompt_token_count"] == 2
     assert captured["payload"]["input_ids"] == [0, 1]
     assert captured["payload"]["extra_key"].startswith("agentic-v1e:")
+    assert captured["payload"]["user"] == captured["payload"]["extra_key"]
 
 
 def test_openenv_episode_grades_durable_patch_after_policy_stops(monkeypatch):
