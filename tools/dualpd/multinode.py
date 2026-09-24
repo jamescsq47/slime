@@ -47,6 +47,8 @@ def _port(value, field):
 
 def load_config(path):
     cfg = json.loads(Path(path).read_text())
+    if cfg.get("model_family", "qwen3") not in {"qwen3", "qwen35_moe"}:
+        raise ValueError("unsupported multi-node model family")
     if not NAME.fullmatch(cfg.get("run_id", "")):
         raise ValueError("invalid run_id")
     for key in ("local_root", "sglang_root", "slime_root", "model_path", "python"):
@@ -181,7 +183,7 @@ def group_env(cfg, node):
 
 def common_env(cfg):
     # No control_root, marker directory, runtime ledger, or NFS polling knobs.
-    return {
+    env = {
         "SGLANG_AGENTIC_MULTINODE_ENABLED": "1",
         "SGLANG_AGENTIC_MULTINODE_PEER_TP_SIZE": str(cfg["tp_size"]),
         "PD_INFERENCE_RETURN_LOGPROB": "false",
@@ -202,6 +204,19 @@ def common_env(cfg):
         "SGLANG_AGENTIC_MULTINODE_DECODE_GROWTH_TOKENS": str(cfg["decode_growth_tokens"]),
         "PYTHONPATH": str(Path(cfg["sglang_root"]) / "python") + ":" + cfg["slime_root"],
     }
+    if cfg.get("model_family") == "qwen35_moe":
+        env.update(
+            {
+                "SGLANG_AGENTIC_MULTINODE_QWEN35_HYBRID": "1",
+                "SGLANG_AGENTIC_KV_CUSTOM_STORAGE_ONLY": "true",
+                "SGLANG_AGENTIC_KV_MAMBA_PROMPT_CHECKPOINT": "true",
+                "SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED": "true",
+                "SGLANG_AGENTIC_KV_APP_OWNS_TERMINATION": "true",
+            }
+        )
+    if cfg.get("cuda_home"):
+        env["CUDA_HOME"] = str(Path(cfg["cuda_home"]))
+    return env
 
 
 def worker_plan(cfg, node):
@@ -218,6 +233,12 @@ def worker_plan(cfg, node):
         "SGLANG_AGENTIC_KV_ENGINE_ID": node["engine_id"],
         "SGLANG_AGENTIC_KV_DIRECT_BOOTSTRAP_PORT": str(node["reverse_bootstrap_port"]),
     })
+    if node.get("ucx_net_devices"):
+        env["UCX_NET_DEVICES"] = str(node["ucx_net_devices"])
+    if cfg.get("local_triton_cache", False):
+        env["TRITON_CACHE_DIR"] = str(
+            Path(cfg["local_root"]) / "compiler-cache" / node["engine_id"] / "triton"
+        )
     if node.get("numa_nodes"):
         env["SGLANG_AGENTIC_KV_TP_NUMA_NODES"] = ",".join(map(str, node["numa_nodes"]))
     prefill_nodes = [n for n in cfg["nodes"] if n["role"] == "prefill"]
@@ -232,6 +253,29 @@ def worker_plan(cfg, node):
     if node["role"] == "prefill":
         command += ["--chunked-prefill-size", str(cfg["chunked_prefill_size"]),
                     "--max-prefill-tokens", str(cfg["max_prefill_tokens"])]
+    if cfg.get("model_family") == "qwen35_moe":
+        command += [
+            "--trust-remote-code",
+            "--dtype", "bfloat16",
+            "--kv-cache-dtype", "bfloat16",
+            "--ep-size", "1",
+            "--reasoning-parser", "glm45",
+            "--tool-call-parser", "qwen3_coder",
+            "--attention-backend", "triton",
+            "--linear-attn-backend", "triton",
+            "--moe-runner-backend", "triton",
+            "--sampling-backend", "flashinfer",
+            "--mamba-scheduler-strategy", "extra_buffer",
+            "--mamba-track-interval", "64",
+            "--mamba-full-memory-ratio",
+            str(
+                cfg.get(
+                    f"{node['role']}_mamba_full_memory_ratio",
+                    cfg.get("mamba_full_memory_ratio", 0.5),
+                )
+            ),
+            "--random-seed", str(cfg.get("seed", 2026)),
+        ]
     if node.get("numa_nodes"):
         command += ["--numa-node"] + list(map(str, node["numa_nodes"]))
     if node.get("ib_device"):

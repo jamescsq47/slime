@@ -118,6 +118,34 @@ class MultiNodeV2PlanTests(unittest.TestCase):
             loaded = self.validate(cfg)
             self.assertEqual(len(m.plan(loaded)["workers"][0]["rank_environments"]), tp)
 
+    def test_qwen35_plan_restores_hybrid_runtime_contract(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg.update(
+            {
+                "model_family": "qwen35_moe",
+                "prefill_mamba_full_memory_ratio": 0.75,
+                "decode_mamba_full_memory_ratio": 0.5,
+                "seed": 2026,
+            }
+        )
+        result = m.plan(self.validate(cfg))
+        for node, worker in zip(cfg["nodes"], result["workers"]):
+            env = worker["environment"]
+            command = worker["command"]
+            self.assertEqual(env["SGLANG_AGENTIC_MULTINODE_QWEN35_HYBRID"], "1")
+            self.assertEqual(env["SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED"], "true")
+            self.assertIn("--mamba-full-memory-ratio", command)
+            expected = "0.75" if node["role"] == "prefill" else "0.5"
+            self.assertEqual(command[command.index("--mamba-full-memory-ratio") + 1], expected)
+            self.assertIn("--tool-call-parser", command)
+            self.assertEqual(command[command.index("--tool-call-parser") + 1], "qwen3_coder")
+
+    def test_unknown_model_family_is_rejected(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["model_family"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "unsupported multi-node model family"):
+            self.validate(cfg)
+
     def test_runtime_scrubs_another_experiment_environment(self):
         worker = m.worker_plan(self.validate(), self.cfg["nodes"][0])
         with patch.dict(m.os.environ, {"SGLANG_AGENTIC_KV_LEDGER_PATH": "/old", "HOST_IP": "127.0.0.1"}):
