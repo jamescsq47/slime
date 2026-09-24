@@ -63,6 +63,7 @@ class MultiNodeV2PlanTests(unittest.TestCase):
             result["router"]["command"][:3],
             [self.cfg["python"], "-m", "sglang_router.launch_router"],
         )
+        self.assertIn("--mini-lb", result["router"]["command"])
         self.assertNotIn(
             "launch_late_binding_router.py", result["router"]["command"]
         )

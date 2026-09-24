@@ -315,12 +315,13 @@ def router_plan(cfg):
                 "SGLANG_AGENTIC_MULTINODE_ROLE": "router",
                 "SGLANG_AGENTIC_MULTINODE_HOST_IP": node["host_ip"],
                 "SGLANG_HOST_IP": node["host_ip"], "CUDA_VISIBLE_DEVICES": ""})
-    # V2 currently has exactly one P group and one D group.  The stock router
-    # only delivers request metadata; actual D memory admission is still
-    # late-bound by the V2 controller.  The old late-binding router is not
-    # usable here because it coordinates through P_READY files and ledgers.
+    # V2 currently has exactly one P group and one D group.  Use the stock
+    # Python MiniLB as a transparent PD HTTP relay: unlike the Rust router's
+    # strict OpenAI normalization it preserves the immutable lifecycle
+    # envelope.  All ownership, admission and transfer decisions remain in
+    # the TCP V2 controller; MiniLB keeps no filesystem control state.
     command = [cfg["python"], "-m", "sglang_router.launch_router",
-               "--pd-disaggregation", "--policy", "random", "--host", "0.0.0.0",
+               "--mini-lb", "--pd-disaggregation", "--policy", "random", "--host", "0.0.0.0",
                "--port", str(router["port"]), "--prometheus-port", str(router["metrics_port"]),
                "--health-check-timeout-secs", "60", "--health-failure-threshold", "10"]
     for worker in cfg["nodes"]:
