@@ -139,6 +139,9 @@ class MultiNodeV2PlanTests(unittest.TestCase):
             self.assertEqual(command[command.index("--mamba-full-memory-ratio") + 1], expected)
             self.assertIn("--tool-call-parser", command)
             self.assertEqual(command[command.index("--tool-call-parser") + 1], "qwen3_coder")
+            self.assertEqual(
+                env["PATH"].split(m.os.pathsep)[0], str(Path(cfg["python"]).parent)
+            )
 
     def test_unknown_model_family_is_rejected(self):
         cfg = copy.deepcopy(self.cfg)

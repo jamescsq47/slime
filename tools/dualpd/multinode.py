@@ -184,6 +184,12 @@ def group_env(cfg, node):
 def common_env(cfg):
     # No control_root, marker directory, runtime ledger, or NFS polling knobs.
     env = {
+        # Workers are commonly launched through a non-interactive SSH shell.
+        # Keep JIT build tools (notably ninja) from the selected environment
+        # available even when that shell does not activate conda.
+        "PATH": str(Path(cfg["python"]).parent)
+        + os.pathsep
+        + os.environ.get("PATH", ""),
         "SGLANG_AGENTIC_MULTINODE_ENABLED": "1",
         "SGLANG_AGENTIC_MULTINODE_PEER_TP_SIZE": str(cfg["tp_size"]),
         "PD_INFERENCE_RETURN_LOGPROB": "false",
