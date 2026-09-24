@@ -463,6 +463,9 @@ def check_listen_ports(cfg, component, kind):
         ports = []
     for port in ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # Match the long-lived servers: a closed connection in TIME_WAIT
+            # is not a live listener and must not prevent a clean restart.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("0.0.0.0", port))
             except OSError as exc:
