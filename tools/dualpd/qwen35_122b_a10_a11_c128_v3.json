@@ -1,5 +1,5 @@
 {
-  "run_id": "qwen35-122b-tp8-v3-c128-r1",
+  "run_id": "qwen35-122b-tp8-v3-c128-r3",
   "local_root": "/tmp/dualpd-v3",
   "sglang_root": "/homes/siqic/dualpd/pd_multi_node_v3/sglang",
   "slime_root": "/homes/siqic/dualpd/pd_multi_node_v3/slime",
@@ -89,7 +89,7 @@
     "--max-response-length",
     "81920",
     "--output-dir",
-    "/homes/siqic/dualpd/pd_multi_node_v3/slime/runs/dualpd/qwen35-122b-tp8-v3-c128-r1/workload"
+    "/homes/siqic/dualpd/pd_multi_node_v3/slime/runs/dualpd/qwen35-122b-tp8-v3-c128-r3/workload"
   ],
   "nodes": [
     {
