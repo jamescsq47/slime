@@ -185,6 +185,7 @@ local/
 *.out
 *.pkl
 *.json
+!tools/dualpd/qwen35_122b_a10_a11_c128_v3.json
 *.code-workspace
 
 .idea

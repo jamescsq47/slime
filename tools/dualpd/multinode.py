@@ -208,6 +208,10 @@ def common_env(cfg):
         "SGLANG_AGENTIC_MULTINODE_DIRECT_WINDOW_SECONDS": str(cfg["fast_tool_seconds"]),
         "SGLANG_AGENTIC_MULTINODE_DIRECT_ADMISSION_SECONDS": str(cfg["direct_admission_seconds"]),
         "SGLANG_AGENTIC_MULTINODE_DECODE_GROWTH_TOKENS": str(cfg["decode_growth_tokens"]),
+        # V3 validates the two real D->P ownership paths.  Do not inherit a
+        # recompute experiment from the shell and silently add a third path.
+        "SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE": "false",
+        "SGLANG_AGENTIC_KV_SLOW_CONGESTION_RECOMPUTE": "false",
         "PYTHONPATH": str(Path(cfg["sglang_root"]) / "python") + ":" + cfg["slime_root"],
     }
     if cfg.get("model_family") == "qwen35_moe":
