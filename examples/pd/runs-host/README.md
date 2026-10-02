@@ -48,7 +48,7 @@ No-reverse 和原生 HiCache/Mooncake 不使用当前新方法的这套 Direct/S
 
 ## Canonical experiment matrices
 
-当前维护以下六个主实验矩阵；空白项表示正式实验尚未完成：
+当前维护以下八个主实验矩阵；空白项表示正式实验尚未完成：
 
 - [BrowseComp + Qwen3-8B](BROWSECOMP_QWEN3_8B.md)
 - [BrowseComp + Qwen3-8B Ablations](BROWSECOMP_QWEN3_8B_ABLATIONS.md)
@@ -56,6 +56,8 @@ No-reverse 和原生 HiCache/Mooncake 不使用当前新方法的这套 Direct/S
 - [Retool + BrowseComp 1:1 + Qwen3-8B](MIXED_1TO1_QWEN3_8B.md)
 - [Retool + BrowseComp 1:1 + Qwen3-8B Ablations](MIXED_1TO1_QWEN3_8B_ABLATIONS.md)
 - [SWE-bench Verified + Qwen3.5-27B TP=2](SWEBENCH_QWEN35_27B_TP2.md)
+- [SWE-bench Verified + Qwen3.5-27B TP=2 · 双节点阶段对比](SWEBENCH_QWEN35_27B_TP2_TWO_NODE.md)
+- [SWE-bench Verified + Qwen3.8-27B TP=2 · 双节点对比](SWEBENCH_QWEN38_27B_TP2.md)
 
 重构前的新方法结果只作为 archive 历史记录，不回填到这六个矩阵；与新方法
 重构无关的 colocated、No-reverse 和原生 Mooncake baseline 可以继续使用。

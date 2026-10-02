@@ -274,6 +274,8 @@ def test_openenv_chat_completions_exposes_official_shell_tool_call(monkeypatch):
     assert captured["url"].endswith("/v1/chat/completions")
     assert captured["payload"]["tool_choice"] == "auto"
     assert captured["payload"]["parallel_tool_calls"] is False
+    assert "</tool_call>" in captured["payload"]["stop"]
+    assert captured["payload"]["no_stop_trim"] is True
     assert captured["payload"]["tools"][0]["function"]["name"] == "shell"
     assert reply == ""
     assert output_ids == []

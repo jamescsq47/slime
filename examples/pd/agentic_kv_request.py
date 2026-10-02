@@ -147,10 +147,32 @@ def confirm_agentic_generation_final(
     """Best-effort application ACK that this generation ended the trajectory."""
 
     p_ready_dir = p_ready_dir or os.getenv("PD_P_READY_DIR", "")
-    if not lifecycle_enabled() or not reverse_reuse_enabled() or not p_ready_dir:
+    callback = os.getenv("PD_AGENTIC_FINAL_CALLBACK_URL", "").strip()
+    if not lifecycle_enabled() or not reverse_reuse_enabled():
         return False
     request_id = trajectory_metadata.get(REQUEST_ID_KEY)
     if request_id is None:
+        return False
+    if callback:
+        try:
+            import json
+            import urllib.request
+
+            body = json.dumps(
+                {"request_id": str(request_id), "generation": int(generation)},
+                separators=(",", ":"),
+            ).encode()
+            request = urllib.request.Request(
+                callback,
+                data=body,
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=2.0) as response:
+                return response.status == 200
+        except (OSError, TypeError, ValueError):
+            return False
+    if not p_ready_dir:
         return False
     try:
         from sglang.srt.disaggregation.agentic_early_claim import (

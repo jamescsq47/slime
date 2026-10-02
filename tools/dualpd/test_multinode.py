@@ -59,14 +59,44 @@ class MultiNodeV2PlanTests(unittest.TestCase):
             self.assertFalse(any("METADATA_DIR" in key for key in env))
             self.assertTrue(legacy_v1_keys.isdisjoint(env))
             self.assertNotIn("SGLANG_AGENTIC_GROUP_RANK", env)
-        self.assertEqual(
-            result["router"]["command"][:3],
-            [self.cfg["python"], "-m", "sglang_router.launch_router"],
+        self.assertEqual(result["router"]["command"][0], self.cfg["python"])
+        self.assertTrue(
+            result["router"]["command"][1].endswith(
+                "tools/dualpd/global_pd_router.py"
+            )
         )
         self.assertIn("--mini-lb", result["router"]["command"])
         self.assertNotIn(
             "launch_late_binding_router.py", result["router"]["command"]
         )
+        self.assertEqual(
+            result["router"]["environment"][
+                "DUALPD_ROUTER_DECODE_RESERVATION_SECONDS"
+            ],
+            "3600.0",
+        )
+        for worker in result["workers"]:
+            self.assertTrue(
+                worker["environment"][
+                    "SGLANG_AGENTIC_DECODE_RESERVATION_CALLBACK_URL"
+                ].endswith("/dualpd/decode_materialized")
+            )
+            self.assertEqual(
+                worker["environment"][
+                    "SGLANG_AGENTIC_MULTINODE_D2P_SHARED_NETWORK_LANES"
+                ],
+                worker["environment"][
+                    "SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES"
+                ],
+            )
+            self.assertEqual(
+                worker["environment"][
+                    "SGLANG_AGENTIC_MULTINODE_P2D_SHARED_NETWORK_LANES"
+                ],
+                worker["environment"][
+                    "SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES"
+                ],
+            )
 
     def test_same_parent_env_yields_eight_explicit_rank_identities(self):
         worker = m.worker_plan(self.validate(), self.cfg["nodes"][0])
@@ -126,6 +156,18 @@ class MultiNodeV2PlanTests(unittest.TestCase):
                 "model_family": "qwen35_moe",
                 "prefill_mamba_full_memory_ratio": 0.75,
                 "decode_mamba_full_memory_ratio": 0.5,
+                "direct_lanes": 8,
+                "d2p_direct_lanes": 4,
+                "p2d_direct_lanes": 8,
+                "host_lanes": 6,
+                "shared_network_lanes": 24,
+                "d2p_shared_network_lanes": 16,
+                "p2d_shared_network_lanes": 20,
+                "d2p_direct_network_reserve": 4,
+                "d2p_host_network_reserve": 8,
+                "nixl_progress_threads": 16,
+                "p2d_direct_network_reserve": 2,
+                "p2d_late_bind_grace_seconds": 2.5,
                 "seed": 2026,
             }
         )
@@ -135,6 +177,36 @@ class MultiNodeV2PlanTests(unittest.TestCase):
             command = worker["command"]
             self.assertEqual(env["SGLANG_AGENTIC_MULTINODE_QWEN35_HYBRID"], "1")
             self.assertEqual(env["SGLANG_AGENTIC_KV_MAMBA_REQUEST_OWNED"], "true")
+            self.assertEqual(env["SGLANG_AGENTIC_MULTINODE_DIRECT_LANES"], "8")
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_D2P_DIRECT_LANES"], "4"
+            )
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_P2D_DIRECT_LANES"], "8"
+            )
+            self.assertEqual(env["SGLANG_AGENTIC_MULTINODE_HOST_LANES"], "6")
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES"], "24"
+            )
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_D2P_SHARED_NETWORK_LANES"], "16"
+            )
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_P2D_SHARED_NETWORK_LANES"], "20"
+            )
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_D2P_DIRECT_NETWORK_RESERVE"], "4"
+            )
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_D2P_HOST_NETWORK_RESERVE"], "8"
+            )
+            self.assertEqual(env["SGLANG_AGENTIC_NIXL_PROGRESS_THREADS"], "16")
+            self.assertEqual(
+                env["SGLANG_AGENTIC_MULTINODE_P2D_DIRECT_NETWORK_RESERVE"], "2"
+            )
+            self.assertEqual(
+                env["SGLANG_AGENTIC_P2D_LATE_BIND_GRACE_SECONDS"], "2.5"
+            )
             self.assertIn("--mamba-full-memory-ratio", command)
             expected = "0.75" if node["role"] == "prefill" else "0.5"
             self.assertEqual(command[command.index("--mamba-full-memory-ratio") + 1], expected)

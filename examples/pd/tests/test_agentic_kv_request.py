@@ -66,6 +66,40 @@ def test_final_confirmation_uses_environment_ready_dir(monkeypatch):
         ) is not None
 
 
+def test_final_confirmation_uses_multinode_callback_without_shared_files(
+    monkeypatch,
+):
+    seen = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def open_request(request, timeout):
+        seen.append((json.loads(request.data), timeout))
+        return Response()
+
+    monkeypatch.setenv("SGLANG_AGENTIC_KV_LIFECYCLE", "true")
+    monkeypatch.delenv("PD_P_READY_DIR", raising=False)
+    monkeypatch.setenv(
+        "PD_AGENTIC_FINAL_CALLBACK_URL",
+        "http://router/dualpd/application_final",
+    )
+    monkeypatch.setattr("urllib.request.urlopen", open_request)
+
+    assert confirm_agentic_generation_final(
+        {"agentic_request_id": "done-over-tcp"}, 9, p_ready_dir=""
+    )
+    assert seen == [
+        ({"request_id": "done-over-tcp", "generation": 9}, 2.0)
+    ]
+
+
 def test_tool_confirmation_uses_environment_ready_dir(monkeypatch):
     with tempfile.TemporaryDirectory(dir="/dev/shm") as ready_dir:
         monkeypatch.setenv("SGLANG_AGENTIC_KV_LIFECYCLE", "true")

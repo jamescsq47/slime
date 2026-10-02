@@ -1,5 +1,5 @@
 {
-  "run_id": "qwen35-122b-tp8-v3-c128-r4",
+  "run_id": "qwen35-122b-tp8-v3-c128-r22-a10-a11-decoupled",
   "local_root": "/tmp/dualpd-v3",
   "sglang_root": "/homes/siqic/dualpd/pd_multi_node_v3/sglang",
   "slime_root": "/homes/siqic/dualpd/pd_multi_node_v3/slime",
@@ -8,6 +8,7 @@
   "model_family": "qwen35_moe",
   "cuda_home": "/homes/siqic/cuda-12.8",
   "local_triton_cache": true,
+  "debug_memory_pool": false,
   "tp_size": 8,
   "page_size": 64,
   "context_length": 131072,
@@ -89,7 +90,7 @@
     "--max-response-length",
     "81920",
     "--output-dir",
-    "/homes/siqic/dualpd/pd_multi_node_v3/slime/runs/dualpd/qwen35-122b-tp8-v3-c128-r4/workload"
+    "/homes/siqic/dualpd/pd_multi_node_v3/slime/runs/dualpd/qwen35-122b-tp8-v3-c128-r22-a10-a11-decoupled/workload"
   ],
   "nodes": [
     {

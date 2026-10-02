@@ -415,6 +415,21 @@ async def _model_turn(
                     "parallel_tool_calls": False,
                 }
             )
+            # Some OpenAI-compatible servers expose ``parallel_tool_calls``
+            # but leave enforcement to the model's chat template.  Qwen3.8's
+            # template can consequently emit several XML tool calls in one
+            # assistant turn even though this harness has a deliberately
+            # single-action contract.  Stop after the first complete call and
+            # retain its closing tag so SGLang's tool parser can consume it.
+            tool_stop = "</tool_call>"
+            configured_stop = payload.get("stop")
+            if configured_stop is None:
+                payload["stop"] = [tool_stop]
+            elif isinstance(configured_stop, str):
+                payload["stop"] = [configured_stop, tool_stop]
+            elif tool_stop not in configured_stop:
+                payload["stop"] = [*configured_stop, tool_stop]
+            payload["no_stop_trim"] = True
         if request_id is not None:
             # Chat Completions accepts the same SGLang extensions as
             # /generate.  Carry both fields: custom_params reaches the

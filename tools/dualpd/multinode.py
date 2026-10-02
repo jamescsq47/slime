@@ -64,12 +64,10 @@ def load_config(path):
     nodes = cfg.get("nodes", [])
     if len(nodes) < 2 or {n.get("role") for n in nodes} != {"prefill", "decode"}:
         raise ValueError("at least one P and one D node required")
-    if len(nodes) != 2:
-        raise ValueError("V2 launcher currently requires exactly one P and one D TP group")
-    for field in ("node_id", "engine_id", "host_ip"):
+    for field in ("node_id", "engine_id"):
         values = [n.get(field) for n in nodes]
         if len(set(values)) != len(values):
-            raise ValueError("one engine group per host; duplicate " + field)
+            raise ValueError("duplicate " + field)
     worker_ports = ("port", "bootstrap_port", "reverse_bootstrap_port")
     for n in nodes:
         for field in ("node_id", "engine_id"):
@@ -90,6 +88,14 @@ def load_config(path):
             _port(n.get(field), n["node_id"] + "." + field)
         if len({n[p] for p in worker_ports}) != len(worker_ports):
             raise ValueError("listener ports must be distinct on each host")
+    for host in {n["host_ip"] for n in nodes}:
+        hosted = [n for n in nodes if n["host_ip"] == host]
+        ports = [n[field] for n in hosted for field in worker_ports]
+        if len(set(ports)) != len(ports):
+            raise ValueError("worker listener ports overlap on host " + host)
+        gpus = [gpu for n in hosted for gpu in n["gpus"]]
+        if len(set(gpus)) != len(gpus):
+            raise ValueError("TP groups overlap physical GPUs on host " + host)
 
     for key in ("d2p_host_gib_per_rank", "p2d_host_gib_per_rank"):
         if type(cfg.get(key)) not in (float, int) or not math.isfinite(cfg[key]) or cfg[key] <= 0:
@@ -157,8 +163,11 @@ def control_endpoint(cfg):
 
 
 def link_id(cfg):
-    # V2 currently has one P<->D link. Multiple links can be emitted later
-    # without changing rank identity or the relay wire protocol.
+    configured = str(cfg.get("group_id", "")).strip()
+    if configured:
+        if not NAME.fullmatch(configured):
+            raise ValueError("invalid group_id")
+        return configured
     p = next(n for n in cfg["nodes"] if n["role"] == "prefill")
     d = next(n for n in cfg["nodes"] if n["role"] == "decode")
     return p["engine_id"] + "--" + d["engine_id"]
@@ -167,6 +176,14 @@ def link_id(cfg):
 def group_env(cfg, node):
     peer = next(item for item in cfg["nodes"] if item["role"] != node["role"])
     prefill = next(item for item in cfg["nodes"] if item["role"] == "prefill")
+    endpoints = [
+        {
+            "endpoint_group": item["engine_id"],
+            "role": item["role"],
+            "size": cfg["tp_size"],
+        }
+        for item in cfg["nodes"]
+    ]
     return {
         "SGLANG_AGENTIC_GROUP_ENDPOINT": control_endpoint(cfg),
         "SGLANG_AGENTIC_GROUP_RUN_ID": cfg["run_id"],
@@ -178,6 +195,9 @@ def group_env(cfg, node):
         "SGLANG_AGENTIC_GROUP_PEER_ROLE": peer["role"],
         "SGLANG_AGENTIC_GROUP_COORDINATOR_GROUP": prefill["engine_id"],
         "SGLANG_AGENTIC_GROUP_SIZE": str(cfg["tp_size"]),
+        "SGLANG_AGENTIC_GROUP_ENDPOINTS": json.dumps(
+            endpoints, sort_keys=True, separators=(",", ":")
+        ),
     }
 
 
@@ -207,7 +227,58 @@ def common_env(cfg):
         "SGLANG_AGENTIC_KV_DIRECT_HANDSHAKE_TIMEOUT": str(cfg["direct_admission_seconds"]),
         "SGLANG_AGENTIC_MULTINODE_DIRECT_WINDOW_SECONDS": str(cfg["fast_tool_seconds"]),
         "SGLANG_AGENTIC_MULTINODE_DIRECT_ADMISSION_SECONDS": str(cfg["direct_admission_seconds"]),
+        "SGLANG_AGENTIC_P2D_LATE_BIND_GRACE_SECONDS": str(
+            cfg.get("p2d_late_bind_grace_seconds", 2.0)
+        ),
         "SGLANG_AGENTIC_MULTINODE_DECODE_GROWTH_TOKENS": str(cfg["decode_growth_tokens"]),
+        "SGLANG_AGENTIC_MULTINODE_SHARED_NETWORK_LANES": str(
+            cfg.get("shared_network_lanes", 0)
+        ),
+        "SGLANG_AGENTIC_MULTINODE_D2P_SHARED_NETWORK_LANES": str(
+            cfg.get(
+                "d2p_shared_network_lanes",
+                cfg.get("shared_network_lanes", 0),
+            )
+        ),
+        "SGLANG_AGENTIC_MULTINODE_P2D_SHARED_NETWORK_LANES": str(
+            cfg.get(
+                "p2d_shared_network_lanes",
+                cfg.get("shared_network_lanes", 0),
+            )
+        ),
+        "SGLANG_AGENTIC_MULTINODE_D2P_DIRECT_NETWORK_RESERVE": str(
+            cfg.get("d2p_direct_network_reserve", 0)
+        ),
+        "SGLANG_AGENTIC_MULTINODE_P2D_DIRECT_NETWORK_RESERVE": str(
+            cfg.get("p2d_direct_network_reserve", 0)
+        ),
+        "SGLANG_AGENTIC_MULTINODE_D2P_HOST_NETWORK_RESERVE": str(
+            cfg.get("d2p_host_network_reserve", 0)
+        ),
+        "SGLANG_AGENTIC_MULTINODE_P2D_HOST_NETWORK_RESERVE": str(
+            cfg.get("p2d_host_network_reserve", 0)
+        ),
+        "SGLANG_AGENTIC_NIXL_PROGRESS_THREADS": str(
+            cfg.get("nixl_progress_threads", 8)
+        ),
+        "SGLANG_AGENTIC_MULTINODE_DIRECT_LANES": str(
+            cfg.get("direct_lanes", 4)
+        ),
+        "SGLANG_AGENTIC_MULTINODE_D2P_DIRECT_LANES": str(
+            cfg.get("d2p_direct_lanes", cfg.get("direct_lanes", 4))
+        ),
+        "SGLANG_AGENTIC_MULTINODE_P2D_DIRECT_LANES": str(
+            cfg.get("p2d_direct_lanes", cfg.get("direct_lanes", 4))
+        ),
+        "SGLANG_AGENTIC_MULTINODE_HOST_LANES": str(cfg.get("host_lanes", 4)),
+        "SGLANG_AGENTIC_ROUTE_CALLBACK_URL": "http://{}:{}/dualpd/prefill_ready".format(
+            node_for(cfg, cfg["router"]["node_id"])["host_ip"],
+            cfg["router"]["port"],
+        ),
+        "SGLANG_AGENTIC_DECODE_RESERVATION_CALLBACK_URL": "http://{}:{}/dualpd/decode_materialized".format(
+            node_for(cfg, cfg["router"]["node_id"])["host_ip"],
+            cfg["router"]["port"],
+        ),
         # V3 validates the two real D->P ownership paths.  Do not inherit a
         # recompute experiment from the shell and silently add a third path.
         "SGLANG_AGENTIC_KV_FAST_DIRECT_FAILURE_RECOMPUTE": "false",
@@ -224,6 +295,8 @@ def common_env(cfg):
                 "SGLANG_AGENTIC_KV_APP_OWNS_TERMINATION": "true",
             }
         )
+    if cfg.get("debug_memory_pool", False):
+        env["SGLANG_DEBUG_MEMORY_POOL"] = "1"
     if cfg.get("cuda_home"):
         env["CUDA_HOME"] = str(Path(cfg["cuda_home"]))
     return env
@@ -319,12 +392,24 @@ def router_plan(cfg):
                 "SGLANG_AGENTIC_MULTINODE_ROLE": "router",
                 "SGLANG_AGENTIC_MULTINODE_HOST_IP": node["host_ip"],
                 "SGLANG_HOST_IP": node["host_ip"], "CUDA_VISIBLE_DEVICES": ""})
-    # V2 currently has exactly one P group and one D group.  Use the stock
-    # Python MiniLB as a transparent PD HTTP relay: unlike the Rust router's
-    # strict OpenAI normalization it preserves the immutable lifecycle
-    # envelope.  All ownership, admission and transfer decisions remain in
-    # the TCP V2 controller; MiniLB keeps no filesystem control state.
-    command = [cfg["python"], "-m", "sglang_router.launch_router",
+    endpoint_groups = {
+        "http://{}:{}".format(worker["host_ip"], worker["port"]): worker["engine_id"]
+        for worker in cfg["nodes"]
+    }
+    env["DUALPD_ROUTER_ENDPOINT_GROUPS"] = json.dumps(
+        endpoint_groups, sort_keys=True, separators=(",", ":")
+    )
+    env["DUALPD_ROUTER_PREFILL_RESERVATION_TOKENS"] = str(
+        cfg.get("prefill_router_reservation_tokens", 16384)
+    )
+    env["DUALPD_ROUTER_DECODE_RESERVATION_SECONDS"] = str(
+        cfg.get("decode_router_reservation_seconds", 3600.0)
+    )
+    env["DUALPD_ROUTER_TP_SIZE"] = str(cfg["tp_size"])
+    # The custom MiniLB dispatches P immediately and D only after the P-ready
+    # callback.  It preserves the immutable lifecycle envelope and uses no
+    # filesystem control state.
+    command = [cfg["python"], str(Path(cfg["slime_root"]) / "tools/dualpd/global_pd_router.py"),
                "--mini-lb", "--pd-disaggregation", "--policy", "random", "--host", "0.0.0.0",
                "--port", str(router["port"]), "--prometheus-port", str(router["metrics_port"]),
                "--health-check-timeout-secs", "60", "--health-failure-threshold", "10"]
@@ -338,13 +423,16 @@ def router_plan(cfg):
 
 def control_links(cfg):
     p = next(n for n in cfg["nodes"] if n["role"] == "prefill")
-    d = next(n for n in cfg["nodes"] if n["role"] == "decode")
     return {
         link_id(cfg): {
             "coordinator": {"endpoint_group": p["engine_id"], "rank": 0},
             "endpoints": [
-                {"endpoint_group": p["engine_id"], "role": "prefill", "size": cfg["tp_size"]},
-                {"endpoint_group": d["engine_id"], "role": "decode", "size": cfg["tp_size"]},
+                {
+                    "endpoint_group": node["engine_id"],
+                    "role": node["role"],
+                    "size": cfg["tp_size"],
+                }
+                for node in cfg["nodes"]
             ],
         }
     }
